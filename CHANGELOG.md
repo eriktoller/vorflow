@@ -22,6 +22,17 @@ and the project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   28.5% to 21.8% and the p95 centroid `ortho_error` from 2.4 to 1.25
   degrees, as well as the exact analytic size field does. 0 keeps the raw
   `node_sizes` and reproduces 0.2.0 bit for bit.
+- `VoronoiTessellator(..., min_face_fraction=0.0)`: opt-in removal of very
+  short cell faces before the grid is built
+  ([#31](https://github.com/rhugman/vorflow/issues/31)). A face is short when
+  it is below this fraction of the distance between its two generators; such
+  faces come from four generators almost on one circle (typically a 5-7
+  valence defect) and are more common after Lloyd. Each such quad is opened
+  by moving its free generators slightly, with the same free nodes and move
+  checks as Lloyd, for up to 20 passes; `short_face_report` holds the counts.
+  On a two-well test model with 30 Lloyd passes, 0.2 takes the faces below
+  0.2·sqrt(cell area) from 1.6% to 0% and the maximum face skewness from 5.3
+  to 0.58, without changing the cell count or the share of hexagons.
 - `MeshGenerator.node_edges`: the unique mesh edges between two of `nodes`,
   as (m, 2) positions into `nodes`, set by `generate()`. `node_sizes` is
   unchanged.

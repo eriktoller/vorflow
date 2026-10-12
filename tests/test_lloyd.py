@@ -882,3 +882,100 @@ def test_lloyd_keeps_hex_ring_cell_regular():
     np.testing.assert_allclose(radii, r / math.sqrt(3), rtol=1e-6)
     assert (cell["x"], cell["y"]) == (point.x, point.y)
     assert cell["lloyd_shift"] == 0.0
+
+
+# --- short-face cleanup -----------------------------------------------------
+
+
+def test_short_faces_finds_the_cocircular_diagonals_of_a_square_lattice():
+    nodes, _ = _square_lattice(5)
+    quads, face, connector = _lloyd.short_faces(nodes, 0.2)
+    # Every unit square is split by one diagonal whose Voronoi face has zero length.
+    assert len(quads) == 16
+    np.testing.assert_allclose(face, 0.0, atol=1e-9)
+    np.testing.assert_allclose(connector, np.sqrt(2.0))
+
+
+def test_short_faces_none_on_a_hex_lattice():
+    quads, _, _ = _lloyd.short_faces(_hex_lattice(8), 0.2)
+    assert len(quads) == 0
+
+
+def test_remove_short_faces_opens_square_lattice_and_keeps_fixed_nodes():
+    nodes, interior = _square_lattice(8)
+    owners = [None] * len(nodes)
+    moved, report = _lloyd.remove_short_faces(nodes, interior, owners, None, 0.2)
+    np.testing.assert_array_equal(moved[~interior], nodes[~interior])
+    assert report["initial"] > 0
+    # Faces between two fixed border nodes cannot be opened; all others are.
+    remaining, _, _ = _lloyd.short_faces(moved, 0.2)
+    assert not interior[remaining].any(axis=1).any()
+    assert report["final"] == len(remaining)
+    # Small nudges, not a reshuffle: no node moves more than a quarter spacing per pass.
+    assert np.hypot(*(moved - nodes).T).max() < 0.25 * np.sqrt(2.0) * report["passes"]
+
+
+def test_remove_short_faces_without_short_faces_returns_copy():
+    nodes = _hex_lattice(6)
+    free = np.ones(len(nodes), dtype=bool)
+    moved, report = _lloyd.remove_short_faces(nodes, free, [None] * len(nodes), None, 0.2)
+    np.testing.assert_array_equal(moved, nodes)
+    assert moved is not nodes
+    assert report == {"initial": 0, "final": 0, "passes": 0, "rejected": 0}
+
+
+def test_remove_short_faces_respects_owner_polygons():
+    nodes, interior = _square_lattice(6)
+    # Owner polygons too small to allow any move.
+    owners = [Point(x, y).buffer(1e-6) if free else None for (x, y), free in zip(nodes, interior)]
+    moved, report = _lloyd.remove_short_faces(nodes, interior, owners, None, 0.2, passes=3)
+    np.testing.assert_array_equal(moved, nodes)
+    assert report["rejected"] > 0
+    assert report["final"] == report["initial"]
+
+
+@pytest.mark.parametrize("fraction", [0.0, 1.0, -0.1, float("nan"), True])
+def test_remove_short_faces_rejects_invalid_fraction(fraction):
+    nodes, interior = _square_lattice(4)
+    with pytest.raises(ValueError, match="min_face_fraction"):
+        _lloyd.remove_short_faces(nodes, interior, [None] * len(nodes), None, fraction)
+
+
+@pytest.mark.parametrize("fraction", [-0.1, 1.0])
+def test_tessellator_rejects_invalid_min_face_fraction(fraction):
+    cm = _unit_square_mesh()
+    with pytest.raises(ValueError, match="min_face_fraction"):
+        VoronoiTessellator(_FakeMeshGenerator(cm.clean_polygons), cm, min_face_fraction=fraction)
+
+
+def test_tessellator_short_face_cleanup_on_a_lattice():
+    cm = _unit_square_mesh()
+    fake = _FakeMeshGenerator(cm.clean_polygons)
+    on_border = (fake.nodes == 0.0).any(axis=1) | (fake.nodes == 1.0).any(axis=1)
+    fake.node_is_free = ~on_border
+    fake.node_sizes = np.full(len(fake.nodes), 0.2)
+    tess = VoronoiTessellator(fake, cm, min_face_fraction=0.2)
+    grid = tess.generate()
+    assert tess.lloyd_report is None
+    assert tess.short_face_report["initial"] > tess.short_face_report["final"]
+    assert len(grid) == len(fake.nodes)
+    rows = _by_node(grid, list(fake.node_tags))
+    np.testing.assert_array_equal(rows[["x", "y"]].to_numpy()[on_border], fake.nodes[on_border])
+    assert (rows["lloyd_shift"].to_numpy()[on_border] == 0).all()
+    assert grid.geometry.area.sum() == pytest.approx(1.0, rel=1e-9)
+
+
+@pytest.mark.slow
+def test_short_face_cleanup_after_lloyd(well_case):
+    cm, mg, _, relaxed, _ = well_case
+    tess = VoronoiTessellator(mg, cm, lloyd_iterations=20, min_face_fraction=0.2)
+    cleaned = tess.generate()
+    report = tess.short_face_report
+    assert report["initial"] > 0
+    assert report["final"] < report["initial"] / 4
+    assert len(cleaned) == len(relaxed)
+    assert cleaned["zone_id"].value_counts().to_dict() == relaxed["zone_id"].value_counts().to_dict()
+    rows = _by_node(cleaned, list(mg.node_tags))
+    fixed = ~mg.node_is_free
+    np.testing.assert_array_equal(rows[["x", "y"]].to_numpy()[fixed], mg.nodes[fixed])
+    assert cleaned.geometry.area.sum() == pytest.approx(DOMAIN.area, rel=1e-9)

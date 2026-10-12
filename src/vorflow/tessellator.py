@@ -490,6 +490,7 @@ class VoronoiTessellator:
         lloyd_damping=1.0,
         lloyd_tolerance=1e-3,
         lloyd_size_smoothing=5,
+        min_face_fraction=0.0,
     ):
         """
         Initializes the Voronoi tessellator.
@@ -559,9 +560,10 @@ class VoronoiTessellator:
                 diagram of all nodes plus the weighted centroids of the free
                 cells; 100 passes took 5-10x the time of meshing and
                 tessellating once. Use 100 or more passes, together with
-                ``hex_ring=True`` on refined points. Avoid about 20 passes: a
-                partly relaxed grid passes through near-cocircular generators,
-                and the number of very short cell faces peaks there.
+                ``hex_ring=True`` on refined points. Lloyd leaves some very
+                short cell faces where four generators end up almost on one
+                circle (about 1% of faces after 30-100 passes, most around 20);
+                ``min_face_fraction=0.2`` removes them.
                 Requires a mesh generator that ran ``MeshGenerator.generate()``
                 before this tessellator was constructed.
             lloyd_damping (float): Fraction of the way each free generator
@@ -581,6 +583,20 @@ class VoronoiTessellator:
                 nodes keep their size and anchor the grading. Default 5;
                 from 10-20 passes on it starts to flatten steep grading. 0
                 uses ``node_sizes`` unchanged (the 0.2.0 behaviour).
+            min_face_fraction (float): Remove very short cell faces before the
+                grid is built (0, the default, turns it off). A face is short
+                when it is shorter than this fraction of the distance between
+                the two generators it separates; such faces come from four
+                generators lying almost on one circle, typically where a 5-
+                and a 7-sided cell meet, and are more common after Lloyd
+                relaxation. Each such group of four is opened by moving its
+                free generators slightly (the same free nodes and move checks
+                as Lloyd), repeated for up to 20 passes. Runs after Lloyd if
+                both are on. 0.2 removes the faces that are visibly short;
+                a regular hexagon's faces are 0.58. ``short_face_report``
+                holds the ``initial`` and ``final`` short-face counts,
+                ``passes`` and ``rejected`` moves, and the grid gets a
+                ``lloyd_shift`` column with the total move of each node.
         """
         if boundary_centering not in {"clip", "inset_mirror"}:
             raise ValueError("boundary_centering must be either 'clip' or 'inset_mirror'.")
@@ -592,6 +608,8 @@ class VoronoiTessellator:
             raise ValueError("boundary_tolerance must be non-negative when provided.")
         _lloyd.validate_settings(lloyd_iterations, lloyd_damping, lloyd_tolerance, prefix="lloyd_",
                                  size_smoothing=lloyd_size_smoothing)
+        if not (0.0 <= float(min_face_fraction) < 1.0):
+            raise ValueError(f"min_face_fraction must be in [0, 1). Got {min_face_fraction!r}.")
 
         self.mg = mesh_generator
         self.cm = conceptual_mesh
@@ -620,13 +638,16 @@ class VoronoiTessellator:
         # run; max_rel_shift is the largest residual |centroid - node| / local
         # size over the accepted moves of the last pass (see _lloyd.relax).
         self.lloyd_report = None
+        self.min_face_fraction = float(min_face_fraction)
+        # {"initial", "final", "passes", "rejected"} after a short-face cleanup.
+        self.short_face_report = None
 
     def _lloyd_mesh_inputs(self, n_nodes):
         """(node_is_free, node_sizes, buffer_footprints) captured from the mesh generator, checked against ``n_nodes``."""
         node_is_free, node_sizes = self.node_is_free, self.node_sizes
         if node_is_free is None or node_sizes is None:
             raise ValueError(
-                "lloyd_iterations > 0 needs MeshGenerator.node_is_free and node_sizes; "
+                "lloyd_iterations > 0 and min_face_fraction > 0 need MeshGenerator.node_is_free and node_sizes; "
                 "run MeshGenerator.generate() before tessellating."
             )
         node_is_free = np.asarray(node_is_free, dtype=bool)
@@ -673,11 +694,16 @@ class VoronoiTessellator:
         geoms = [geom for geom in lines.geometry if geom is not None and not geom.is_empty]
         return unary_union(geoms) if geoms else None
 
+    def _free_generators(self, nodes):
+        """(owners, free) for the movable mesh nodes: see ``_owner_polygons``."""
+        node_is_free, _, footprints = self._lloyd_mesh_inputs(len(nodes))
+        pieces = _zone_pieces(self._embedded_polygons().geometry, footprints)
+        return _owner_polygons(nodes, node_is_free, pieces)
+
     def _relax_generators(self, nodes):
         """Density-weighted Lloyd relaxation of the free mesh nodes (see ``lloyd_iterations``); returns the moved nodes."""
-        node_is_free, node_sizes, footprints = self._lloyd_mesh_inputs(len(nodes))
-        pieces = _zone_pieces(self._embedded_polygons().geometry, footprints)
-        owners, free = _owner_polygons(nodes, node_is_free, pieces)
+        _, node_sizes, _ = self._lloyd_mesh_inputs(len(nodes))
+        owners, free = self._free_generators(nodes)
         report = {"iterations": 0, "max_rel_shift": 0.0, "rejected": 0}
         if free.any():
             logger.info(f"Lloyd relaxation of {int(free.sum())} free generators...")
@@ -698,6 +724,19 @@ class VoronoiTessellator:
                 f"{report['max_rel_shift']:.2e} x local size, {report['rejected']} moves rejected"
             )
         self.lloyd_report = {**report, "n_free": int(free.sum())}
+        return nodes
+
+    def _open_short_faces(self, nodes):
+        """Move free generators until no face is shorter than ``min_face_fraction`` x connector; returns the moved nodes."""
+        owners, free = self._free_generators(nodes)
+        nodes, report = _lloyd.remove_short_faces(
+            nodes, free, owners, self._lloyd_constraint_lines(), self.min_face_fraction
+        )
+        logger.info(
+            f"Short-face cleanup: {report['initial']} -> {report['final']} faces below "
+            f"{self.min_face_fraction:g} x connector in {report['passes']} passes, {report['rejected']} moves rejected"
+        )
+        self.short_face_report = report
         return nodes
 
     def _embedded_polygons(self):
@@ -1157,9 +1196,14 @@ class VoronoiTessellator:
             raise ValueError("MeshGenerator nodes and node_tags must have the same length.")
 
         self.lloyd_report = None
+        self.short_face_report = None
         lloyd_shift = None
-        if self.lloyd_iterations > 0:
-            relaxed = self._relax_generators(nodes)
+        if self.lloyd_iterations > 0 or self.min_face_fraction > 0:
+            relaxed = nodes
+            if self.lloyd_iterations > 0:
+                relaxed = self._relax_generators(relaxed)
+            if self.min_face_fraction > 0:
+                relaxed = self._open_short_faces(relaxed)
             lloyd_shift = pd.Series(np.hypot(*(relaxed - nodes).T), index=tags)
             nodes = relaxed
 

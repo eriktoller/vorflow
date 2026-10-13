@@ -244,6 +244,13 @@ around wells.
 See [ROADMAP.md](https://github.com/rhugman/vorflow/blob/main/ROADMAP.md)
 for planned and completed milestones.
 
+## Acknowledgements
+
+Thanks to David ([@d-strom](https://github.com/d-strom)) for reporting the
+line-junction problem in [#31](https://github.com/rhugman/vorflow/issues/31)
+and for [#35](https://github.com/rhugman/vorflow/pull/35), whose parallel-line
+guard and junction diagnostics are part of the line-junction handling.
+
 ## License
 
 MIT — see [LICENSE](https://github.com/rhugman/vorflow/blob/main/LICENSE).

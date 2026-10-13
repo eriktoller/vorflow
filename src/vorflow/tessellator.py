@@ -1160,6 +1160,7 @@ class VoronoiTessellator:
         Executes the full Voronoi tessellation workflow.
 
         This method orchestrates the process of:
+
         1. With ``lloyd_iterations > 0``, moving the free generators towards
            their density-weighted cell centroids (Lloyd relaxation).
         2. With ``boundary_centering="inset_mirror"``, shifting boundary

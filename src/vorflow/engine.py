@@ -2743,6 +2743,7 @@ class MeshGenerator:
         Executes the full mesh generation workflow.
 
         This method orchestrates the entire process:
+
         1. Initializes Gmsh.
         2. Transfers geometries into the Gmsh model.
         3. Sets up mesh size fields.

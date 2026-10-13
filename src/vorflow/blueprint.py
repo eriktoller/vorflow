@@ -390,12 +390,6 @@ class ConceptualMesh:
                 another quad-buffered feature (higher stays continuous). To control
                 the two independently, add the zone without ``quad_buffer`` and add
                 its boundary as a separate quad-buffered line with its own z_order.
-            dist_min (float, optional): DEPRECATED. Distance from the polygon boundary where
-                the mesh size is held constant at the boundary's resolution. Supplying
-                dist_min/dist_max selects the legacy linear ThresholdField transition and
-                emits a DeprecationWarning; omit them to use the default GeometricGrowthField.
-            dist_max (float, optional): DEPRECATED. Distance from the polygon boundary over
-                which the mesh transitions to the background resolution. See dist_min.
             growth_factor (float, optional): Cell-to-cell growth ratio (>1.0) for the default
                 GeometricGrowthField size transition away from the feature. Defaults to 1.2.
                 Ignored when an explicit ``fields`` list or the legacy dist_min/dist_max is given.
@@ -432,15 +426,23 @@ class ConceptualMesh:
             quad_buffer_thickness (int): Band width in local cell widths
                 (multiples of ``resolution``, like gmshflow's ``cs_thick``).
                 Supported values are 1 and 2.
-            mesh_refinement (bool, optional): DEPRECATED, has no effect (it was
+
+        Deprecated parameters:
+            dist_min (float, optional): Distance from the polygon boundary where
+                the mesh size is held constant at the boundary's resolution. Supplying
+                dist_min/dist_max selects the legacy linear ThresholdField transition and
+                emits a DeprecationWarning; omit them to use the default GeometricGrowthField.
+            dist_max (float, optional): Distance from the polygon boundary over
+                which the mesh transitions to the background resolution. See dist_min.
+            mesh_refinement (bool, optional): Has no effect (it was
                 never read by the mesh generator).
-            border_density (float, optional): DEPRECATED. Densifies the boundary
+            border_density (float, optional): Densifies the boundary
                 to this spacing (use ``densify``) and grades the interior from this
                 finer border size up to ``resolution`` over ``dist_min`` to
                 ``dist_max_in``.
-            dist_max_in (float, optional): DEPRECATED. Interior grading distance
+            dist_max_in (float, optional): Interior grading distance
                 for ``border_density``.
-            dist_max_out (float, optional): DEPRECATED alias for ``dist_max``.
+            dist_max_out (float, optional): Alias for ``dist_max``.
         """
         if not geometry.is_valid:
             geometry = make_valid(geometry)
@@ -516,12 +518,6 @@ class ConceptualMesh:
                 nearby polygon boundaries to ensure connectivity.
             is_barrier (bool): If True, the line is treated as a flow barrier. The mesh
                 will be constructed to prevent cell faces from crossing it.
-            dist_min (float, optional): DEPRECATED. Distance from the line where the mesh size
-                is held constant at the line's resolution. Supplying dist_min/dist_max selects
-                the legacy linear ThresholdField transition and emits a DeprecationWarning;
-                omit them to use the default GeometricGrowthField.
-            dist_max (float, optional): DEPRECATED. Distance from the line over which the mesh
-                transitions to the background resolution. See dist_min.
             straddle_width (float, optional): If set, forces Voronoi cell edges to align
                 perfectly with the line by creating a "virtual straddle" of mesh nodes.
             fields (list, optional): List of MeshField objects.
@@ -558,6 +554,14 @@ class ConceptualMesh:
             growth_factor (float, optional): Cell-to-cell growth ratio (>1.0) for the default
                 GeometricGrowthField size transition away from the line. Defaults to 1.2.
                 Ignored when an explicit ``fields`` list or the legacy dist_min/dist_max is given.
+
+        Deprecated parameters:
+            dist_min (float, optional): Distance from the line where the mesh size
+                is held constant at the line's resolution. Supplying dist_min/dist_max selects
+                the legacy linear ThresholdField transition and emits a DeprecationWarning;
+                omit them to use the default GeometricGrowthField.
+            dist_max (float, optional): Distance from the line over which the mesh
+                transitions to the background resolution. See dist_min.
         """
         if not geometry.is_valid:
             geometry = make_valid(geometry)
@@ -611,12 +615,6 @@ class ConceptualMesh:
             geometry (shapely.Point): The point geometry.
             point_id (str): A unique identifier for the point.
             resolution (float): Target mesh size at the point.
-            dist_min (float, optional): DEPRECATED. Distance from the point where the mesh size
-                is held constant at the point's resolution. Supplying dist_min/dist_max selects
-                the legacy linear ThresholdField transition and emits a DeprecationWarning;
-                omit them to use the default GeometricGrowthField.
-            dist_max (float, optional): DEPRECATED. Distance from the point over which the mesh
-                transitions to the background resolution. See dist_min.
             fields (list, optional): List of MeshField objects. When given, they replace
                 the default size transition around the point.
             embed (bool): If True (default), the point becomes a mesh node (and so a
@@ -646,6 +644,14 @@ class ConceptualMesh:
                 below the ring radius) are caught after meshing: ``MeshGenerator``
                 warns when a ring was split and records the outcome per point in
                 ``diagnostics['hex_rings']``.
+
+        Deprecated parameters:
+            dist_min (float, optional): Distance from the point where the mesh size
+                is held constant at the point's resolution. Supplying dist_min/dist_max selects
+                the legacy linear ThresholdField transition and emits a DeprecationWarning;
+                omit them to use the default GeometricGrowthField.
+            dist_max (float, optional): Distance from the point over which the mesh
+                transitions to the background resolution. See dist_min.
         """
         if not isinstance(hex_ring, (bool, np.bool_)):
             raise ValueError(f"hex_ring must be True or False. Got {hex_ring!r}.")

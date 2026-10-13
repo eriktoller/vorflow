@@ -40,11 +40,20 @@ dependencies = [
 [project.urls]
 Repository = "https://github.com/rhugman/vorflow"
 Issues = "https://github.com/rhugman/vorflow/issues"
+Documentation = "https://rhugman.github.io/vorflow/"
 Changelog = "https://github.com/rhugman/vorflow/blob/main/CHANGELOG.md"
 
 [project.optional-dependencies]
 examples = [
     "matplotlib",         # Plotting in examples/ and notebooks; the library itself never imports it
+]
+docs = [
+    "sphinx>=7",
+    "myst-nb>=1.1",       # Markdown pages and executed example notebooks
+    "pydata-sphinx-theme>=0.15",
+    "sphinx-copybutton",
+    "ipykernel",
+    "matplotlib",
 ]
 dev = [
     "pytest",

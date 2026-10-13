@@ -9,13 +9,19 @@
 [![PyPI](https://img.shields.io/pypi/v/vorflow)](https://pypi.org/project/vorflow/)
 [![Python](https://img.shields.io/pypi/pyversions/vorflow)](https://pypi.org/project/vorflow/)
 [![Tests](https://github.com/rhugman/vorflow/actions/workflows/python-app.yml/badge.svg)](https://github.com/rhugman/vorflow/actions/workflows/python-app.yml)
+[![Docs](https://github.com/rhugman/vorflow/actions/workflows/docs.yml/badge.svg)](https://rhugman.github.io/vorflow/)
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](https://github.com/rhugman/vorflow/blob/main/LICENSE)
 
 Voronoi mesh generation for MODFLOW 6 using Gmsh and GeoPandas.
 
+Documentation, including the API reference and executed example notebooks:
+<https://rhugman.github.io/vorflow/>
+
 `vorflow` is a Python package for creating 2D unstructured Voronoi cell meshes for groundwater modeling, particularly for MODFLOW 6. It leverages the power of `Gmsh` for robust triangular meshing and `Shapely`/`GeoPandas` for geometric operations.
 
 The process is designed to translate a conceptual model—defined by geometric features like polygons, lines, and points—into a high-quality Voronoi grid suitable for numerical simulation.
+
+<!-- docs:overview-start -->
 
 ## Core Components
 
@@ -36,6 +42,8 @@ The typical workflow follows these steps:
 3.  **Generate Mesh**: Instantiate `MeshGenerator` and call its `generate()` method with the processed geometries from the blueprint. This produces a triangular mesh.
 4.  **Tessellate to Voronoi**: Instantiate `VoronoiTessellator` with the generated mesh and the blueprint. Calling its `generate()` method produces the final `GeoDataFrame` of Voronoi cells.
 5.  **Export**: The resulting `GeoDataFrame` can be easily saved to a shapefile or other formats.
+
+<!-- docs:installation-start -->
 
 ## Installation
 
@@ -94,6 +102,8 @@ which installs the package in editable mode with the `dev` extra:
 ```bash
 micromamba env create -f etc/environment.yml
 ```
+
+<!-- docs:usage-start -->
 
 ## Basic Usage
 
@@ -228,6 +238,8 @@ steady radial-flow (Thiem) test
 `growth_factor - 1` roughly doubled the cell count and cut the head RMSE about
 threefold, while 100 Lloyd passes improved it by at most about 5%. Lower
 `growth_factor` (or the resolution) where accuracy matters.
+
+<!-- docs:usage-end -->
 
 ## Examples
 

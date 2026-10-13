@@ -17,6 +17,18 @@ scales as rho^(-1/4), so rho = h(x)^-4 keeps the spacing at the target mesh
 size h(x). h is interpolated from per-node sizes supplied by the caller
 (``size_interpolator``).
 
+*Smoothed sizes.* Gmsh's per-node sizes (mean incident edge length) jitter by
+7-12% (sd of log h) between neighbouring nodes once the intended grading is
+removed, which is +-30-46% in rho. At growth factor 1.05 that is twice the
+real size step between neighbours, and Lloyd converges to a CVT of the noise
+(rhugman/vorflow#31). ``smooth_log_sizes`` removes most of it with a few
+damped Jacobi passes over the mesh graph in log space: each pass moves a free
+node's log size halfway to the mean of its neighbours', while fixed nodes
+(boundaries, embedded points and lines, hex-ring seeds) keep their size and
+anchor the grading. On the #31 test model 5 passes cut the jitter 3-4x and
+gave the same regularity as the exact size field; from 10-20 passes on the
+smoothing starts to flatten steep grading.
+
 *Centroids.* For a cell that lies inside the domain the weighted centroid is
 integrated over a fan of triangles from the generator (a Voronoi cell is
 convex and contains its generator): sum(w_k x_k) / sum(w_k) over quadrature
@@ -39,7 +51,7 @@ from __future__ import annotations
 import numpy as np
 import shapely
 from scipy.interpolate import LinearNDInterpolator
-from scipy.spatial import Voronoi, cKDTree
+from scipy.spatial import Delaunay, Voronoi, cKDTree
 
 # Far ghost generators sit this many bbox extents outside the nodes, as in
 # VoronoiTessellator.generate(), so every real node has a finite region.
@@ -85,6 +97,39 @@ def size_interpolator(nodes, sizes):
         return values
 
     return size_fn
+
+
+def smooth_log_sizes(sizes, free, edges, passes):
+    """Damped Jacobi smoothing of log(sizes) over the graph ``edges``; returns new sizes.
+
+    ``edges`` is an (m, 2) array of node positions. Each pass sets
+    log h_i = (log h_i + mean of log h over i's neighbours) / 2 for every
+    ``free`` node that has a neighbour; the other nodes are returned
+    bit-identical, and ``passes == 0`` returns an unchanged copy.
+    """
+    sizes = np.asarray(sizes, dtype=float)
+    free = np.asarray(free, dtype=bool)
+    edges = np.asarray(edges, dtype=np.int64).reshape(-1, 2)
+    if sizes.ndim != 1 or free.shape != sizes.shape:
+        raise ValueError(f"sizes and free must have the same 1D shape. Got {sizes.shape} and {free.shape}.")
+    if len(edges) and (edges.min() < 0 or edges.max() >= len(sizes)):
+        raise ValueError(f"edges must hold node positions in [0, {len(sizes)}).")
+    if not np.all(np.isfinite(sizes)) or np.any(sizes <= 0):
+        raise ValueError("sizes must be positive finite numbers.")
+    validate_size_smoothing(passes)
+    result = sizes.copy()
+    ends = np.concatenate([edges[:, 0], edges[:, 1]])
+    others = np.concatenate([edges[:, 1], edges[:, 0]])
+    degree = np.bincount(ends, minlength=len(sizes))
+    moving = np.flatnonzero(free & (degree > 0))
+    if passes == 0 or len(moving) == 0:
+        return result
+    log_h = np.log(sizes)
+    for _ in range(passes):
+        neighbour_mean = np.bincount(ends, weights=log_h[others], minlength=len(sizes))[moving] / degree[moving]
+        log_h[moving] = 0.5 * log_h[moving] + 0.5 * neighbour_mean
+    result[moving] = np.exp(log_h[moving])
+    return result
 
 
 def _ghost_points(nodes):
@@ -261,19 +306,34 @@ def _is_real_number(value) -> bool:
     return not np.isnan(value)
 
 
-def validate_settings(iterations, damping, tolerance, prefix=""):
-    """Raise ValueError unless iterations is an int >= 0, damping a number in (0, 1] and tolerance a number >= 0.
+def _is_count(value) -> bool:
+    """True for a non-negative int or NumPy integer that is not a bool."""
+    if isinstance(value, (bool, np.bool_)) or not isinstance(value, (int, np.integer)):
+        return False
+    return value >= 0
 
-    Bools and NaN are rejected; iterations must be an integer type (2.0 is
-    rejected), damping and tolerance may be any int or float. ``prefix`` is
-    prepended to the setting names in the messages (e.g. ``"lloyd_"``).
+
+def validate_size_smoothing(size_smoothing, prefix=""):
+    """Raise ValueError unless size_smoothing is an int >= 0 (bools and 2.0 are rejected)."""
+    if not _is_count(size_smoothing):
+        raise ValueError(f"{prefix}size_smoothing must be a non-negative integer. Got {size_smoothing!r}.")
+
+
+def validate_settings(iterations, damping, tolerance, prefix="", size_smoothing=0):
+    """Raise ValueError unless iterations and size_smoothing are ints >= 0, damping a number in (0, 1] and tolerance a number >= 0.
+
+    Bools and NaN are rejected; iterations and size_smoothing must be integer
+    types (2.0 is rejected), damping and tolerance may be any int or float.
+    ``prefix`` is prepended to the setting names in the messages (e.g.
+    ``"lloyd_"``).
     """
-    if isinstance(iterations, (bool, np.bool_)) or not isinstance(iterations, (int, np.integer)) or iterations < 0:
+    if not _is_count(iterations):
         raise ValueError(f"{prefix}iterations must be a non-negative integer. Got {iterations!r}.")
     if not _is_real_number(damping) or not (0.0 < damping <= 1.0):
         raise ValueError(f"{prefix}damping must be a number in (0, 1]. Got {damping!r}.")
     if not _is_real_number(tolerance) or not (tolerance >= 0.0):
         raise ValueError(f"{prefix}tolerance must be a non-negative number. Got {tolerance!r}.")
+    validate_size_smoothing(size_smoothing, prefix=prefix)
 
 
 def _validate_relax_args(nodes, free, owner_polys, iterations, damping, tolerance):
@@ -334,5 +394,141 @@ def relax(nodes, free, size_fn, domain, owner_polys, constraint_lines,
             "rejected": report["rejected"] + int((~ok).sum()),
         }
         if max_rel_shift < tolerance:
+            break
+    return current, report
+
+
+def _circumcentres(points, triangles):
+    """Circumcentres (m, 2) of ``triangles`` (m, 3) of ``points``; NaN for degenerate triangles."""
+    a, b, c = (points[triangles[:, k]] for k in range(3))
+    ba, ca = b - a, c - a
+    denom = 2.0 * (ba[:, 0] * ca[:, 1] - ba[:, 1] * ca[:, 0])
+    ba2, ca2 = (ba ** 2).sum(axis=1), (ca ** 2).sum(axis=1)
+    with np.errstate(invalid='ignore', divide='ignore'):
+        ux = (ca[:, 1] * ba2 - ba[:, 1] * ca2) / denom
+        uy = (ba[:, 0] * ca2 - ca[:, 0] * ba2) / denom
+    return a + np.column_stack([ux, uy])
+
+
+def short_faces(nodes, min_face_fraction):
+    """Voronoi faces of ``nodes`` shorter than ``min_face_fraction`` x their connector length.
+
+    A face is the dual of a Delaunay edge (i, j) shared by two triangles
+    (i, j, k) and (j, i, l) of real nodes; its length is the distance between
+    their circumcentres. Faces on the hull (next to a far ghost) are skipped.
+    Returns (quads (m, 4) node positions [i, j, k, l], face (m,), connector
+    (m,)): (i, j) is the edge, k and l its two opposite nodes.
+    """
+    nodes = np.asarray(nodes, dtype=float)
+    origin = (nodes.min(axis=0) + nodes.max(axis=0)) / 2.0
+    local = nodes - origin
+    n = len(local)
+    tri = Delaunay(np.vstack([local, _ghost_points(local)]))
+    simplices, neighbours = tri.simplices, tri.neighbors
+    real = np.all(simplices < n, axis=1)
+    centres = _circumcentres(tri.points, simplices)
+    t, m = np.nonzero(real[:, None] & (neighbours > np.arange(len(simplices))[:, None]))
+    u = neighbours[t, m]
+    keep = real[u]
+    t, m, u = t[keep], m[keep], u[keep]
+    k = simplices[t, m]
+    i = simplices[t, (m + 1) % 3]
+    j = simplices[t, (m + 2) % 3]
+    # The node of u that is not on the shared edge.
+    other = simplices[u]
+    l_pos = np.argmax((other != i[:, None]) & (other != j[:, None]), axis=1)
+    l_node = other[np.arange(len(u)), l_pos]
+    face = np.hypot(*(centres[t] - centres[u]).T)
+    connector = np.hypot(*(local[i] - local[j]).T)
+    short = face < min_face_fraction * connector
+    quads = np.column_stack([i, j, k, l_node])[short]
+    return quads, face[short], connector[short]
+
+
+def _quad_displacements(nodes, free, quads, face, connector, target_fraction):
+    """Summed displacement (n, 2) that opens each near-cocircular quad by ``target_fraction`` x connector.
+
+    For a rhombus with diagonals p < q the face dual to p has length about
+    q - p, so the face reaches ``target_fraction * connector`` once the
+    diagonals differ by that much. The shorter diagonal's free ends move
+    towards each other by half the deficit and the longer diagonal's free
+    ends apart by the other half (all of it to one pair if the other pair is
+    fixed). Which of the two diagonals ends up as the Delaunay edge does not
+    matter; only that the face between them is no longer short.
+    """
+    shift = np.zeros_like(nodes)
+    deficit = target_fraction * connector - face
+    for (i, j, k, opp), need in zip(quads, deficit):
+        diag_ij = np.hypot(*(nodes[i] - nodes[j]))
+        diag_kl = np.hypot(*(nodes[k] - nodes[opp]))
+        near, far = ((i, j), (k, opp)) if diag_ij <= diag_kl else ((k, opp), (i, j))
+        near_free = [p for p in near if free[p]]
+        far_free = [p for p in far if free[p]]
+        if not near_free and not far_free:
+            continue
+        near_share = need / 2.0 if far_free else need
+        far_share = need - near_share if near_free else need
+        for pair, movers, sign, share in ((near, near_free, -1.0, near_share), (far, far_free, 1.0, far_share)):
+            if not movers:
+                continue
+            a, b = nodes[pair[0]], nodes[pair[1]]
+            length = np.hypot(*(b - a))
+            if length == 0:
+                continue
+            unit = (b - a) / length
+            step = share / len(movers)
+            # Moving apart (sign +1): pair[0] goes along -unit, pair[1] along +unit.
+            if free[pair[0]]:
+                shift[pair[0]] -= sign * step * unit
+            if free[pair[1]]:
+                shift[pair[1]] += sign * step * unit
+    return shift
+
+
+def remove_short_faces(nodes, free, owner_polys, constraint_lines, min_face_fraction,
+                       passes=20, overshoot=1.5, max_step_fraction=0.25):
+    """Nudge free generators apart until no Voronoi face is shorter than ``min_face_fraction`` x its connector.
+
+    Short faces come from near-cocircular quads of generators (four nodes on
+    almost the same circle, typically at a 5-7 valence defect, and more often
+    after Lloyd relaxation). Each pass finds them with ``short_faces``, moves
+    the free nodes of each quad by ``_quad_displacements`` towards a face of
+    ``overshoot * min_face_fraction`` x connector, caps each node's move at
+    ``max_step_fraction`` x its shortest connector in a short quad, and keeps
+    only moves ``accept_moves`` allows. Fixed nodes are returned bit-identical.
+
+    Returns (new_nodes, report) with ``initial`` and ``final`` short-face
+    counts, ``passes`` run and ``rejected`` moves.
+    """
+    nodes = np.asarray(nodes, dtype=float)
+    free = np.asarray(free, dtype=bool)
+    if not _is_real_number(min_face_fraction) or not (0.0 < min_face_fraction < 1.0):
+        raise ValueError(f"min_face_fraction must be a number in (0, 1). Got {min_face_fraction!r}.")
+    if not _is_count(passes):
+        raise ValueError(f"passes must be a non-negative integer. Got {passes!r}.")
+    owners = _object_array(owner_polys)
+    if len(owners) != len(nodes) or free.shape != (len(nodes),):
+        raise ValueError("free and owner_polys must have one entry per node.")
+    current = nodes.copy()
+    quads, face, connector = short_faces(current, min_face_fraction)
+    report = {"initial": len(quads), "final": len(quads), "passes": 0, "rejected": 0}
+    for step in range(passes):
+        movable = free[quads].any(axis=1)
+        if not movable.any():
+            break
+        quads, face, connector = quads[movable], face[movable], connector[movable]
+        shift = _quad_displacements(current, free, quads, face, connector, overshoot * min_face_fraction)
+        cap = np.full(len(current), np.inf)
+        np.minimum.at(cap, quads.ravel(), np.repeat(max_step_fraction * connector, 4))
+        length = np.hypot(*shift.T)
+        scale = np.where(length > cap, cap / np.where(length > 0, length, 1.0), 1.0)
+        moved = np.flatnonzero(length > 0)
+        proposal = current[moved] + shift[moved] * scale[moved, None]
+        ok = accept_moves(current[moved], proposal, owners[moved], constraint_lines)
+        current[moved[ok]] = proposal[ok]
+        quads, face, connector = short_faces(current, min_face_fraction)
+        report = {"initial": report["initial"], "final": len(quads), "passes": step + 1,
+                  "rejected": report["rejected"] + int((~ok).sum())}
+        if len(quads) == 0:
             break
     return current, report

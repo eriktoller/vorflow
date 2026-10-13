@@ -1,7 +1,7 @@
 """Minimal end-to-end vorflow example used by release smoke tests.
 
 Run with ``--plot PATH`` to also save a figure of the grid (needs Matplotlib,
-from the ``examples`` extra). The README's Basic Usage figure is made with
+from the ``plot`` extra). The README's Basic Usage figure is made with
 ``python examples/basic_usage.py --plot docs/images/basic_usage.png``.
 """
 
@@ -32,26 +32,23 @@ def main():
         is_barrier=True,
     )
 
-    clean_polys, clean_lines, clean_pts = blueprint.generate()
-    mesher = MeshGenerator(background_lc=100)
-    mesher.generate(clean_polys, clean_lines, clean_pts)
+    mesher = MeshGenerator(background_lc=100, conceptual_mesh=blueprint)
+    mesher.generate()
 
-    tessellator = VoronoiTessellator(mesher, blueprint, clip_to_boundary=True)
-    grid_gdf = tessellator.generate()
-    if grid_gdf.empty:
+    tessellator = VoronoiTessellator(mesher, clip_to_boundary=True)
+    if tessellator.generate().empty:
         raise RuntimeError("Basic Usage generated an empty Voronoi grid")
-    return grid_gdf
+    return tessellator
 
 
-def plot_grid(grid_gdf, path):
+def plot_grid(tessellator, path):
     import matplotlib.pyplot as plt
 
     fig, ax = plt.subplots(figsize=(6, 6))
-    grid_gdf.plot(ax=ax, facecolor="whitesmoke", edgecolor="0.4", linewidth=0.3)
+    tessellator.plot(ax=ax, column=None, facecolor="whitesmoke", edgecolor="0.4")
     ax.plot(*FAULT_LINE.xy, color="tab:red", linewidth=1.5, label="Fault-1 (barrier)")
     ax.plot(WELL_POINT.x, WELL_POINT.y, "o", color="tab:blue", markersize=4, label="Well-A")
-    ax.set_aspect("equal")
-    ax.set_title(f"Basic Usage: {len(grid_gdf)} Voronoi cells")
+    ax.set_title(f"Basic Usage: {len(tessellator.grid)} Voronoi cells")
     ax.legend(loc="upper right")
     fig.tight_layout()
     fig.savefig(path, dpi=150)
@@ -62,8 +59,8 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     parser.add_argument("--plot", metavar="PATH", help="save a figure of the grid to PATH")
     args = parser.parse_args()
-    grid = main()
-    print(f"Generated {len(grid)} Voronoi cells")
+    tessellator = main()
+    print(f"Generated {len(tessellator.grid)} Voronoi cells")
     if args.plot:
-        plot_grid(grid, args.plot)
+        plot_grid(tessellator, args.plot)
         print(f"Saved figure to {args.plot}")

@@ -188,13 +188,35 @@ plt.show()
        width="60%">
 </p>
 
+### MODFLOW 6 export
+
+`to_disv()` returns the grid as MODFLOW 6 DISV arrays (`ncpl`, `nvert`,
+`vertices`, `cell2d`), zero-based as flopy takes them. Cell centres are the
+generator points, vertices are listed clockwise and shared between neighbours,
+and `node_id` maps each `icell2d` back to its grid row:
+
+```python
+disv = tessellator.to_disv()
+```
+
+With flopy installed, `to_modflowgwfdisv()` adds the DISV package to a model
+directly; further keywords go to `flopy.mf6.ModflowGwfdisv`:
+
+```python
+import flopy
+
+sim = flopy.mf6.MFSimulation(sim_ws="model")
+gwf = flopy.mf6.ModflowGwf(sim, modelname="vorflow")
+tessellator.to_modflowgwfdisv(gwf, top=10.0, botm=[0.0, -10.0], nlay=2)
+```
+
 ### Optional file export
 
 GeoPandas writes formats such as Shapefile and GeoPackage through an I/O engine
 such as Pyogrio or Fiona. Install one of those engines before calling:
 
 ```python
-grid_gdf.to_file("mf6_grid.gpkg", driver="GPKG")
+tessellator.to_file("mf6_grid.gpkg", driver="GPKG")
 ```
 
 ### Mesh gradation
@@ -296,6 +318,19 @@ around wells.
 
 See [ROADMAP.md](https://github.com/rhugman/vorflow/blob/main/ROADMAP.md)
 for planned and completed milestones.
+
+## Contributing
+
+Bug reports, questions and pull requests are welcome; see
+[CONTRIBUTING.md](https://github.com/rhugman/vorflow/blob/main/CONTRIBUTING.md).
+Everyone taking part follows the
+[Code of Conduct](https://github.com/rhugman/vorflow/blob/main/CODE_OF_CONDUCT.md).
+
+## Citing
+
+If you use `vorflow` in your work, please cite it using the metadata in
+[CITATION.cff](https://github.com/rhugman/vorflow/blob/main/CITATION.cff)
+(GitHub's "Cite this repository" button formats it).
 
 ## Acknowledgements
 

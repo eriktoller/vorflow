@@ -6,10 +6,15 @@ import warnings
 import numpy as np
 import geopandas as gpd
 import pandas as pd
+import shapely
 from shapely.geometry import LineString, MultiLineString, Point, Polygon, MultiPolygon
 
 
 logger = logging.getLogger(__name__)
+
+# Default tolerance of grid_to_disv, as a fraction of the coordinate scale,
+# for a vertex of one cell to count as lying on an edge of another.
+DISV_VERTEX_FRACTION = 1e-9
 
 
 CONNECTIVITY_COLUMNS = [
@@ -693,3 +698,125 @@ def resample_geometry(geom, target_spacing):
         return MultiPolygon(parts)
         
     return geom
+
+
+def grid_to_disv(gdf: gpd.GeoDataFrame, tolerance: float | None = None) -> dict:
+    """
+    Build MODFLOW 6 DISV grid arrays from a polygonal grid.
+
+    Returns a dict with ``ncpl``, ``nvert``, ``vertices`` (``[iv, x, y]``)
+    and ``cell2d`` (``[icell2d, xc, yc, ncvert, iv1, iv2, ...]``), in the
+    zero-based form flopy's ``ModflowGwfdisv`` takes, plus ``node_id``: the
+    grid's ``node_id`` per ``icell2d`` (row order), to map results back.
+
+    Cell centres ``xc``/``yc`` are the ``x``/``y`` columns, i.e. the
+    generator points on a vorflow grid, which the CVFD connection geometry
+    assumes. Each cell lists its vertices clockwise without repeating the
+    first. Neighbouring cells share vertex indices; a vertex of one cell
+    that lies on another cell's edge (a hanging node, e.g. where a barrier
+    split a cell) is inserted into that edge too, because MODFLOW 6 finds
+    connections from shared vertex pairs.
+
+    Args:
+        gdf (GeoDataFrame): Grid of single-part polygons without holes, with
+            ``x`` and ``y`` columns (e.g. ``VoronoiTessellator.grid``).
+        tolerance (float, optional): Distance within which a vertex counts as
+            lying on an edge. Defaults to ``DISV_VERTEX_FRACTION`` times the
+            coordinate scale.
+
+    Returns:
+        dict: ``ncpl``, ``nvert``, ``vertices``, ``cell2d`` and ``node_id``.
+
+    Raises:
+        ValueError: If columns are missing, the grid is empty, or a cell is
+            not a single polygon without holes.
+    """
+    missing = {"geometry", "x", "y"}.difference(gdf.columns)
+    if missing:
+        raise ValueError(f"grid_to_disv missing required columns: {sorted(missing)}")
+    if gdf.empty:
+        raise ValueError("grid_to_disv needs a non-empty grid.")
+    geoms = gdf.geometry.to_numpy()
+    bad = [i for i, geom in enumerate(geoms) if geom.geom_type != "Polygon" or len(geom.interiors) > 0]
+    if bad:
+        raise ValueError(
+            f"DISV cells must be single polygons without holes; {len(bad)} are not "
+            f"(first at row {bad[0]})."
+        )
+
+    rings = [np.asarray(geom.exterior.coords)[:-1, :2] for geom in geoms]
+    coords = np.vstack(rings)
+    vertex_xy, vertex_of = np.unique(coords, axis=0, return_inverse=True)
+    vertex_of = vertex_of.ravel()
+    splits = np.cumsum([len(ring) for ring in rings])[:-1]
+    cell_vertices = [list(ids) for ids in np.split(vertex_of, splits)]
+
+    if tolerance is None:
+        scale = max(float(np.ptp(vertex_xy, axis=0).max()), float(np.abs(vertex_xy).max()), 1.0)
+        tolerance = DISV_VERTEX_FRACTION * scale
+    cell_vertices = _insert_hanging_vertices(cell_vertices, vertex_xy, tolerance)
+    cell_vertices = [_clockwise(ids, vertex_xy) for ids in cell_vertices]
+
+    # Drop vertices no cell uses (none today; kept for robustness) and renumber.
+    used = np.unique(np.concatenate([np.asarray(ids) for ids in cell_vertices]))
+    renumber = np.full(len(vertex_xy), -1, dtype=np.int64)
+    renumber[used] = np.arange(len(used))
+    vertices = [[i, float(x), float(y)] for i, (x, y) in enumerate(vertex_xy[used])]
+
+    xc = gdf["x"].to_numpy(dtype=float)
+    yc = gdf["y"].to_numpy(dtype=float)
+    cell2d = [
+        [icell, float(xc[icell]), float(yc[icell]), len(ids), *(int(renumber[v]) for v in ids)]
+        for icell, ids in enumerate(cell_vertices)
+    ]
+    node_id = gdf["node_id"].to_numpy() if "node_id" in gdf.columns else np.arange(len(gdf))
+    return {
+        "ncpl": len(cell2d),
+        "nvert": len(vertices),
+        "vertices": vertices,
+        "cell2d": cell2d,
+        "node_id": node_id,
+    }
+
+
+def _insert_hanging_vertices(cell_vertices, vertex_xy, tolerance):
+    """Cell rings with every grid vertex that lies inside one of their edges inserted, in order along the edge."""
+    edge_cell = np.repeat(np.arange(len(cell_vertices)), [len(ids) for ids in cell_vertices])
+    edge_pos = np.concatenate([np.arange(len(ids)) for ids in cell_vertices])
+    start_ids = np.concatenate([np.asarray(ids) for ids in cell_vertices])
+    end_ids = np.concatenate([np.roll(np.asarray(ids), -1) for ids in cell_vertices])
+    starts, ends = vertex_xy[start_ids], vertex_xy[end_ids]
+
+    tree = shapely.STRtree(shapely.points(vertex_xy))
+    edge_idx, vertex_idx = tree.query(
+        shapely.linestrings(np.stack([starts, ends], axis=1)), predicate="dwithin", distance=tolerance
+    )
+    keep = (vertex_idx != start_ids[edge_idx]) & (vertex_idx != end_ids[edge_idx])
+    edge_idx, vertex_idx = edge_idx[keep], vertex_idx[keep]
+    if edge_idx.size == 0:
+        return cell_vertices
+
+    edge = ends[edge_idx] - starts[edge_idx]
+    rel = vertex_xy[vertex_idx] - starts[edge_idx]
+    t = np.einsum("ij,ij->i", rel, edge) / np.einsum("ij,ij->i", edge, edge)
+    inside = (t > 0.0) & (t < 1.0)
+    hanging = {}
+    for e, v, ti in zip(edge_idx[inside], vertex_idx[inside], t[inside]):
+        hanging.setdefault(int(e), []).append((ti, int(v)))
+
+    out = [list(ids) for ids in cell_vertices]
+    # Insert from the last edge of each ring backwards so earlier positions stay valid.
+    for e in sorted(hanging, reverse=True):
+        inserted = [v for _, v in sorted(hanging[e])]
+        ring = out[edge_cell[e]]
+        pos = edge_pos[e] + 1
+        ring[pos:pos] = inserted
+    return out
+
+
+def _clockwise(ids, vertex_xy):
+    """Ring vertex ids in clockwise order (negative shoelace area), as MODFLOW 6 expects."""
+    xy = vertex_xy[np.asarray(ids)]
+    x, y = xy[:, 0], xy[:, 1]
+    signed_area = 0.5 * float(np.dot(x, np.roll(y, -1)) - np.dot(np.roll(x, -1), y))
+    return list(ids) if signed_area < 0 else list(ids)[::-1]

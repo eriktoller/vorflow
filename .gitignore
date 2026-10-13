@@ -226,3 +226,6 @@ benchmarks/
 docs/generated/
 docs/examples/
 docs/jupyter_execute/
+
+# JOSS paper build output
+paper/paper.pdf

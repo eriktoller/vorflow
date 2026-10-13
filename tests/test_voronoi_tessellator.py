@@ -582,7 +582,8 @@ class TestExportToShapefile:
         tess = self._tessellator_with_grid()
         grid = tess.generate()
         path = tmp_path / "grid.shp"
-        tess.export_to_shapefile(str(path))
+        with pytest.warns(DeprecationWarning, match="to_file"):
+            tess.export_to_shapefile(str(path))
         assert path.exists()
         back = gpd.read_file(path)
         assert len(back) == len(grid)
@@ -592,8 +593,21 @@ class TestExportToShapefile:
     def test_no_grid_writes_nothing(self, tmp_path):
         tess = self._tessellator_with_grid()  # generate() never called
         path = tmp_path / "grid.shp"
-        tess.export_to_shapefile(str(path))
+        with pytest.warns(DeprecationWarning):
+            tess.export_to_shapefile(str(path))
         assert not path.exists()
+
+    def test_to_file_writes_geopackage_layer(self, tmp_path):
+        tess = self._tessellator_with_grid()
+        grid = tess.generate()
+        path = tmp_path / "grid.gpkg"
+        tess.to_file(path, layer="cells")
+        back = gpd.read_file(path, layer="cells")
+        assert len(back) == len(grid)
+
+    def test_to_file_before_generate_raises(self, tmp_path):
+        with pytest.raises(RuntimeError, match="generate"):
+            self._tessellator_with_grid().to_file(tmp_path / "grid.gpkg")
 
 
 def _lattice_nodes(minx, miny, maxx, maxy, n):

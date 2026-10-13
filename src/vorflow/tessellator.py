@@ -16,6 +16,7 @@ from shapely.validation import make_valid
 from . import _lloyd
 from ._features import polygon_parts
 from ._plot import get_ax
+from .utils import grid_to_disv
 
 logger = logging.getLogger(__name__)
 
@@ -1351,23 +1352,104 @@ class VoronoiTessellator:
         logger.info(f"Final Voronoi Grid Generated: {len(self.final_grid)} cells.")
         return self.final_grid
 
-    def export_to_shapefile(self, filepath):
+    def to_file(self, filepath, **kwargs):
         """
         Writes the grid from the last ``generate()`` to a file.
 
         A thin wrapper around ``GeoDataFrame.to_file``, which picks the format
         from the file extension (e.g. ``.shp``, ``.gpkg``) and needs an I/O
-        engine such as Pyogrio or Fiona. Logs a message and writes nothing
-        when ``generate()`` has not produced a grid.
+        engine such as Pyogrio or Fiona.
+
+        Args:
+            filepath (str or Path): Output path.
+            **kwargs: Passed to ``GeoDataFrame.to_file`` (e.g. ``driver``, ``layer``).
+
+        Raises:
+            RuntimeError: If ``generate()`` has not run.
+        """
+        self.grid.to_file(filepath, **kwargs)
+        logger.info(f"Saved to {filepath}")
+
+    def export_to_shapefile(self, filepath):
+        """
+        Writes the grid from the last ``generate()`` to a file.
+
+        Deprecated: use ``to_file()``. Unlike ``to_file()``, this logs a
+        message and writes nothing when ``generate()`` has not produced a grid.
 
         Args:
             filepath (str or Path): Output path.
         """
+        warnings.warn(
+            "export_to_shapefile() is deprecated; use to_file().",
+            DeprecationWarning,
+            stacklevel=2,
+        )
         if self.final_grid is not None and not self.final_grid.empty:
-            self.final_grid.to_file(filepath)
-            logger.info(f"Saved to {filepath}")
+            self.to_file(filepath)
         else:
             logger.info("No grid to export.")
+
+    def to_disv(self):
+        """
+        MODFLOW 6 DISV grid arrays for the grid from the last ``generate()``.
+
+        See ``vorflow.utils.grid_to_disv``: returns ``ncpl``, ``nvert``,
+        ``vertices`` and ``cell2d`` in the zero-based form flopy takes, with
+        the generator points as cell centres, plus ``node_id`` per
+        ``icell2d`` (grid row order) to map results back to the grid.
+
+        Returns:
+            dict: ``ncpl``, ``nvert``, ``vertices``, ``cell2d`` and ``node_id``.
+
+        Raises:
+            RuntimeError: If ``generate()`` has not run.
+        """
+        return grid_to_disv(self.grid)
+
+    def to_modflowgwfdisv(self, gwf, top, botm, nlay=1, **kwargs):
+        """
+        Builds a flopy ``ModflowGwfdisv`` package from the grid.
+
+        Needs flopy, which vorflow does not depend on. ``icell2d`` follows the
+        grid's row order; ``to_disv()["node_id"]`` maps it back to cells.
+
+        Args:
+            gwf (flopy.mf6.ModflowGwf): The groundwater flow model to add the
+                package to.
+            top: Top elevation, a scalar or one value per cell.
+            botm: Bottom elevations, a scalar, one value per layer, or an
+                ``(nlay, ncpl)`` array.
+            nlay (int): Number of layers. Default 1.
+            **kwargs: Passed to ``flopy.mf6.ModflowGwfdisv`` (e.g.
+                ``length_units``, ``idomain``, ``xorigin``).
+
+        Returns:
+            flopy.mf6.ModflowGwfdisv: The DISV package.
+
+        Raises:
+            ImportError: If flopy is not installed.
+            RuntimeError: If ``generate()`` has not run.
+        """
+        try:
+            import flopy
+        except ImportError as err:
+            raise ImportError(
+                "to_modflowgwfdisv() needs flopy; install it with `pip install flopy`, "
+                "or use to_disv() for the plain arrays."
+            ) from err
+        disv = self.to_disv()
+        return flopy.mf6.ModflowGwfdisv(
+            gwf,
+            nlay=nlay,
+            ncpl=disv["ncpl"],
+            nvert=disv["nvert"],
+            vertices=disv["vertices"],
+            cell2d=disv["cell2d"],
+            top=top,
+            botm=botm,
+            **kwargs,
+        )
 
     def plot(self, ax=None, column="zone_id", show_generators=False, **kwargs):
         """

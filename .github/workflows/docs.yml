@@ -26,8 +26,10 @@ jobs:
         uses: mamba-org/setup-micromamba@v1
         with:
           environment-file: etc/environment.yml
+          # modflow6 provides the mf6 binary the MODFLOW example notebooks run.
           create-args: >-
             python=3.12
+            modflow6
           cache-environment: true
       - name: Install docs dependencies
         shell: bash -l {0}
@@ -53,8 +55,10 @@ jobs:
         uses: mamba-org/setup-micromamba@v1
         with:
           environment-file: etc/environment.yml
+          # modflow6 provides the mf6 binary the MODFLOW example notebooks run.
           create-args: >-
             python=3.12
+            modflow6
           cache-environment: true
       - name: Install docs dependencies
         shell: bash -l {0}

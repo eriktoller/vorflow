@@ -49,6 +49,7 @@ plot = [
 ]
 examples = [
     "matplotlib",         # Plotting in examples/ and notebooks; the library itself never imports it
+    "flopy>=3.10",        # MODFLOW 6 examples; the library itself never imports it
 ]
 docs = [
     "sphinx>=7",
@@ -57,6 +58,7 @@ docs = [
     "sphinx-copybutton",
     "ipykernel",
     "matplotlib",
+    "flopy>=3.10",        # MODFLOW 6 example notebooks (they also need the mf6 binary)
 ]
 dev = [
     "pytest",

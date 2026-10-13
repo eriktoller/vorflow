@@ -9,6 +9,16 @@ and the project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- `VoronoiTessellator.to_disv()` and `vorflow.utils.grid_to_disv()` return
+  the grid as MODFLOW 6 DISV arrays (`ncpl`, `nvert`, `vertices`, `cell2d`,
+  zero-based as flopy takes them) plus the `node_id` of each `icell2d`
+  ([#44](https://github.com/rhugman/vorflow/issues/44)). Cell centres are the
+  generator points; vertices are clockwise and shared between neighbours, and
+  a vertex lying on another cell's edge is inserted into that edge so
+  MODFLOW 6 finds the connection. `to_modflowgwfdisv(gwf, top, botm, nlay=1)`
+  builds the flopy package directly; flopy stays optional.
+- `VoronoiTessellator.to_file()`: writes the grid with `GeoDataFrame.to_file`,
+  passing keywords through.
 - `plot()` methods on `ConceptualMesh` (registered features, or the cleaned
   ones with `clean=True`), `MeshGenerator` (the element grid) and
   `VoronoiTessellator` (the cells, optionally with their generators)
@@ -62,6 +72,8 @@ and the project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Changed
 
+- `VoronoiTessellator.export_to_shapefile()` is deprecated in favour of
+  `to_file()`.
 - `MeshGenerator.generate()` returns the mesh generator instead of `True`
   ([#42](https://github.com/rhugman/vorflow/issues/42)). It is still truthy,
   so `assert mesher.generate(...)` keeps working; code comparing the result

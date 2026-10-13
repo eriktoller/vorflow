@@ -105,6 +105,38 @@ class TestBlueprint:
             assert a.equals_exact(b, 0)
         assert cm.raw_lines[1]["geometry"].equals(B_CROSSES)
 
+    @pytest.mark.parametrize("offset", [10.0, 14.0])
+    def test_parallel_lines_closer_than_the_tolerance_stay_apart(self, offset):
+        # Each end is within 0.5 x 30 = 15 of the other line, but runs alongside it.
+        cm = ConceptualMesh()
+        cm.add_polygon(box(-500, -500, 1500, 1500), zone_id=1, resolution=160)
+        cm.add_line(LineString([(0, 0), (1000, 0)]), "A", resolution=RES)
+        cm.add_line(LineString([(0, offset), (1000, offset)]), "B", resolution=RES)
+        _, lines, _ = cm.generate()
+        line_a, line_b = lines.geometry
+        assert line_a.distance(line_b) == pytest.approx(offset)
+        assert cm.junction_diagnostics["snapped_ends"] == []
+
+    def test_shallow_tributary_still_snaps(self):
+        # Meets A at about 15 degrees and stops 5 m short.
+        tributary = LineString([(200, 1015 - 5 - 800 * math.tan(math.radians(15))), (1000, 1070)])
+        _, lines, _ = _model(tributary).generate()
+        assert Point(lines.geometry.iloc[1].coords[-1]).distance(LINE_A) < EPS
+
+    def test_diagnostics_report_junctions_snaps_and_trims(self):
+        cm = _model(B_SHORT)
+        cm.add_line(LineString([(500, 1800), (1600, 1300), (1601.5, 1112)]), "C", resolution=RES)
+        cm.generate()
+        report = cm.junction_diagnostics
+        assert sorted(sorted(j["line_ids"]) for j in report["junctions"]) == [["A", "B"], ["A", "C"]]
+        assert [(s["line_id"], s["end"]) for s in report["snapped_ends"]] == [("B", "end")]
+        assert report["snapped_ends"][0]["from"] == (1200.0, 1085.0)
+        assert [(t["line_id"], t["end"]) for t in report["trimmed_ends"]] == [("C", "end")]
+
+        cm.line_junction_fraction = 0
+        cm.generate()
+        assert cm.junction_diagnostics == {"junctions": [], "snapped_ends": [], "trimmed_ends": []}
+
     @pytest.mark.parametrize("value", [-0.1, True, "0.5", float("nan")])
     def test_invalid_fraction_is_rejected(self, value):
         with pytest.raises(ValueError, match="line_junction_fraction"):
@@ -117,7 +149,7 @@ class TestHelpers:
         b = LineString([(103, 4), (200, 50)])
         (a, b), moved = _junctions.snap_line_ends([a, b], [10.0, 10.0], EPS)
         # A's end moves onto B's end; B's end is then already on A.
-        assert moved == 1
+        assert len(moved) == 1
         assert a.coords[-1] == b.coords[0] == (103.0, 4.0)
 
     def test_snap_skips_anchored_ends(self):
@@ -125,7 +157,7 @@ class TestHelpers:
         b = LineString([(50, 5), (50, 100)])
         anchors = LineString([(0, 5), (100, 5)])
         (_, kept), moved = _junctions.snap_line_ends([a, b], [10.0, 10.0], EPS, anchors)
-        assert moved == 0
+        assert moved == []
         assert kept.equals(b)
 
     def test_three_lines_through_one_point_share_one_coordinate(self):
@@ -138,14 +170,14 @@ class TestHelpers:
     def test_stub_is_trimmed_at_the_junction(self):
         line = LineString([(0, 0), (100, 0)])
         (trimmed,), count = _junctions.trim_short_stubs([line], [[(97.0, 0.0)]], [5.0], EPS)
-        assert count == 1
+        assert count == [(0, -1, 3.0)]
         assert trimmed.coords[-1] == (97.0, 0.0)
 
     def test_anchored_stub_is_kept(self):
         line = LineString([(0, 0), (100, 0)])
         anchors = LineString([(100, -1), (100, 1)])
         (kept,), count = _junctions.trim_short_stubs([line], [[(97.0, 0.0)]], [5.0], EPS, anchors)
-        assert count == 0
+        assert count == []
         assert kept.equals(line)
 
     def test_pin_inserts_the_junction_and_drops_close_vertices(self):

@@ -72,8 +72,15 @@ and the project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   5 m) and 2.6 to 17.7 m (crossing; 2.6 to 6.0 m at resolution 10). The new
   `ConceptualMesh(line_junction_fraction=0.5)` sets the threshold; 0 turns
   the step off. It is separate from `connectivity_tolerance`, which is an
-  absolute distance; in this step it only sets what counts as
-  touching. Barrier and straddle lines, quad-buffer lines and field-only lines are left out.
+  absolute distance; in this step it only sets what counts as touching.
+  Barrier and straddle lines, quad-buffer lines and field-only lines are left
+  out. An end is not snapped when the gap to the other line points more than 80
+  degrees away from the line's own direction, so parallel lines closer than
+  the threshold stay apart. `ConceptualMesh.junction_diagnostics` records each
+  run's junctions (point and line IDs), snapped ends and trimmed ends. The
+  parallel-line guard and the diagnostics follow
+  [@d-strom](https://github.com/d-strom)'s
+  [#35](https://github.com/rhugman/vorflow/pull/35).
 
 ## [0.2.0] - 2026-10-05
 

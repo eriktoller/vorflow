@@ -77,6 +77,31 @@ def _line_vertex_spacing(feature) -> float | None:
     return spacing if spacing is not None else positive_number(feature.get('lc'))
 
 
+def _empty_junction_diagnostics() -> dict:
+    """The ``junction_diagnostics`` of a run that joined no lines."""
+    return {'junctions': [], 'snapped_ends': [], 'trimmed_ends': []}
+
+
+def _junction_diagnostics(line_ids, junctions, moves, trims) -> dict:
+    """Readable record of the junction step, keyed by ``line_id``."""
+    end_name = {0: 'start', -1: 'end'}
+    lines_at = {}
+    for k, points in enumerate(junctions):
+        for xy in points:
+            lines_at.setdefault(xy, []).append(line_ids[k])
+    return {
+        'junctions': [{'point': xy, 'line_ids': ids} for xy, ids in lines_at.items()],
+        'snapped_ends': [
+            {'line_id': line_ids[k], 'end': end_name[end], 'from': old, 'to': new}
+            for k, end, old, new in moves
+        ],
+        'trimmed_ends': [
+            {'line_id': line_ids[k], 'end': end_name[end], 'length': cut}
+            for k, end, cut in trims
+        ],
+    }
+
+
 def _takes_part_in_junctions(feature) -> bool:
     """True for embedded plain lines: not field-only, straddle/barrier or quad-buffer lines."""
     geom = feature.get('geometry')
@@ -395,12 +420,17 @@ class ConceptualMesh:
                 junction are dropped, so one node sits at the junction instead
                 of two a few units apart. Barrier/straddle, quad-buffer and
                 field-only lines are left out; line ends on polygon boundaries
-                never move. Default 0.5; 0 turns the step off.
+                never move. Default 0.5; 0 turns the step off. Each
+                ``generate()`` records what it did in ``junction_diagnostics``:
+                ``junctions`` (``point`` and the ``line_ids`` through it),
+                ``snapped_ends`` (``line_id``, ``end``, ``from``, ``to``) and
+                ``trimmed_ends`` (``line_id``, ``end``, cut ``length``).
         """
         self.crs = crs
         _warn_if_geographic_crs(crs)
         self.connectivity_tolerance = _coerce_connectivity_tolerance(connectivity_tolerance)
         self.line_junction_fraction = _coerce_line_junction_fraction(line_junction_fraction)
+        self.junction_diagnostics = _empty_junction_diagnostics()
         # Store raw geometric inputs before processing.
         self.raw_polygons = [] 
         self.raw_lines = []
@@ -1020,6 +1050,7 @@ class ConceptualMesh:
         Only line geometries change; the list keeps its order and length, so
         the clean-line index (the feature ID) is unchanged.
         """
+        self.junction_diagnostics = _empty_junction_diagnostics()
         if self.line_junction_fraction <= 0:
             return
         members = [i for i, line in enumerate(self.raw_lines) if _takes_part_in_junctions(line)]
@@ -1034,21 +1065,23 @@ class ConceptualMesh:
             anchors = unary_union(self.clean_polygons.geometry.boundary)
 
         lines = [self.raw_lines[i]['geometry'] for i in members]
-        lines, moved = _junctions.snap_line_ends(lines, tolerances, eps, anchors)
+        lines, moves = _junctions.snap_line_ends(lines, tolerances, eps, anchors)
         junctions = _junctions.find_junctions(lines, eps)
-        lines, trimmed = _junctions.trim_short_stubs(lines, junctions, tolerances, eps, anchors)
-        if trimmed:
+        lines, trims = _junctions.trim_short_stubs(lines, junctions, tolerances, eps, anchors)
+        if trims:
             junctions = _junctions.find_junctions(lines, eps)
         for k, i in enumerate(members):
             self.raw_lines[i]['geometry'] = _junctions.pin_junctions(
                 lines[k], junctions[k], tolerances[k], eps, anchors
             )
 
-        n_junctions = len({xy for points in junctions for xy in points})
-        if moved or trimmed or n_junctions:
+        line_ids = [self.raw_lines[i].get('line_id') for i in members]
+        self.junction_diagnostics = _junction_diagnostics(line_ids, junctions, moves, trims)
+        n_junctions = len(self.junction_diagnostics['junctions'])
+        if moves or trims or n_junctions:
             logger.info(
-                f"Line junctions: {n_junctions} pinned, {moved} line end(s) snapped, "
-                f"{trimmed} overshoot(s) trimmed."
+                f"Line junctions: {n_junctions} pinned, {len(moves)} line end(s) snapped, "
+                f"{len(trims)} overshoot(s) trimmed."
             )
 
     def _hex_ring_obstacles(self):

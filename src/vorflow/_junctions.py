@@ -12,7 +12,12 @@ lines that take part (embedded, not straddle/barrier, not quad-buffer):
    also within ``tolerance``, else onto its nearest point, so near misses
    become T-junctions. An end whose line already meets the other line within
    ``2 * tolerance`` of it is an overshoot and is not moved: pulling it back
-   would fold the line across the other one.
+   would fold the line across the other one. Nor is an end whose gap to the
+   other line points more than ``SNAP_MAX_GAP_ANGLE_DEG`` away from the
+   line's own direction at that end: that end runs alongside the other line
+   rather than towards it, as for two parallel lines closer than
+   ``tolerance``, and snapping would lay one line onto the other (guard
+   after @d-strom's #35).
 2. **Find junctions.** Every point where two lines cross or touch. A junction
    shared by several lines gets one coordinate, so all of them carry the same
    vertex and ``fragment`` makes a single node there.
@@ -39,15 +44,23 @@ from shapely.strtree import STRtree
 # Distances at or below max(connectivity_tolerance, TOUCH_FLOOR) count as
 # touching, so float noise from projecting onto a line is not a near miss.
 TOUCH_FLOOR = 1e-6
+# An end snaps only if the gap to the other line lies within this angle of the
+# line's outward direction at that end. 80 degrees joins lines that meet at
+# 10 degrees or more and leaves parallel or nearly parallel lines apart.
+SNAP_MAX_GAP_ANGLE_DEG = 80.0
 
 
-def snap_line_ends(lines: list, tolerances: list, eps: float, anchors=None) -> tuple[list, int]:
-    """Move each line end that misses another line by at most its tolerance onto that line; returns (lines, moves)."""
+def snap_line_ends(lines: list, tolerances: list, eps: float, anchors=None) -> tuple[list, list]:
+    """Move each line end that misses another line by at most its tolerance onto that line.
+
+    Returns (lines, moves); each move is ``(line position, end, from_xy, to_xy)``
+    with ``end`` 0 (start) or -1 (end).
+    """
     lines = list(lines)
     tree = STRtree(lines)
     # Lines already processed may have moved by up to their own tolerance.
     slack = max(tolerances, default=0.0)
-    moved = 0
+    moves = []
     for i, line in enumerate(lines):
         coords = list(line.coords)
         reach = tolerances[i] + eps
@@ -63,14 +76,30 @@ def snap_line_ends(lines: list, tolerances: list, eps: float, anchors=None) -> t
             if gap > tolerances[i] or _meets_near_end(line, lines[j], end, 2 * tolerances[i]):
                 continue
             target = _snap_target(lines[j], point, tolerances[i])
+            if not _gap_is_ahead(coords, end, target):
+                continue
             candidate = list(coords)
             candidate[end] = target
             if LineString(candidate).length <= eps or candidate[0] == candidate[-1]:
                 continue
+            moves.append((i, end, tuple(coords[end]), tuple(target)))
             coords = candidate
-            moved += 1
         lines[i] = LineString(coords)
-    return lines, moved
+    return lines, moves
+
+
+def _gap_is_ahead(coords: list, end: int, target: tuple,
+                  max_angle_deg: float = SNAP_MAX_GAP_ANGLE_DEG) -> bool:
+    """True if ``target`` lies within ``max_angle_deg`` of the line's outward direction at ``end``."""
+    ordered = coords if end == 0 else coords[::-1]
+    tip = ordered[0]
+    inner = next((xy for xy in ordered[1:] if math.dist(xy, tip) > 0), None)
+    gap = (target[0] - tip[0], target[1] - tip[1])
+    if inner is None or math.hypot(*gap) == 0:
+        return False
+    outward = (tip[0] - inner[0], tip[1] - inner[1])
+    cos_angle = (outward[0] * gap[0] + outward[1] * gap[1]) / (math.hypot(*outward) * math.hypot(*gap))
+    return cos_angle >= math.cos(math.radians(max_angle_deg))
 
 
 def _meets_near_end(line: LineString, other: LineString, end: int, reach: float) -> bool:
@@ -147,10 +176,14 @@ def _add_unique(points: list, point: tuple, eps: float) -> None:
 
 
 def trim_short_stubs(lines: list, junctions: list, tolerances: list, eps: float,
-                     anchors=None) -> tuple[list, int]:
-    """Cut off line ends shorter than the line's tolerance beyond a junction; returns (lines, trims)."""
+                     anchors=None) -> tuple[list, list]:
+    """Cut off line ends shorter than the line's tolerance beyond a junction.
+
+    Returns (lines, trims); each trim is ``(line position, end, cut length)``
+    with ``end`` 0 (start) or -1 (end).
+    """
     lines = list(lines)
-    trimmed = 0
+    trims = []
     for i, line in enumerate(lines):
         length = line.length
         tolerance = tolerances[i]
@@ -178,8 +211,11 @@ def trim_short_stubs(lines: list, junctions: list, tolerances: list, eps: float,
         if cut_end:
             coords[-1] = cut_end[1]
         lines[i] = LineString(coords)
-        trimmed += (cut_start is not None) + (cut_end is not None)
-    return lines, trimmed
+        if cut_start:
+            trims.append((i, 0, start))
+        if cut_end:
+            trims.append((i, -1, length - end))
+    return lines, trims
 
 
 def _is_anchored(xy, anchors, eps: float) -> bool:

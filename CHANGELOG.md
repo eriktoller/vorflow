@@ -7,6 +7,29 @@ and the project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Fixed
+
+- Embedded lines that meet at a T-junction or cross no longer put two mesh
+  nodes a few metres apart at the junction
+  ([#31](https://github.com/rhugman/vorflow/issues/31)). Each line was
+  densified from its own ends, and Gmsh then added the junction node wherever
+  it fell, 0 to `resolution` from the nearest line vertex. `ConceptualMesh.generate()`
+  now, after clipping and before densification: snaps a line end that misses
+  another line by less than `line_junction_fraction` x its vertex spacing
+  (`densify` if numeric, else `resolution`) onto that line; trims an
+  overshoot shorter than that at the crossing; makes each junction a vertex
+  of every line through it, with one shared coordinate; and drops line
+  vertices closer than that to a junction, so densification starts at the
+  junction. Line ends and vertices on polygon boundaries are never moved,
+  trimmed or dropped. On a 160 m background with two lines at resolution 30,
+  the smallest node spacing goes from 6.0 to 18.4 m (line ending on the
+  other), 7.5 to 17.3 m (ending 5 m short), 3.4 to 21.4 m (overshooting by
+  5 m) and 2.6 to 17.7 m (crossing; 2.6 to 6.0 m at resolution 10). The new
+  `ConceptualMesh(line_junction_fraction=0.5)` sets the threshold; 0 turns
+  the step off. It is separate from `connectivity_tolerance`, which is an
+  absolute distance; in this step it only sets what counts as touching. Barrier and
+  straddle lines, quad-buffer lines and field-only lines are left out.
+
 ## [0.2.0] - 2026-10-05
 
 Centred point cells (`hex_ring`) and size-weighted Lloyd relaxation

@@ -11,6 +11,7 @@ from shapely.ops import unary_union, snap, polygonize
 from shapely.prepared import prep
 from shapely.validation import make_valid
 
+from . import _junctions
 from ._features import line_parts as _line_parts
 from ._features import positive_number, row_bool
 from ._straddle import is_straddle_line, straddle_epsilon
@@ -22,6 +23,12 @@ logger = logging.getLogger(__name__)
 # Constants for geometry simplification and reporting
 SIGNIFICANT_REDUCTION_PCT = 1.0
 DEFAULT_CONNECTIVITY_TOLERANCE = 1e-3
+# Where embedded lines meet, ends that miss another line by less than this
+# fraction of their vertex spacing are snapped onto it, shorter overshoots are
+# trimmed, and line vertices closer than it to the junction are dropped (#31).
+# 0.5 keeps the nearest line node at least half a cell from the junction node
+# while moving any line end by at most half a cell.
+DEFAULT_LINE_JUNCTION_FRACTION = 0.5
 # A hex_ring point's ring seeds sit at 1 x lc; every other node-bearing feature
 # must stay at least HEX_RING_CLEARANCE x lc away, so at least one cell width
 # separates the ring from foreign nodes (closer ones would cut the hexagon).
@@ -45,6 +52,43 @@ def _validate_growth_factor(value):
     if value <= 1.0:
         raise ValueError(f"growth_factor must be greater than 1.0. Got {value}.")
     return float(value)
+
+def _coerce_line_junction_fraction(value):
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise ValueError(f"line_junction_fraction must be a non-negative number. Got {value!r}.")
+    if not math.isfinite(value) or value < 0:
+        raise ValueError(f"line_junction_fraction must be finite and non-negative. Got {value}.")
+    return float(value)
+
+
+def _line_densify_spacing(feature) -> float | None:
+    """Densification spacing of a line: a numeric ``densify``, else its ``lc``; None when ``densify=False``."""
+    d = feature.get('densify')
+    if d is False:
+        return None
+    if isinstance(d, (int, float)) and not isinstance(d, bool) and d > 0:
+        return d
+    return feature.get('lc')
+
+
+def _line_vertex_spacing(feature) -> float | None:
+    """Spacing of a line's nodes: its densification spacing, else (``densify=False``) its ``lc``."""
+    spacing = positive_number(_line_densify_spacing(feature))
+    return spacing if spacing is not None else positive_number(feature.get('lc'))
+
+
+def _takes_part_in_junctions(feature) -> bool:
+    """True for embedded plain lines: not field-only, straddle/barrier or quad-buffer lines."""
+    geom = feature.get('geometry')
+    return (
+        isinstance(geom, LineString)
+        and geom.length > 0
+        and row_bool(feature, 'embed', True)
+        and not row_bool(feature, 'quad_buffer', False)
+        and not is_straddle_line(feature)
+        and _line_vertex_spacing(feature) is not None
+    )
+
 
 def _coerce_connectivity_tolerance(value, parameter_name="connectivity_tolerance"):
     if isinstance(value, bool):
@@ -322,7 +366,8 @@ def _warn_if_geographic_crs(crs):
 
 
 class ConceptualMesh:
-    def __init__(self, crs=None, connectivity_tolerance=DEFAULT_CONNECTIVITY_TOLERANCE):
+    def __init__(self, crs=None, connectivity_tolerance=DEFAULT_CONNECTIVITY_TOLERANCE,
+                 line_junction_fraction=DEFAULT_LINE_JUNCTION_FRACTION):
         """
         Initializes the conceptual model, which holds raw geometric inputs.
 
@@ -341,10 +386,21 @@ class ConceptualMesh:
             connectivity_tolerance (float, optional): Default snapping tolerance used
                 during topology cleanup in generate(). Larger values make lines and
                 points connect more aggressively to nearby geometry.
+            line_junction_fraction (float, optional): Where embedded lines meet
+                or nearly meet, a line end that misses another line by less than
+                this fraction of its vertex spacing (``densify`` if numeric,
+                else ``resolution``) is snapped onto it, an overshoot shorter
+                than that is trimmed, each junction becomes a vertex of every
+                line through it, and line vertices closer than that to a
+                junction are dropped, so one node sits at the junction instead
+                of two a few units apart. Barrier/straddle, quad-buffer and
+                field-only lines are left out; line ends on polygon boundaries
+                never move. Default 0.5; 0 turns the step off.
         """
         self.crs = crs
         _warn_if_geographic_crs(crs)
         self.connectivity_tolerance = _coerce_connectivity_tolerance(connectivity_tolerance)
+        self.line_junction_fraction = _coerce_line_junction_fraction(line_junction_fraction)
         # Store raw geometric inputs before processing.
         self.raw_polygons = [] 
         self.raw_lines = []
@@ -831,6 +887,12 @@ class ConceptualMesh:
 
         self.clean_polygons = gpd.GeoDataFrame(final_features, crs=self.crs)
 
+    def _resolve_connectivity_tolerance(self, connectivity_tolerance=None):
+        """The per-run override if given (validated), else the instance default."""
+        if connectivity_tolerance is None:
+            return self.connectivity_tolerance
+        return _coerce_connectivity_tolerance(connectivity_tolerance)
+
     def _enforce_connectivity(self, connectivity_tolerance=None):
         """
         Snaps features together to ensure they are topologically connected before
@@ -838,10 +900,7 @@ class ConceptualMesh:
 
         interpret shared boundaries.
         """
-        if connectivity_tolerance is None:
-            tolerance = self.connectivity_tolerance
-        else:
-            tolerance = _coerce_connectivity_tolerance(connectivity_tolerance)
+        tolerance = self._resolve_connectivity_tolerance(connectivity_tolerance)
 
         # 1. Collect all polygon boundaries into a single geometry.
         # We snap to the linear boundaries, not the polygon areas.
@@ -954,6 +1013,43 @@ class ConceptualMesh:
             logger.info(f"Removed {removed_points} point feature(s) outside the domain.")
         self.raw_points = kept_points
 
+
+    def _join_line_junctions(self, connectivity_tolerance=None):
+        """Snap, trim, pin and thin embedded lines where they meet (see ``_junctions``).
+
+        Only line geometries change; the list keeps its order and length, so
+        the clean-line index (the feature ID) is unchanged.
+        """
+        if self.line_junction_fraction <= 0:
+            return
+        members = [i for i, line in enumerate(self.raw_lines) if _takes_part_in_junctions(line)]
+        if len(members) < 2:
+            return
+        eps = max(self._resolve_connectivity_tolerance(connectivity_tolerance), _junctions.TOUCH_FLOOR)
+        tolerances = [
+            self.line_junction_fraction * _line_vertex_spacing(self.raw_lines[i]) for i in members
+        ]
+        anchors = None
+        if not self.clean_polygons.empty:
+            anchors = unary_union(self.clean_polygons.geometry.boundary)
+
+        lines = [self.raw_lines[i]['geometry'] for i in members]
+        lines, moved = _junctions.snap_line_ends(lines, tolerances, eps, anchors)
+        junctions = _junctions.find_junctions(lines, eps)
+        lines, trimmed = _junctions.trim_short_stubs(lines, junctions, tolerances, eps, anchors)
+        if trimmed:
+            junctions = _junctions.find_junctions(lines, eps)
+        for k, i in enumerate(members):
+            self.raw_lines[i]['geometry'] = _junctions.pin_junctions(
+                lines[k], junctions[k], tolerances[k], eps, anchors
+            )
+
+        n_junctions = len({xy for points in junctions for xy in points})
+        if moved or trimmed or n_junctions:
+            logger.info(
+                f"Line junctions: {n_junctions} pinned, {moved} line end(s) snapped, "
+                f"{trimmed} overshoot(s) trimmed."
+            )
 
     def _hex_ring_obstacles(self):
         """Embedded polygon boundaries and lines as ``(label, geometry, half_width)`` hex-ring obstacles.
@@ -1097,6 +1193,9 @@ class ConceptualMesh:
 
         logger.info("Clipping features to domain...")
         self._clip_features_to_domain()
+
+        logger.info("Joining line junctions...")
+        self._join_line_junctions(connectivity_tolerance=connectivity_tolerance)
 
         # After snapping and clipping, so each ring is built about the final point.
         self._assign_hex_ring_seeds(field_only_polys)
@@ -1293,22 +1392,8 @@ class ConceptualMesh:
 
         # Densify lines based on their target resolution ('lc').
         if not self.clean_lines.empty:
-            # Helper to determine the target resolution for a line row
-            def get_line_resolution(row):
-                d = row.get('densify')
-                
-                # 1. Explicitly disabled (densify=False)
-                if d is False:
-                    return None
-                
-                # 2. Explicit custom resolution (e.g., densify=5.0)
-                if isinstance(d, (int, float)) and not isinstance(d, bool) and d > 0:
-                    return d
-                
-                # 3. Default behavior (True or None): use the mesh resolution (lc)
-                return row.get('lc')
             def _line_densify(row):
-                res = get_line_resolution(row)
+                res = _line_densify_spacing(row)
                 return self._densify_geometry(row['geometry'], res) if res is not None else row['geometry']
 
             self.clean_lines['geometry'] = self.clean_lines.apply(_line_densify, axis=1)

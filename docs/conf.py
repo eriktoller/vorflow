@@ -106,3 +106,10 @@ html_theme_options = {
         },
     ],
 }
+
+# The Pages deploy builds develop into /dev/ with VORFLOW_DOCS_CHANNEL=dev.
+if os.environ.get("VORFLOW_DOCS_CHANNEL") == "dev":
+    html_theme_options["announcement"] = (
+        "Development docs for the unreleased <code>develop</code> branch. "
+        '<a href="https://rhugman.github.io/vorflow/">Stable docs</a>'
+    )

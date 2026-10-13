@@ -318,6 +318,22 @@ class ConstantField(MeshField):
 
 
 class ThresholdField(MeshField):
+    """Linear transition from ``size_min`` to ``size_max`` with distance.
+
+    The size is ``size_min`` within ``dist_min`` of the feature, rises
+    linearly to ``size_max`` at ``dist_max`` and stays there beyond it. This
+    is the field behind the deprecated ``dist_min``/``dist_max`` keywords;
+    ``GeometricGrowthField`` is the default.
+
+    Args:
+        size_min (float): Size at and near the feature.
+        dist_min (float): Distance over which ``size_min`` is held.
+        dist_max (float): Distance at which ``size_max`` is reached.
+        size_max (float, optional): Far-field size. Defaults to the
+            background size.
+        sampling (int): Number of distance sample points per curve.
+    """
+
     def __init__(self, size_min, dist_min, dist_max, size_max=None, sampling=20):
         self.size_min = float(size_min)
         self.dist_min = float(dist_min)

@@ -800,55 +800,56 @@ def _entities_to_embed(gmsh_map, points_gdf, lines_gdf):
 
 
 class MeshGenerator:
+    """
+    Gmsh-based triangular mesh generator.
+
+    This class is responsible for taking clean geometric inputs and using Gmsh
+    to produce a high-quality triangular mesh.
+
+    Args:
+        background_lc (float, optional): The default target mesh size for areas
+            not controlled by a specific refinement field.
+        verbosity (int, optional): Output level while ``generate()`` runs
+            (0=warnings only, 1=progress, 2=debug diagnostics). It applies to
+            both vorflow's logger and Gmsh, and only for the duration of
+            ``generate()``. None (default) follows the package-wide level set
+            with ``vorflow.set_verbosity()``.
+        mesh_algorithm (int): The 2D mesh algorithm to use. Common choices are
+            5 (Delaunay) for speed or 6 (Frontal-Delaunay) for quality.
+        smoothing_steps (int): Gmsh ``Mesh.Smoothing``: the number of Laplacian
+            smoothing passes over the triangle-mesh nodes during mesh generation.
+        optimization_cycles (int): Number of extra gmsh ``Relocate2D`` +
+            ``Laplace2D`` passes over the triangles after the initial mesh is
+            generated. Both options improve triangle shape; neither centres the
+            Voronoi generators within their cells. For Lloyd (centroidal
+            Voronoi) relaxation of the generators, use
+            ``VoronoiTessellator(lloyd_iterations=...)``.
+        tolerance_initial_delaunay (float): Tolerance for the initial Delaunay
+            point insertion. Increase this (e.g. 1e-4, 1e-2) to handle
+            "Could not insert point" errors caused by near-degenerate geometry
+            after fragmentation. This is a meshing-phase tolerance — it does NOT
+            alter the CAD topology, so no surfaces or lines are lost.
+            Default is 1e-8 (Gmsh default).
+        heal_shapes (bool): If True, run OCC topology healing after
+            fragmentation. This can fix degenerate geometry that causes
+            meshing failures, but may also merge or delete small entities.
+            Use with caution on complex models — keep heal_tolerance small.
+            Default is False.
+        heal_tolerance (float): Size threshold for healShapes. Entities
+            smaller than this may be removed or merged. Default 1e-8. only works if heal_shapes=True.
+        heal_fix_degenerated (bool): Fix degenerated edges/faces. Default True. Only works if heal_shapes=True.
+        heal_fix_small_edges (bool): Remove edges smaller than tolerance. Default True. Only works if heal_shapes=True.
+        heal_fix_small_faces (bool): Remove faces smaller than tolerance. Default True. Only works if heal_shapes=True.
+        diagnose (bool): If True, retain structured diagnostic details from
+            geometry transfer, embedding, and meshing steps.
+    """
+
     def __init__(self, background_lc=None, verbosity=None, mesh_algorithm=6,
                  smoothing_steps=10, optimization_cycles=2,
                  tolerance_initial_delaunay=1e-8,
                  heal_shapes=False, heal_tolerance=1e-8,
                  heal_fix_degenerated=True, heal_fix_small_edges=True,
                  heal_fix_small_faces=True, diagnose=False):
-        """
-        Initializes the Gmsh-based mesh generator.
-
-        This class is responsible for taking clean geometric inputs and using Gmsh
-        to produce a high-quality triangular mesh.
-
-        Args:
-            background_lc (float, optional): The default target mesh size for areas
-                not controlled by a specific refinement field.
-            verbosity (int, optional): Output level while ``generate()`` runs
-                (0=warnings only, 1=progress, 2=debug diagnostics). It applies to
-                both vorflow's logger and Gmsh, and only for the duration of
-                ``generate()``. None (default) follows the package-wide level set
-                with ``vorflow.set_verbosity()``.
-            mesh_algorithm (int): The 2D mesh algorithm to use. Common choices are
-                5 (Delaunay) for speed or 6 (Frontal-Delaunay) for quality.
-            smoothing_steps (int): Gmsh ``Mesh.Smoothing``: the number of Laplacian
-                smoothing passes over the triangle-mesh nodes during mesh generation.
-            optimization_cycles (int): Number of extra gmsh ``Relocate2D`` +
-                ``Laplace2D`` passes over the triangles after the initial mesh is
-                generated. Both options improve triangle shape; neither centres the
-                Voronoi generators within their cells. For Lloyd (centroidal
-                Voronoi) relaxation of the generators, use
-                ``VoronoiTessellator(lloyd_iterations=...)``.
-            tolerance_initial_delaunay (float): Tolerance for the initial Delaunay
-                point insertion. Increase this (e.g. 1e-4, 1e-2) to handle
-                "Could not insert point" errors caused by near-degenerate geometry
-                after fragmentation. This is a meshing-phase tolerance — it does NOT
-                alter the CAD topology, so no surfaces or lines are lost.
-                Default is 1e-8 (Gmsh default).
-            heal_shapes (bool): If True, run OCC topology healing after
-                fragmentation. This can fix degenerate geometry that causes
-                meshing failures, but may also merge or delete small entities.
-                Use with caution on complex models — keep heal_tolerance small.
-                Default is False.
-            heal_tolerance (float): Size threshold for healShapes. Entities
-                smaller than this may be removed or merged. Default 1e-8. only works if heal_shapes=True.
-            heal_fix_degenerated (bool): Fix degenerated edges/faces. Default True. Only works if heal_shapes=True.
-            heal_fix_small_edges (bool): Remove edges smaller than tolerance. Default True. Only works if heal_shapes=True.
-            heal_fix_small_faces (bool): Remove faces smaller than tolerance. Default True. Only works if heal_shapes=True.
-            diagnose (bool): If True, retain structured diagnostic details from
-                geometry transfer, embedding, and meshing steps.
-        """
         self.background_lc = background_lc
         self.verbosity = verbosity
         # Resolved level used by internal gates; refreshed at each generate().

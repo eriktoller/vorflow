@@ -477,6 +477,113 @@ def _owner_polygons(nodes, free, pieces):
 
 
 class VoronoiTessellator:
+    """
+    Builds the Voronoi grid from a triangular mesh.
+
+    This class takes a triangular mesh (typically from `MeshGenerator`) and
+    computes its dual: a Voronoi diagram. The resulting grid of polygonal
+    cells is suitable for use in cell-centered finite volume models.
+
+    Args:
+        mesh_generator (MeshGenerator): An instance of the mesh generator that
+            contains the generated triangular mesh nodes.
+        conceptual_mesh (ConceptualMesh): The conceptual model, used for CRS,
+            domain boundaries, and feature information.
+        clip_to_boundary (bool): If True, the final Voronoi grid will be
+            clipped to the domain boundary defined in the conceptual model.
+        boundary_centering (str): ``"clip"`` keeps the historical behavior.
+            ``"inset_mirror"`` shifts boundary generators inward and adds
+            mirrored outside ghosts so boundary-cell centers move off the
+            clipped face. On Gmsh meshes this lowers the median
+            centroid-to-centroid orthogonality error of boundary
+            connections from about 6 to under 2 degrees. Nodes at sharp
+            corners stay in place, so the worst connections next to
+            corners do not improve.
+        boundary_inset_fraction (float): Fraction of local boundary-node
+            spacing used for the inward shift in ``"inset_mirror"`` mode.
+            A boundary cell reaches about halfway to the first interior
+            row, so its generator sits near its centroid when the inset is
+            about a third of that row's depth. On Gmsh meshes the row lies
+            about 0.87 x spacing inside, so 0.2-0.3 works best. At 0.5
+            boundary nodes get closer to the interior row than to each
+            other and orthogonality ends up worse than ``"clip"``.
+        boundary_corner_angle (float): Boundary vertices with a local angle
+            below this value are treated as sharp corners and left unchanged.
+        boundary_tolerance (float, optional): Distance tolerance used to
+            classify generator nodes as boundary nodes.
+        lloyd_iterations (int): Number of Lloyd relaxation passes over the
+            generators before the Voronoi grid is built (0, the default,
+            turns it off). Each pass moves every free generator towards
+            the centroid of its Voronoi cell, so generators end up near
+            their cell centroids (lower ``drift_ratio`` in
+            ``vorflow.utils.calculate_mesh_quality``). The centroids are
+            weighted by the density h**-4, where h is the local mesh size
+            interpolated from ``MeshGenerator.node_sizes`` after
+            ``lloyd_size_smoothing``; this keeps the mesh grading (the
+            cell sizes around refined features) instead of evening out
+            the cell sizes. Only free nodes move: mesh
+            nodes inside the embedded polygon surfaces. Nodes on the domain
+            and zone boundaries, embedded points (and their hex-ring
+            seeds), embedded and barrier lines (including straddle pairs)
+            and the quad-buffer strips and bands stay fixed. A move is
+            rejected if it would leave the node's zone or cross an embedded
+            line. With Lloyd on, the cells are no longer the exact dual of
+            the triangle mesh (``MeshGenerator.get_element_grid()``) and
+            the grid gets a ``lloyd_shift`` column; ``lloyd_report`` holds
+            the run summary: passes run (``iterations``), the last pass's
+            largest relative residual (``max_rel_shift``, as for
+            ``lloyd_tolerance``), moves rejected (``rejected``) and the
+            number of free generators (``n_free``).
+
+            Lloyd is opt-in and mainly for models that use cell centroids
+            as cell centres, or for visually more regular cells. Head
+            accuracy is set mainly by ``growth_factor`` (how fine the
+            cells are relative to the curvature of the head), not by cell
+            shape. In a steady radial-flow (Thiem) test with generator
+            centres (rhugman/vorflow#31), 100 passes lowered the head
+            RMSE by at most about 5%. Each pass costs about one Voronoi
+            diagram of all nodes plus the weighted centroids of the free
+            cells; 100 passes took 5-10x the time of meshing and
+            tessellating once. Use 100 or more passes, together with
+            ``hex_ring=True`` on refined points. Lloyd leaves some very
+            short cell faces where four generators end up almost on one
+            circle (about 1% of faces after 30-100 passes, most around 20);
+            ``min_face_fraction=0.2`` removes them.
+            Requires a mesh generator that ran ``MeshGenerator.generate()``
+            before this tessellator was constructed.
+        lloyd_damping (float): Fraction of the way each free generator
+            moves towards its centroid per pass, in (0, 1]. Default 1.0.
+        lloyd_tolerance (float): Stop early after a pass in which the
+            largest distance from an accepted free generator to its
+            weighted centroid, relative to the local mesh size, is below
+            this (independent of ``lloyd_damping``). Default 1e-3.
+            Graded meshes usually run all ``lloyd_iterations`` passes.
+        lloyd_size_smoothing (int): Passes of smoothing applied to the
+            per-node sizes behind the Lloyd density (only used with
+            ``lloyd_iterations > 0``). Gmsh's node sizes jitter by about
+            10% between neighbouring nodes, i.e. +-30-45% in h**-4, and
+            Lloyd would otherwise converge to that noise. Each pass moves
+            the log size of every free node halfway to the mean over its
+            mesh-edge neighbours (``MeshGenerator.node_edges``); fixed
+            nodes keep their size and anchor the grading. Default 5;
+            from 10-20 passes on it starts to flatten steep grading. 0
+            uses ``node_sizes`` unchanged (the 0.2.0 behaviour).
+        min_face_fraction (float): Remove very short cell faces before the
+            grid is built (0, the default, turns it off). A face is short
+            when it is shorter than this fraction of the distance between
+            the two generators it separates; such faces come from four
+            generators lying almost on one circle, typically where a 5-
+            and a 7-sided cell meet, and are more common after Lloyd
+            relaxation. Each such group of four is opened by moving its
+            free generators slightly (the same free nodes and move checks
+            as Lloyd), repeated for up to 20 passes. Runs after Lloyd if
+            both are on. 0.2 removes the faces that are visibly short;
+            a regular hexagon's faces are 0.58. ``short_face_report``
+            holds the ``initial`` and ``final`` short-face counts,
+            ``passes`` and ``rejected`` moves, and the grid gets a
+            ``lloyd_shift`` column with the total move of each node.
+    """
+
     def __init__(
         self,
         mesh_generator,
@@ -492,112 +599,6 @@ class VoronoiTessellator:
         lloyd_size_smoothing=5,
         min_face_fraction=0.0,
     ):
-        """
-        Initializes the Voronoi tessellator.
-
-        This class takes a triangular mesh (typically from `MeshGenerator`) and
-        computes its dual: a Voronoi diagram. The resulting grid of polygonal
-        cells is suitable for use in cell-centered finite volume models.
-
-        Args:
-            mesh_generator (MeshGenerator): An instance of the mesh generator that
-                contains the generated triangular mesh nodes.
-            conceptual_mesh (ConceptualMesh): The conceptual model, used for CRS,
-                domain boundaries, and feature information.
-            clip_to_boundary (bool): If True, the final Voronoi grid will be
-                clipped to the domain boundary defined in the conceptual model.
-            boundary_centering (str): ``"clip"`` keeps the historical behavior.
-                ``"inset_mirror"`` shifts boundary generators inward and adds
-                mirrored outside ghosts so boundary-cell centers move off the
-                clipped face. On Gmsh meshes this lowers the median
-                centroid-to-centroid orthogonality error of boundary
-                connections from about 6 to under 2 degrees. Nodes at sharp
-                corners stay in place, so the worst connections next to
-                corners do not improve.
-            boundary_inset_fraction (float): Fraction of local boundary-node
-                spacing used for the inward shift in ``"inset_mirror"`` mode.
-                A boundary cell reaches about halfway to the first interior
-                row, so its generator sits near its centroid when the inset is
-                about a third of that row's depth. On Gmsh meshes the row lies
-                about 0.87 x spacing inside, so 0.2-0.3 works best. At 0.5
-                boundary nodes get closer to the interior row than to each
-                other and orthogonality ends up worse than ``"clip"``.
-            boundary_corner_angle (float): Boundary vertices with a local angle
-                below this value are treated as sharp corners and left unchanged.
-            boundary_tolerance (float, optional): Distance tolerance used to
-                classify generator nodes as boundary nodes.
-            lloyd_iterations (int): Number of Lloyd relaxation passes over the
-                generators before the Voronoi grid is built (0, the default,
-                turns it off). Each pass moves every free generator towards
-                the centroid of its Voronoi cell, so generators end up near
-                their cell centroids (lower ``drift_ratio`` in
-                ``vorflow.utils.calculate_mesh_quality``). The centroids are
-                weighted by the density h**-4, where h is the local mesh size
-                interpolated from ``MeshGenerator.node_sizes`` after
-                ``lloyd_size_smoothing``; this keeps the mesh grading (the
-                cell sizes around refined features) instead of evening out
-                the cell sizes. Only free nodes move: mesh
-                nodes inside the embedded polygon surfaces. Nodes on the domain
-                and zone boundaries, embedded points (and their hex-ring
-                seeds), embedded and barrier lines (including straddle pairs)
-                and the quad-buffer strips and bands stay fixed. A move is
-                rejected if it would leave the node's zone or cross an embedded
-                line. With Lloyd on, the cells are no longer the exact dual of
-                the triangle mesh (``MeshGenerator.get_element_grid()``) and
-                the grid gets a ``lloyd_shift`` column; ``lloyd_report`` holds
-                the run summary: passes run (``iterations``), the last pass's
-                largest relative residual (``max_rel_shift``, as for
-                ``lloyd_tolerance``), moves rejected (``rejected``) and the
-                number of free generators (``n_free``).
-
-                Lloyd is opt-in and mainly for models that use cell centroids
-                as cell centres, or for visually more regular cells. Head
-                accuracy is set mainly by ``growth_factor`` (how fine the
-                cells are relative to the curvature of the head), not by cell
-                shape. In a steady radial-flow (Thiem) test with generator
-                centres (rhugman/vorflow#31), 100 passes lowered the head
-                RMSE by at most about 5%. Each pass costs about one Voronoi
-                diagram of all nodes plus the weighted centroids of the free
-                cells; 100 passes took 5-10x the time of meshing and
-                tessellating once. Use 100 or more passes, together with
-                ``hex_ring=True`` on refined points. Lloyd leaves some very
-                short cell faces where four generators end up almost on one
-                circle (about 1% of faces after 30-100 passes, most around 20);
-                ``min_face_fraction=0.2`` removes them.
-                Requires a mesh generator that ran ``MeshGenerator.generate()``
-                before this tessellator was constructed.
-            lloyd_damping (float): Fraction of the way each free generator
-                moves towards its centroid per pass, in (0, 1]. Default 1.0.
-            lloyd_tolerance (float): Stop early after a pass in which the
-                largest distance from an accepted free generator to its
-                weighted centroid, relative to the local mesh size, is below
-                this (independent of ``lloyd_damping``). Default 1e-3.
-                Graded meshes usually run all ``lloyd_iterations`` passes.
-            lloyd_size_smoothing (int): Passes of smoothing applied to the
-                per-node sizes behind the Lloyd density (only used with
-                ``lloyd_iterations > 0``). Gmsh's node sizes jitter by about
-                10% between neighbouring nodes, i.e. +-30-45% in h**-4, and
-                Lloyd would otherwise converge to that noise. Each pass moves
-                the log size of every free node halfway to the mean over its
-                mesh-edge neighbours (``MeshGenerator.node_edges``); fixed
-                nodes keep their size and anchor the grading. Default 5;
-                from 10-20 passes on it starts to flatten steep grading. 0
-                uses ``node_sizes`` unchanged (the 0.2.0 behaviour).
-            min_face_fraction (float): Remove very short cell faces before the
-                grid is built (0, the default, turns it off). A face is short
-                when it is shorter than this fraction of the distance between
-                the two generators it separates; such faces come from four
-                generators lying almost on one circle, typically where a 5-
-                and a 7-sided cell meet, and are more common after Lloyd
-                relaxation. Each such group of four is opened by moving its
-                free generators slightly (the same free nodes and move checks
-                as Lloyd), repeated for up to 20 passes. Runs after Lloyd if
-                both are on. 0.2 removes the faces that are visibly short;
-                a regular hexagon's faces are 0.58. ``short_face_report``
-                holds the ``initial`` and ``final`` short-face counts,
-                ``passes`` and ``rejected`` moves, and the grid gets a
-                ``lloyd_shift`` column with the total move of each node.
-        """
         if boundary_centering not in {"clip", "inset_mirror"}:
             raise ValueError("boundary_centering must be either 'clip' or 'inset_mirror'.")
         if boundary_inset_fraction <= 0:
@@ -1334,6 +1335,17 @@ class VoronoiTessellator:
         return self.final_grid
 
     def export_to_shapefile(self, filepath):
+        """
+        Writes the grid from the last ``generate()`` to a file.
+
+        A thin wrapper around ``GeoDataFrame.to_file``, which picks the format
+        from the file extension (e.g. ``.shp``, ``.gpkg``) and needs an I/O
+        engine such as Pyogrio or Fiona. Logs a message and writes nothing
+        when ``generate()`` has not produced a grid.
+
+        Args:
+            filepath (str or Path): Output path.
+        """
         if self.final_grid is not None and not self.final_grid.empty:
             self.final_grid.to_file(filepath)
             logger.info(f"Saved to {filepath}")

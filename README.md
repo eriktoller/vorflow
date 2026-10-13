@@ -319,6 +319,19 @@ around wells.
 See [ROADMAP.md](https://github.com/rhugman/vorflow/blob/main/ROADMAP.md)
 for planned and completed milestones.
 
+## Contributing
+
+Bug reports, questions and pull requests are welcome; see
+[CONTRIBUTING.md](https://github.com/rhugman/vorflow/blob/main/CONTRIBUTING.md).
+Everyone taking part follows the
+[Code of Conduct](https://github.com/rhugman/vorflow/blob/main/CODE_OF_CONDUCT.md).
+
+## Citing
+
+If you use `vorflow` in your work, please cite it using the metadata in
+[CITATION.cff](https://github.com/rhugman/vorflow/blob/main/CITATION.cff)
+(GitHub's "Cite this repository" button formats it).
+
 ## Acknowledgements
 
 Thanks to David ([@d-strom](https://github.com/d-strom)) for reporting the

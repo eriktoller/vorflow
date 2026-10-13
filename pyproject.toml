@@ -10,12 +10,12 @@ readme = "README.md"
 license = "MIT"
 license-files = ["LICENSE"]
 authors = [
+    {name = "Rui Hugman"},
     {name = "Oscar Sanchez", email = "oscarfasanchez@gmail.com"},
-    {name = "rhugman"},
 ]
 maintainers = [
+    {name = "Rui Hugman"},
     {name = "Oscar Sanchez", email = "oscarfasanchez@gmail.com"},
-    {name = "rhugman"},
 ]
 requires-python = ">=3.10"
 keywords = ["modflow", "groundwater", "voronoi", "mesh", "gmsh"]

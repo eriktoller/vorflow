@@ -34,7 +34,7 @@ def _copy_notebooks(src, dst):
 _copy_notebooks(EXAMPLES_SRC, EXAMPLES_DST)
 
 project = "vorflow"
-author = "Oscar Sanchez and Rui Hugman"
+author = "Rui Hugman and Oscar Sanchez"
 copyright = "vorflow developers"
 release = vorflow.__version__
 version = release

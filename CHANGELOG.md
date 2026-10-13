@@ -9,6 +9,15 @@ and the project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- Documentation site at <https://rhugman.github.io/vorflow/>
+  ([#39](https://github.com/rhugman/vorflow/issues/39)): a Sphinx API
+  reference built from the docstrings, the README's user guide, and the
+  example notebooks, executed on every build. A `docs` extra installs the
+  toolchain; `.github/workflows/docs.yml` builds it on pull requests and
+  deploys it to GitHub Pages: `main` at the site root and `develop`
+  under `/dev/`. The deprecated keywords of
+  `add_polygon`, `add_line` and `add_point` are now listed in their own
+  "Deprecated parameters" docstring section.
 - `VoronoiTessellator(..., lloyd_size_smoothing=5)` smooths the per-node
   sizes behind the Lloyd density before relaxing
   ([#31](https://github.com/rhugman/vorflow/issues/31)). Gmsh's node sizes

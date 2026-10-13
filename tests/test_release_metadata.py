@@ -51,8 +51,9 @@ def test_people_have_names_and_no_placeholder_emails():
 
 
 def test_project_urls_point_to_upstream():
+    upstream = ("https://github.com/rhugman/vorflow", "https://rhugman.github.io/vorflow/")
     for url in _pyproject()["project"]["urls"].values():
-        assert url.startswith("https://github.com/rhugman/vorflow")
+        assert url.startswith(upstream)
 
 
 def test_minimum_dependency_job_pins_every_runtime_floor():

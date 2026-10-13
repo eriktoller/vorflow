@@ -1,0 +1,29 @@
+cff-version: 1.2.0
+message: "If you use vorflow, please cite it as below."
+title: "vorflow: Voronoi mesh generation for MODFLOW 6"
+type: software
+authors:
+  - given-names: Rui
+    family-names: Hugman
+    orcid: "https://orcid.org/0000-0003-0891-3886"
+    affiliation: INTERA Geoscience Pty Ltd
+  - given-names: Oscar
+    family-names: Sanchez
+version: 0.2.0
+date-released: 2026-10-05
+license: MIT
+repository-code: "https://github.com/rhugman/vorflow"
+url: "https://rhugman.github.io/vorflow/"
+abstract: >-
+  vorflow generates 2D unstructured Voronoi grids for MODFLOW 6 groundwater
+  models. It converts a conceptual model of polygons, lines and points into a
+  feature-conforming triangular mesh with Gmsh and takes its dual to produce
+  Voronoi cells, with local refinement, barriers, structured quad buffers and
+  DISV export.
+keywords:
+  - MODFLOW 6
+  - groundwater
+  - Voronoi
+  - unstructured grid
+  - mesh generation
+  - Gmsh

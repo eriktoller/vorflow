@@ -9,6 +9,20 @@ and the project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- `plot()` methods on `ConceptualMesh` (registered features, or the cleaned
+  ones with `clean=True`), `MeshGenerator` (the element grid) and
+  `VoronoiTessellator` (the cells, optionally with their generators)
+  ([#42](https://github.com/rhugman/vorflow/issues/42)). Each takes an
+  optional `ax` and returns the axes. Matplotlib stays optional: it is
+  imported only when `plot()` is called, and the new `plot` extra installs it.
+- `MeshGenerator(conceptual_mesh=...)`: `generate()` called without the clean
+  frames runs `conceptual_mesh.generate()` itself, and
+  `VoronoiTessellator(mesher)` takes the conceptual mesh from the generator
+  ([#42](https://github.com/rhugman/vorflow/issues/42)). Passing the three
+  clean frames and the conceptual mesh explicitly still works.
+- `VoronoiTessellator.grid`: the grid from the last `generate()`, raising a
+  `RuntimeError` before it has run. `final_grid` remains as before.
+
 - Documentation site at <https://rhugman.github.io/vorflow/>
   ([#39](https://github.com/rhugman/vorflow/issues/39)): a Sphinx API
   reference built from the docstrings, the README's user guide, and the
@@ -47,6 +61,11 @@ and the project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   unchanged.
 
 ### Changed
+
+- `MeshGenerator.generate()` returns the mesh generator instead of `True`
+  ([#42](https://github.com/rhugman/vorflow/issues/42)). It is still truthy,
+  so `assert mesher.generate(...)` keeps working; code comparing the result
+  with `is True` or `== True` needs updating.
 
 - Documentation follow-ups from
   [#39](https://github.com/rhugman/vorflow/issues/39): the constructor

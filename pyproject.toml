@@ -44,6 +44,9 @@ Documentation = "https://rhugman.github.io/vorflow/"
 Changelog = "https://github.com/rhugman/vorflow/blob/main/CHANGELOG.md"
 
 [project.optional-dependencies]
+plot = [
+    "matplotlib",         # The plot() methods import it lazily; the library works without it
+]
 examples = [
     "matplotlib",         # Plotting in examples/ and notebooks; the library itself never imports it
 ]

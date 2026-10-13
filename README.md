@@ -39,8 +39,8 @@ The typical workflow follows these steps:
 
 1.  **Define Geometry**: Create `shapely` objects for your model features (domain boundary, rivers, wells, etc.).
 2.  **Create a Blueprint**: Instantiate `ConceptualMesh` and add your geometries, specifying parameters like mesh resolution, refinement distances, and feature types (e.g., barriers).
-3.  **Generate Mesh**: Instantiate `MeshGenerator` and call its `generate()` method with the processed geometries from the blueprint. This produces a triangular mesh.
-4.  **Tessellate to Voronoi**: Instantiate `VoronoiTessellator` with the generated mesh and the blueprint. Calling its `generate()` method produces the final `GeoDataFrame` of Voronoi cells.
+3.  **Generate Mesh**: Instantiate `MeshGenerator` with the blueprint (`conceptual_mesh=blueprint`) and call its `generate()` method. It cleans the blueprint's features and produces a triangular mesh.
+4.  **Tessellate to Voronoi**: Instantiate `VoronoiTessellator` with the mesh generator. Calling its `generate()` method produces the final `GeoDataFrame` of Voronoi cells, also kept as `tessellator.grid`.
 5.  **Export**: The resulting `GeoDataFrame` can be easily saved to a shapefile or other formats.
 
 <!-- docs:installation-start -->
@@ -89,10 +89,11 @@ cd vorflow
 pip install -e ".[dev]"
 ```
 
-For plotting examples and notebooks without all development tools:
+The `plot()` methods need Matplotlib, from the `plot` extra; the `examples`
+extra installs it for the example scripts and notebooks:
 
 ```bash
-pip install -e ".[examples]"
+pip install -e ".[plot]"
 ```
 
 Alternatively, create the Conda development environment from
@@ -136,27 +137,47 @@ blueprint.add_line(
     is_barrier=True,
 )
 
-clean_polys, clean_lines, clean_pts = blueprint.generate()
+mesher = MeshGenerator(background_lc=100, conceptual_mesh=blueprint)
+mesher.generate()
 
-mesher = MeshGenerator(background_lc=100)
-mesher.generate(clean_polys, clean_lines, clean_pts)
-
-tessellator = VoronoiTessellator(mesher, blueprint, clip_to_boundary=True)
+tessellator = VoronoiTessellator(mesher, clip_to_boundary=True)
 grid_gdf = tessellator.generate()
 if grid_gdf.empty:
     raise RuntimeError("Basic Usage generated an empty Voronoi grid")
 ```
 
-The grid is a GeoDataFrame, so it plots directly (Matplotlib comes with the
-`examples` extra):
+`mesher.generate()` runs `blueprint.generate()` itself. To inspect or edit the
+cleaned features before meshing, call it yourself and pass the three
+GeoDataFrames on; keep their index, which links refinement fields back to
+their features:
+
+```python
+clean_polys, clean_lines, clean_pts = blueprint.generate()
+mesher = MeshGenerator(background_lc=100)
+mesher.generate(clean_polys, clean_lines, clean_pts)
+tessellator = VoronoiTessellator(mesher, blueprint)
+```
+
+### Plotting
+
+Each stage has a `plot()` method (Matplotlib, from the `plot` extra). Each
+takes an optional `ax` and returns the axes, so the stages can be overlaid:
+
+```python
+blueprint.plot()                    # registered features; plot(clean=True) after generate()
+mesher.plot()                       # triangular mesh; column="zone_id" to colour it
+tessellator.plot(column="zone_id")  # Voronoi cells; show_generators=True adds x/y
+```
+
+Keyword arguments go to `GeoDataFrame.plot`, and the returned axes take
+further layers:
 
 ```python
 import matplotlib.pyplot as plt
 
-ax = grid_gdf.plot(facecolor="whitesmoke", edgecolor="0.4", linewidth=0.3)
+ax = tessellator.plot(column=None, facecolor="whitesmoke", edgecolor="0.4")
 ax.plot(*fault_line.xy, color="tab:red", label="Fault-1 (barrier)")
 ax.plot(well_point.x, well_point.y, "o", color="tab:blue", label="Well-A")
-ax.set_aspect("equal")
 ax.legend()
 plt.show()
 ```

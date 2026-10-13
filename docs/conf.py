@@ -66,7 +66,6 @@ autodoc_default_options = {
     "member-order": "bysource",
     "show-inheritance": True,
 }
-autodoc_class_signature = "separated"
 autodoc_typehints = "description"
 napoleon_google_docstring = True
 napoleon_numpy_docstring = False

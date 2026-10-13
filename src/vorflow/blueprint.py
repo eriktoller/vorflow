@@ -391,41 +391,42 @@ def _warn_if_geographic_crs(crs):
 
 
 class ConceptualMesh:
+    """
+    Conceptual model: the raw geometric inputs of a vorflow mesh.
+
+    This class acts as a staging area for geometric features (polygons, lines,
+    points) before they are processed into a clean, non-overlapping set of
+    inputs for the mesh generator.
+
+    Args:
+        crs: The coordinate reference system for the project. Use a
+            *projected* CRS (e.g. a UTM zone like "EPSG:32618") so mesh
+            sizes are in real length units. Geographic CRSs (lat/lon
+            degrees, e.g. "EPSG:4326") produce physically meaningless
+            grids and trigger a warning -- reproject your data first with
+            GeoDataFrame.to_crs(). None (default) means local/unspecified
+            coordinates; output GeoDataFrames then carry no CRS.
+        connectivity_tolerance (float, optional): Default snapping tolerance used
+            during topology cleanup in generate(). Larger values make lines and
+            points connect more aggressively to nearby geometry.
+        line_junction_fraction (float, optional): Where embedded lines meet
+            or nearly meet, a line end that misses another line by less than
+            this fraction of its vertex spacing (``densify`` if numeric,
+            else ``resolution``) is snapped onto it, an overshoot shorter
+            than that is trimmed, each junction becomes a vertex of every
+            line through it, and line vertices closer than that to a
+            junction are dropped, so one node sits at the junction instead
+            of two a few units apart. Barrier/straddle, quad-buffer and
+            field-only lines are left out; line ends on polygon boundaries
+            never move. Default 0.5; 0 turns the step off. Each
+            ``generate()`` records what it did in ``junction_diagnostics``:
+            ``junctions`` (``point`` and the ``line_ids`` through it),
+            ``snapped_ends`` (``line_id``, ``end``, ``from``, ``to``) and
+            ``trimmed_ends`` (``line_id``, ``end``, cut ``length``).
+    """
+
     def __init__(self, crs=None, connectivity_tolerance=DEFAULT_CONNECTIVITY_TOLERANCE,
                  line_junction_fraction=DEFAULT_LINE_JUNCTION_FRACTION):
-        """
-        Initializes the conceptual model, which holds raw geometric inputs.
-
-        This class acts as a staging area for geometric features (polygons, lines,
-        points) before they are processed into a clean, non-overlapping set of
-        inputs for the mesh generator.
-
-        Args:
-            crs: The coordinate reference system for the project. Use a
-                *projected* CRS (e.g. a UTM zone like "EPSG:32618") so mesh
-                sizes are in real length units. Geographic CRSs (lat/lon
-                degrees, e.g. "EPSG:4326") produce physically meaningless
-                grids and trigger a warning -- reproject your data first with
-                GeoDataFrame.to_crs(). None (default) means local/unspecified
-                coordinates; output GeoDataFrames then carry no CRS.
-            connectivity_tolerance (float, optional): Default snapping tolerance used
-                during topology cleanup in generate(). Larger values make lines and
-                points connect more aggressively to nearby geometry.
-            line_junction_fraction (float, optional): Where embedded lines meet
-                or nearly meet, a line end that misses another line by less than
-                this fraction of its vertex spacing (``densify`` if numeric,
-                else ``resolution``) is snapped onto it, an overshoot shorter
-                than that is trimmed, each junction becomes a vertex of every
-                line through it, and line vertices closer than that to a
-                junction are dropped, so one node sits at the junction instead
-                of two a few units apart. Barrier/straddle, quad-buffer and
-                field-only lines are left out; line ends on polygon boundaries
-                never move. Default 0.5; 0 turns the step off. Each
-                ``generate()`` records what it did in ``junction_diagnostics``:
-                ``junctions`` (``point`` and the ``line_ids`` through it),
-                ``snapped_ends`` (``line_id``, ``end``, ``from``, ``to``) and
-                ``trimmed_ends`` (``line_id``, ``end``, cut ``length``).
-        """
         self.crs = crs
         _warn_if_geographic_crs(crs)
         self.connectivity_tolerance = _coerce_connectivity_tolerance(connectivity_tolerance)

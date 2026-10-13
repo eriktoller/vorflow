@@ -147,6 +147,26 @@ if grid_gdf.empty:
     raise RuntimeError("Basic Usage generated an empty Voronoi grid")
 ```
 
+The grid is a GeoDataFrame, so it plots directly (Matplotlib comes with the
+`examples` extra):
+
+```python
+import matplotlib.pyplot as plt
+
+ax = grid_gdf.plot(facecolor="whitesmoke", edgecolor="0.4", linewidth=0.3)
+ax.plot(*fault_line.xy, color="tab:red", label="Fault-1 (barrier)")
+ax.plot(well_point.x, well_point.y, "o", color="tab:blue", label="Well-A")
+ax.set_aspect("equal")
+ax.legend()
+plt.show()
+```
+
+<p align="center">
+  <img src="https://raw.githubusercontent.com/rhugman/vorflow/main/docs/images/basic_usage.png"
+       alt="Basic Usage grid: cells refine towards the fault barrier at x = 100 and around the well at (25, 25)"
+       width="60%">
+</p>
+
 ### Optional file export
 
 GeoPandas writes formats such as Shapefile and GeoPackage through an I/O engine

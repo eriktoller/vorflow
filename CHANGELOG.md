@@ -48,6 +48,14 @@ and the project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Changed
 
+- Documentation follow-ups from
+  [#39](https://github.com/rhugman/vorflow/issues/39): the constructor
+  docstrings of `ConceptualMesh`, `MeshGenerator` and `VoronoiTessellator`
+  move to the class, `ThresholdField` and
+  `VoronoiTessellator.export_to_shapefile` gain docstrings (so they appear in
+  the API reference), the example notebooks log warnings only
+  (`set_verbosity(0)`), and Basic Usage shows a plot of the grid.
+  `examples/basic_usage.py --plot PATH` saves that figure.
 - With `lloyd_iterations > 0` the grid differs from 0.2.0, because the Lloyd
   density now uses the smoothed sizes. Pass `lloyd_size_smoothing=0` for the
   0.2.0 grid. Without `hex_ring`, the cells of refined points can grow by

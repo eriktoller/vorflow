@@ -172,3 +172,36 @@ def test_barrier_cells_keep_orthogonal_generator_centres():
     assert connectivity["ortho_error"].max() < 1e-6
     assert _shortest_edge(grid) > 1e-9
     assert pytest.approx(unary_union(clean_polys.geometry).area, rel=1e-9) == grid.geometry.area.sum()
+
+
+def test_grid_property_raises_before_generate_and_matches_returned_grid():
+    cm = _build_simple_conceptual_mesh()
+    clean_polys, _, _ = cm.generate()
+    tessellator = VoronoiTessellator(FakeMeshGenerator(clean_polys), cm)
+
+    with pytest.raises(RuntimeError, match="generate"):
+        tessellator.grid
+
+    returned = tessellator.generate()
+    assert tessellator.grid is returned
+    assert tessellator.final_grid is returned
+
+
+def test_tessellator_takes_conceptual_mesh_from_mesh_generator():
+    cm = _build_simple_conceptual_mesh()
+    clean_polys, _, _ = cm.generate()
+    mesh_gen = FakeMeshGenerator(clean_polys)
+    mesh_gen.conceptual_mesh = cm
+
+    tessellator = VoronoiTessellator(mesh_gen)
+
+    assert tessellator.cm is cm
+    assert set(tessellator.generate()["zone_id"]) == {99}
+
+
+def test_tessellator_without_conceptual_mesh_raises():
+    cm = _build_simple_conceptual_mesh()
+    clean_polys, _, _ = cm.generate()
+
+    with pytest.raises(ValueError, match="conceptual_mesh"):
+        VoronoiTessellator(FakeMeshGenerator(clean_polys))

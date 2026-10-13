@@ -1,5 +1,7 @@
 import warnings
 
+import numpy as np
+
 import pytest
 from shapely.geometry import Point, Polygon, LineString, box
 import gmsh
@@ -457,3 +459,35 @@ def test_inset_mirror_improves_boundary_orthogonality_on_gmsh_mesh(domain, well)
 
     assert medians["clip"] > 4.0
     assert medians["inset_mirror"] < 0.5 * medians["clip"]
+
+
+@pytest.mark.slow
+def test_mesh_generator_meshes_attached_conceptual_mesh():
+    def build():
+        cm = ConceptualMesh()
+        cm.add_polygon(Polygon([(0, 0), (20, 0), (20, 20), (0, 20)]), zone_id=1, resolution=4)
+        cm.add_line(LineString([(2, 10), (18, 10)]), line_id="river", resolution=1)
+        return cm
+
+    explicit_cm = build()
+    explicit = MeshGenerator(background_lc=4, verbosity=0)
+    assert explicit.generate(*explicit_cm.generate()) is explicit
+    explicit_grid = VoronoiTessellator(explicit, explicit_cm).generate()
+
+    implicit = MeshGenerator(background_lc=4, verbosity=0, conceptual_mesh=build())
+    assert implicit.generate() is implicit
+    implicit_grid = VoronoiTessellator(implicit).generate()
+
+    np.testing.assert_allclose(implicit.nodes, explicit.nodes)
+    assert len(implicit_grid) == len(explicit_grid)
+
+
+def test_mesh_generator_generate_rejects_partial_or_missing_frames():
+    cm = ConceptualMesh()
+    cm.add_polygon(Polygon([(0, 0), (1, 0), (1, 1), (0, 1)]), zone_id=1)
+    polys, lines, _ = cm.generate()
+
+    with pytest.raises(ValueError, match="together"):
+        MeshGenerator(background_lc=1).generate(polys, lines)
+    with pytest.raises(ValueError, match="conceptual_mesh"):
+        MeshGenerator(background_lc=1).generate()

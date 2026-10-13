@@ -15,6 +15,7 @@ from shapely.validation import make_valid
 
 from . import _lloyd
 from ._features import polygon_parts
+from ._plot import get_ax
 
 logger = logging.getLogger(__name__)
 
@@ -487,8 +488,9 @@ class VoronoiTessellator:
     Args:
         mesh_generator (MeshGenerator): An instance of the mesh generator that
             contains the generated triangular mesh nodes.
-        conceptual_mesh (ConceptualMesh): The conceptual model, used for CRS,
-            domain boundaries, and feature information.
+        conceptual_mesh (ConceptualMesh, optional): The conceptual model, used
+            for CRS, domain boundaries, and feature information. Defaults to
+            the ``conceptual_mesh`` of ``mesh_generator``.
         clip_to_boundary (bool): If True, the final Voronoi grid will be
             clipped to the domain boundary defined in the conceptual model.
         boundary_centering (str): ``"clip"`` keeps the historical behavior.
@@ -587,7 +589,7 @@ class VoronoiTessellator:
     def __init__(
         self,
         mesh_generator,
-        conceptual_mesh,
+        conceptual_mesh=None,
         clip_to_boundary=True,
         boundary_centering="clip",
         boundary_inset_fraction=0.25,
@@ -611,6 +613,14 @@ class VoronoiTessellator:
                                  size_smoothing=lloyd_size_smoothing)
         if not (0.0 <= float(min_face_fraction) < 1.0):
             raise ValueError(f"min_face_fraction must be in [0, 1). Got {min_face_fraction!r}.")
+
+        if conceptual_mesh is None:
+            conceptual_mesh = getattr(mesh_generator, 'conceptual_mesh', None)
+        if conceptual_mesh is None:
+            raise ValueError(
+                "VoronoiTessellator needs a conceptual_mesh, passed here or to "
+                "MeshGenerator(conceptual_mesh=...)."
+            )
 
         self.mg = mesh_generator
         self.cm = conceptual_mesh
@@ -1156,6 +1166,13 @@ class VoronoiTessellator:
         current_grid['node_id'] = current_grid['node_id'].astype(node_id_dtype)
         return current_grid
 
+    @property
+    def grid(self):
+        """The Voronoi grid from the last ``generate()`` (a GeoDataFrame); same as ``final_grid``."""
+        if self.final_grid is None:
+            raise RuntimeError("Grid is not available. Call VoronoiTessellator.generate() first.")
+        return self.final_grid
+
     def generate(self):
         """
         Executes the full Voronoi tessellation workflow.
@@ -1351,3 +1368,30 @@ class VoronoiTessellator:
             logger.info(f"Saved to {filepath}")
         else:
             logger.info("No grid to export.")
+
+    def plot(self, ax=None, column="zone_id", show_generators=False, **kwargs):
+        """
+        Plots the Voronoi grid from the last ``generate()``.
+
+        Needs Matplotlib (``pip install vorflow[plot]``).
+
+        Args:
+            ax (matplotlib.axes.Axes, optional): Axes to draw on; a new figure
+                is created when None.
+            column (str, optional): Grid column to colour the cells by.
+                Default ``"zone_id"``; None draws outlines only.
+            show_generators (bool): Also draw the generator points (``x``/``y``).
+            **kwargs: Passed to ``GeoDataFrame.plot`` for the cells.
+
+        Returns:
+            matplotlib.axes.Axes: The axes drawn on.
+        """
+        ax = get_ax(ax)
+        grid = self.grid
+        cell_kwargs = {"edgecolor": "black", "linewidth": 0.3, **kwargs}
+        if column is None:
+            cell_kwargs.setdefault("facecolor", "none")
+        grid.plot(ax=ax, column=column, **cell_kwargs)
+        if show_generators:
+            ax.scatter(grid["x"], grid["y"], s=2, color="black", zorder=3)
+        return ax

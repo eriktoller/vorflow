@@ -14,6 +14,7 @@ from shapely.validation import make_valid
 from . import _junctions
 from ._features import line_parts as _line_parts
 from ._features import positive_number, row_bool
+from ._plot import features_frame, get_ax, plot_features
 from ._straddle import is_straddle_line, straddle_epsilon
 from .fields import DEFAULT_GROWTH_FACTOR, GeometricGrowthField, MeshField, ThresholdField
 from shapely.strtree import STRtree
@@ -1186,6 +1187,44 @@ class ConceptualMesh:
                 )
                 continue
             point_data['ring_seeds'] = seeds
+
+    def plot(self, ax=None, clean=False, column="zone_id", **kwargs):
+        """
+        Plots the conceptual model: polygons coloured by ``column``, with lines
+        and points on top.
+
+        Field-only (``embed=False``) features are drawn as dashed outlines,
+        dashed lines and hollow points. Needs Matplotlib
+        (``pip install vorflow[plot]``).
+
+        Args:
+            ax (matplotlib.axes.Axes, optional): Axes to draw on; a new figure
+                is created when None.
+            clean (bool): Plot the features from the last ``generate()``
+                instead of the registered raw features.
+            column (str, optional): Polygon column to colour by. Default
+                ``"zone_id"``; None draws them in one colour.
+            **kwargs: Passed to ``GeoDataFrame.plot`` for the polygons.
+
+        Returns:
+            matplotlib.axes.Axes: The axes drawn on.
+
+        Raises:
+            RuntimeError: If ``clean=True`` before ``generate()`` has run.
+        """
+        ax = get_ax(ax)
+        if clean:
+            if self.clean_polygons.empty:
+                raise RuntimeError(
+                    "Clean features are not available. Call ConceptualMesh.generate() first."
+                )
+            frames = (self.clean_polygons, self.clean_lines, self.clean_points)
+        else:
+            frames = tuple(
+                features_frame(features, self.crs)
+                for features in (self.raw_polygons, self.raw_lines, self.raw_points)
+            )
+        return plot_features(ax, *frames, column=column, **kwargs)
 
     def generate(self, connectivity_tolerance=None):
         """

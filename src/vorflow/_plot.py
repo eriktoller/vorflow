@@ -135,7 +135,11 @@ def plot_features(ax, polygons, lines, points, column="zone_id", **kwargs):
         n_collections = len(ax.collections)
         embedded.plot(ax=ax, **polygon_kwargs)
         if len(ax.collections) > n_collections:
-            add_polygon_legend_entries(ax, ax.collections[n_collections], embedded)
+            collection = ax.collections[n_collections]
+            # Some GeoPandas versions label the collection with a category
+            # value; the proxy patches are the polygon legend entries.
+            collection.set_label("_nolegend_")
+            add_polygon_legend_entries(ax, collection, embedded)
     if not field_only.empty:
         outlines = field_only.assign(geometry=field_only.boundary)
         plot_by_label(outlines, ax, color="grey", linestyle="--", linewidth=0.8)

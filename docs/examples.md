@@ -13,4 +13,5 @@ examples/basic_example
 examples/comprehensive_demo
 examples/point_centring_demo
 examples/cleaning_limitations_demo
+examples/basic_example_modflow
 ```

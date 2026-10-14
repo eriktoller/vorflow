@@ -128,6 +128,8 @@ def plot_features(ax, polygons, lines, points, column="zone_id", **kwargs):
     lines and hollow points, since they only size the mesh. Features with a
     ``label`` get one legend entry per label, shown by ``ax.legend()``.
     """
+    from matplotlib.colors import is_color_like
+
     embedded, field_only = split_embedded(polygons)
     if not embedded.empty:
         polygon_kwargs = {"edgecolor": "black", "linewidth": 0.8, "alpha": 0.6, **kwargs}
@@ -140,6 +142,12 @@ def plot_features(ax, polygons, lines, points, column="zone_id", **kwargs):
                 polygon_kwargs["color"] = colors
             else:
                 polygon_kwargs.update(column=column, categorical=categorical, cmap=cmap)
+        elif "facecolor" not in polygon_kwargs:
+            # One colour for all polygons: GeoPandas' default unless given.
+            polygon_kwargs.setdefault("color", "C0")
+        single_color = polygon_kwargs.get("facecolor", polygon_kwargs.get("color"))
+        if colors is None and is_color_like(single_color):
+            colors = [single_color] * len(embedded)
         n_collections = len(ax.collections)
         embedded.plot(ax=ax, **polygon_kwargs)
         for collection in ax.collections[n_collections:]:

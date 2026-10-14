@@ -92,6 +92,20 @@ def test_conceptual_mesh_plot_polygon_legend_entry_matches_fill():
     assert handle_fills == fills
 
 
+@pytest.mark.parametrize("plot_kwargs, expected", [
+    ({"column": None}, "C0"),
+    ({"column": None, "color": "wheat"}, "wheat"),
+    ({"facecolor": "none"}, "none"),
+])
+def test_conceptual_mesh_plot_single_colour_polygon_legend_entry(plot_kwargs, expected):
+    cm = ConceptualMesh()
+    cm.add_polygon(Polygon([(0, 0), (10, 0), (10, 10), (0, 10)]), zone_id=1, label="A")
+
+    handles, _ = cm.plot(alpha=1, **plot_kwargs).get_legend_handles_labels()
+
+    assert tuple(handles[0].get_facecolor()) == pytest.approx(matplotlib.colors.to_rgba(expected))
+
+
 def test_conceptual_mesh_plot_without_labels_has_no_legend_entries():
     _, labels = _model().plot().get_legend_handles_labels()
     assert labels == []

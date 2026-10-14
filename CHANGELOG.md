@@ -32,6 +32,8 @@ and the project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   label share an entry; unlabelled features get none. Before, all lines (and
   all points) were drawn as one artist, so a hand-written legend could label
   only the first of them.
+- `examples/plotting_demo.ipynb`: the three `plot()` methods, legend labels
+  and layering the conceptual model over the grid.
 - `MeshGenerator(conceptual_mesh=...)`: `generate()` called without the clean
   frames runs `conceptual_mesh.generate()` itself, and
   `VoronoiTessellator(mesher)` takes the conceptual mesh from the generator

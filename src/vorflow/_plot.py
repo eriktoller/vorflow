@@ -79,41 +79,44 @@ def plot_by_label(gdf, ax, colors=None, **kwargs):
         gdf.iloc[positions].plot(ax=ax, **group_kwargs)
 
 
-def row_colors(collection, gdf):
-    """Face colour of each ``gdf`` row in the polygon ``collection`` drawn from it, or None.
+def category_colors(values, cmap):
+    """Colour of each value as GeoPandas draws a categorical column with ``cmap``.
 
-    GeoPandas draws one patch per polygon part, so rows are matched to their
-    first part. None when the patches cannot be matched to rows (e.g. rows
-    left out for a missing ``column`` value).
+    Categories are the sorted unique values, spread evenly over the colormap;
+    missing values are light grey.
     """
-    facecolors = collection.get_facecolor()
-    if len(facecolors) == 1:
-        return [facecolors[0]] * len(gdf)
-    part_counts = [len(geom.geoms) if hasattr(geom, "geoms") else 1 for geom in gdf.geometry]
-    if len(facecolors) != sum(part_counts):
-        return None
-    first_parts = pd.Series(part_counts).cumsum() - part_counts
-    return [facecolors[i] for i in first_parts]
+    from matplotlib import colormaps
+
+    if isinstance(cmap, str):
+        cmap = colormaps[cmap]
+    categorical = pd.Categorical(values)
+    top_code = max(len(categorical.categories) - 1, 1)
+    return [cmap(code / top_code) if code >= 0 else "lightgrey" for code in categorical.codes]
 
 
-def add_polygon_legend_entries(ax, collection, gdf):
-    """Add a legend entry per label of the polygons ``gdf`` drawn as ``collection``.
+def add_polygon_legend_entries(ax, gdf, colors, polygon_kwargs):
+    """Add a legend entry per label of the polygons ``gdf`` drawn with ``polygon_kwargs``.
 
-    Matplotlib cannot use a polygon ``PatchCollection`` as a legend handle,
-    so each label gets an empty patch styled like the label's first polygon.
+    Polygon collections make poor legend handles (GeoPandas >= 1.2 also
+    labels them by category), so each label gets an empty patch styled like
+    its first polygon. Without ``colors`` (one per row) the patch is hollow.
     """
-    colors = row_colors(collection, gdf)
-    edgecolors = collection.get_edgecolor()
-    linewidths = collection.get_linewidth()
     for label, positions in label_groups(gdf):
         if label is None:
             continue
-        patch_kwargs = {"label": label, "linewidth": linewidths[0] if len(linewidths) else None}
-        if colors is not None:
-            patch_kwargs["facecolor"] = colors[positions[0]]
-        if len(edgecolors):
-            patch_kwargs["edgecolor"] = edgecolors[0]
-        ax.fill([], [], **patch_kwargs)
+        ax.fill(
+            [], [],
+            facecolor=colors[positions[0]] if colors is not None else "none",
+            edgecolor=polygon_kwargs.get("edgecolor"),
+            linewidth=polygon_kwargs.get("linewidth"),
+            alpha=polygon_kwargs.get("alpha"),
+            label=label,
+        )
+
+
+# Polygon keywords that take over GeoPandas' colouring, so the categorical
+# colours are left to GeoPandas and are not known for the legend.
+GEOPANDAS_COLOUR_KEYWORDS = {"color", "facecolor", "norm", "vmin", "vmax", "categories", "legend"}
 
 
 def plot_features(ax, polygons, lines, points, column="zone_id", **kwargs):
@@ -128,18 +131,20 @@ def plot_features(ax, polygons, lines, points, column="zone_id", **kwargs):
     embedded, field_only = split_embedded(polygons)
     if not embedded.empty:
         polygon_kwargs = {"edgecolor": "black", "linewidth": 0.8, "alpha": 0.6, **kwargs}
+        colors = None
         if column is not None and column in embedded.columns:
-            polygon_kwargs.setdefault("categorical", True)
-            polygon_kwargs.setdefault("cmap", "Pastel1")
-            polygon_kwargs["column"] = column
+            categorical = polygon_kwargs.pop("categorical", True)
+            cmap = polygon_kwargs.pop("cmap", "Pastel1")
+            if categorical and not GEOPANDAS_COLOUR_KEYWORDS & set(kwargs):
+                colors = category_colors(embedded[column], cmap)
+                polygon_kwargs["color"] = colors
+            else:
+                polygon_kwargs.update(column=column, categorical=categorical, cmap=cmap)
         n_collections = len(ax.collections)
         embedded.plot(ax=ax, **polygon_kwargs)
-        if len(ax.collections) > n_collections:
-            collection = ax.collections[n_collections]
-            # Some GeoPandas versions label the collection with a category
-            # value; the proxy patches are the polygon legend entries.
+        for collection in ax.collections[n_collections:]:
             collection.set_label("_nolegend_")
-            add_polygon_legend_entries(ax, collection, embedded)
+        add_polygon_legend_entries(ax, embedded, colors, polygon_kwargs)
     if not field_only.empty:
         outlines = field_only.assign(geometry=field_only.boundary)
         plot_by_label(outlines, ax, color="grey", linestyle="--", linewidth=0.8)

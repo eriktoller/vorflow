@@ -84,11 +84,12 @@ def test_conceptual_mesh_plot_polygon_legend_entry_matches_fill():
 
     ax = cm.plot()
 
-    fills = ax.collections[0].get_facecolor()
+    fills = {tuple(fill) for collection in ax.collections for fill in collection.get_facecolor()}
     handles, labels = ax.get_legend_handles_labels()
     assert labels == ["A", "B"]
-    for handle, fill in zip(handles, fills):
-        assert tuple(handle.get_facecolor()) == pytest.approx(tuple(fill))
+    handle_fills = {tuple(handle.get_facecolor()) for handle in handles}
+    assert len(handle_fills) == 2
+    assert handle_fills == fills
 
 
 def test_conceptual_mesh_plot_without_labels_has_no_legend_entries():

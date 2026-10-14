@@ -52,6 +52,89 @@ def test_conceptual_mesh_plot_uses_given_axes():
     assert _model().plot(ax=ax, column=None) is ax
 
 
+def _labelled_model():
+    cm = ConceptualMesh()
+    cm.add_polygon(Polygon([(0, 0), (10, 0), (10, 10), (0, 10)]), zone_id=1, label="Region")
+    cm.add_polygon(Polygon([(6, 6), (8, 6), (8, 8), (6, 8)]), zone_id=2, embed=False, label="Refine")
+    cm.add_line(LineString([(5, 0), (5, 8)]), line_id="fault", resolution=1, is_barrier=True,
+                label="Fault")
+    cm.add_line(LineString([(0, 2), (10, 2)]), line_id="left", resolution=1, label="Boundary")
+    cm.add_line(LineString([(0, 4), (10, 4)]), line_id="right", resolution=1, label="Boundary")
+    cm.add_line(LineString([(0, 9), (10, 9)]), line_id="unlabelled", resolution=1)
+    cm.add_point(Point(2, 6), point_id="well", resolution=0.5, label="Well")
+    return cm
+
+
+@pytest.mark.parametrize("clean", [False, True])
+def test_conceptual_mesh_plot_gives_one_legend_entry_per_label(clean):
+    cm = _labelled_model()
+    if clean:
+        cm.generate()
+
+    legend = cm.plot(clean=clean).legend()
+
+    labels = [text.get_text() for text in legend.get_texts()]
+    assert labels == ["Region", "Refine", "Fault", "Boundary", "Well"]
+
+
+def test_conceptual_mesh_plot_polygon_legend_entry_matches_fill():
+    cm = ConceptualMesh()
+    cm.add_polygon(Polygon([(0, 0), (10, 0), (10, 10), (0, 10)]), zone_id=1, label="A")
+    cm.add_polygon(Polygon([(2, 2), (4, 2), (4, 4), (2, 4)]), zone_id=2, z_order=1, label="B")
+
+    ax = cm.plot()
+
+    fills = {tuple(fill) for collection in ax.collections for fill in collection.get_facecolor()}
+    handles, labels = ax.get_legend_handles_labels()
+    assert labels == ["A", "B"]
+    handle_fills = {tuple(handle.get_facecolor()) for handle in handles}
+    assert len(handle_fills) == 2
+    assert handle_fills == fills
+
+
+@pytest.mark.parametrize("plot_kwargs, expected", [
+    ({"column": None}, "C0"),
+    ({"column": None, "color": "wheat"}, "wheat"),
+    ({"facecolor": "none"}, "none"),
+])
+def test_conceptual_mesh_plot_single_colour_polygon_legend_entry(plot_kwargs, expected):
+    cm = ConceptualMesh()
+    cm.add_polygon(Polygon([(0, 0), (10, 0), (10, 10), (0, 10)]), zone_id=1, label="A")
+
+    handles, _ = cm.plot(alpha=1, **plot_kwargs).get_legend_handles_labels()
+
+    assert tuple(handles[0].get_facecolor()) == pytest.approx(matplotlib.colors.to_rgba(expected))
+
+
+@pytest.mark.parametrize("clean", [False, True])
+def test_conceptual_mesh_plot_uses_line_colour(clean):
+    cm = ConceptualMesh()
+    cm.add_polygon(Polygon([(0, 0), (10, 0), (10, 10), (0, 10)]), zone_id=1)
+    cm.add_line(LineString([(0, 2), (10, 2)]), line_id="river", resolution=1, label="River",
+                color="navy")
+    cm.add_line(LineString([(0, 6), (10, 6)]), line_id="drain", resolution=1, label="Drain",
+                color=(0.0, 0.5, 0.0))
+    cm.add_line(LineString([(5, 0), (5, 9)]), line_id="fault", resolution=1, is_barrier=True,
+                label="Fault")
+    if clean:
+        cm.generate()
+
+    handles, labels = cm.plot(clean=clean).get_legend_handles_labels()
+
+    colors = {label: tuple(handle.get_color()[0]) for handle, label in zip(handles, labels)}
+    to_rgba = matplotlib.colors.to_rgba
+    assert colors == {
+        "River": pytest.approx(to_rgba("navy")),
+        "Drain": pytest.approx(to_rgba((0.0, 0.5, 0.0))),
+        "Fault": pytest.approx(to_rgba("tab:red")),
+    }
+
+
+def test_conceptual_mesh_plot_without_labels_has_no_legend_entries():
+    _, labels = _model().plot().get_legend_handles_labels()
+    assert labels == []
+
+
 def test_tessellator_plot_draws_cells_and_generators():
     cm = ConceptualMesh()
     cm.add_polygon(Polygon([(0, 0), (2, 0), (2, 2), (0, 2)]), zone_id=99, densify=0.5)

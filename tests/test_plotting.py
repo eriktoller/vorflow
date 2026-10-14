@@ -52,6 +52,50 @@ def test_conceptual_mesh_plot_uses_given_axes():
     assert _model().plot(ax=ax, column=None) is ax
 
 
+def _labelled_model():
+    cm = ConceptualMesh()
+    cm.add_polygon(Polygon([(0, 0), (10, 0), (10, 10), (0, 10)]), zone_id=1, label="Region")
+    cm.add_polygon(Polygon([(6, 6), (8, 6), (8, 8), (6, 8)]), zone_id=2, embed=False, label="Refine")
+    cm.add_line(LineString([(5, 0), (5, 8)]), line_id="fault", resolution=1, is_barrier=True,
+                label="Fault")
+    cm.add_line(LineString([(0, 2), (10, 2)]), line_id="left", resolution=1, label="Boundary")
+    cm.add_line(LineString([(0, 4), (10, 4)]), line_id="right", resolution=1, label="Boundary")
+    cm.add_line(LineString([(0, 9), (10, 9)]), line_id="unlabelled", resolution=1)
+    cm.add_point(Point(2, 6), point_id="well", resolution=0.5, label="Well")
+    return cm
+
+
+@pytest.mark.parametrize("clean", [False, True])
+def test_conceptual_mesh_plot_gives_one_legend_entry_per_label(clean):
+    cm = _labelled_model()
+    if clean:
+        cm.generate()
+
+    legend = cm.plot(clean=clean).legend()
+
+    labels = [text.get_text() for text in legend.get_texts()]
+    assert labels == ["Region", "Refine", "Fault", "Boundary", "Well"]
+
+
+def test_conceptual_mesh_plot_polygon_legend_entry_matches_fill():
+    cm = ConceptualMesh()
+    cm.add_polygon(Polygon([(0, 0), (10, 0), (10, 10), (0, 10)]), zone_id=1, label="A")
+    cm.add_polygon(Polygon([(2, 2), (4, 2), (4, 4), (2, 4)]), zone_id=2, z_order=1, label="B")
+
+    ax = cm.plot()
+
+    fills = ax.collections[0].get_facecolor()
+    handles, labels = ax.get_legend_handles_labels()
+    assert labels == ["A", "B"]
+    for handle, fill in zip(handles, fills):
+        assert tuple(handle.get_facecolor()) == pytest.approx(tuple(fill))
+
+
+def test_conceptual_mesh_plot_without_labels_has_no_legend_entries():
+    _, labels = _model().plot().get_legend_handles_labels()
+    assert labels == []
+
+
 def test_tessellator_plot_draws_cells_and_generators():
     cm = ConceptualMesh()
     cm.add_polygon(Polygon([(0, 0), (2, 0), (2, 2), (0, 2)]), zone_id=99, densify=0.5)

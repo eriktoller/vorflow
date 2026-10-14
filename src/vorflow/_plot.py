@@ -12,7 +12,7 @@ from ._features import is_embedded, row_bool
 
 # Columns the raw feature dicts are reduced to before plotting; the rest
 # (fields, refinement settings) cannot go into a GeoDataFrame cleanly.
-RAW_PLOT_COLUMNS = ("geometry", "zone_id", "embed", "is_barrier", "label")
+RAW_PLOT_COLUMNS = ("geometry", "zone_id", "embed", "is_barrier", "label", "color")
 
 
 def require_matplotlib():
@@ -79,6 +79,17 @@ def plot_by_label(gdf, ax, colors=None, **kwargs):
         gdf.iloc[positions].plot(ax=ax, **group_kwargs)
 
 
+def line_colors(gdf, barrier_color="tab:red"):
+    """Colour of each line row: its ``color``, else ``barrier_color`` for barriers and blue otherwise."""
+    colors = []
+    for _, row in gdf.iterrows():
+        color = row.get("color")
+        if color is None or (isinstance(color, float) and pd.isna(color)):
+            color = barrier_color if row_bool(row, "is_barrier") else "tab:blue"
+        colors.append(color)
+    return colors
+
+
 def category_colors(values, cmap):
     """Colour of each value as GeoPandas draws a categorical column with ``cmap``.
 
@@ -123,8 +134,8 @@ def plot_features(ax, polygons, lines, points, column="zone_id", **kwargs):
     """Draw conceptual-model features on ``ax``; returns ``ax``.
 
     Embedded polygons are filled by ``column`` (``kwargs`` go to their
-    ``GeoDataFrame.plot``); lines and points are drawn on top, barrier lines
-    in red. Field-only (``embed=False``) features are dashed outlines, dashed
+    ``GeoDataFrame.plot``); lines and points are drawn on top, each line in
+    its ``color`` (default: barriers red, others blue). Field-only (``embed=False``) features are dashed outlines, dashed
     lines and hollow points, since they only size the mesh. Features with a
     ``label`` get one legend entry per label, shown by ``ax.legend()``.
     """
@@ -159,11 +170,9 @@ def plot_features(ax, polygons, lines, points, column="zone_id", **kwargs):
 
     embedded, field_only = split_embedded(lines)
     if not embedded.empty:
-        colors = ["tab:red" if row_bool(row, "is_barrier") else "tab:blue"
-                  for _, row in embedded.iterrows()]
-        plot_by_label(embedded, ax, colors=colors, linewidth=1.5)
+        plot_by_label(embedded, ax, colors=line_colors(embedded), linewidth=1.5)
     if not field_only.empty:
-        plot_by_label(field_only, ax, color="tab:blue", linestyle="--", linewidth=1.0)
+        plot_by_label(field_only, ax, colors=line_colors(field_only, barrier_color="tab:blue"), linestyle="--", linewidth=1.0)
 
     embedded, field_only = split_embedded(points)
     if not embedded.empty:

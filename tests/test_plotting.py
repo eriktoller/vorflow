@@ -106,6 +106,30 @@ def test_conceptual_mesh_plot_single_colour_polygon_legend_entry(plot_kwargs, ex
     assert tuple(handles[0].get_facecolor()) == pytest.approx(matplotlib.colors.to_rgba(expected))
 
 
+@pytest.mark.parametrize("clean", [False, True])
+def test_conceptual_mesh_plot_uses_line_colour(clean):
+    cm = ConceptualMesh()
+    cm.add_polygon(Polygon([(0, 0), (10, 0), (10, 10), (0, 10)]), zone_id=1)
+    cm.add_line(LineString([(0, 2), (10, 2)]), line_id="river", resolution=1, label="River",
+                color="navy")
+    cm.add_line(LineString([(0, 6), (10, 6)]), line_id="drain", resolution=1, label="Drain",
+                color=(0.0, 0.5, 0.0))
+    cm.add_line(LineString([(5, 0), (5, 9)]), line_id="fault", resolution=1, is_barrier=True,
+                label="Fault")
+    if clean:
+        cm.generate()
+
+    handles, labels = cm.plot(clean=clean).get_legend_handles_labels()
+
+    colors = {label: tuple(handle.get_color()[0]) for handle, label in zip(handles, labels)}
+    to_rgba = matplotlib.colors.to_rgba
+    assert colors == {
+        "River": pytest.approx(to_rgba("navy")),
+        "Drain": pytest.approx(to_rgba((0.0, 0.5, 0.0))),
+        "Fault": pytest.approx(to_rgba("tab:red")),
+    }
+
+
 def test_conceptual_mesh_plot_without_labels_has_no_legend_entries():
     _, labels = _model().plot().get_legend_handles_labels()
     assert labels == []

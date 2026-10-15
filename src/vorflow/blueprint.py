@@ -463,6 +463,7 @@ class ConceptualMesh:
         border_density=None,
         dist_max_in=None,
         dist_max_out=None,
+        label=None,
     ):
         """
         Adds a polygon feature, such as a model boundary or a refinement zone.
@@ -514,6 +515,8 @@ class ConceptualMesh:
             quad_buffer_thickness (int): Band width in local cell widths
                 (multiples of ``resolution``, like gmshflow's ``cs_thick``).
                 Supported values are 1 and 2.
+            label (str, optional): Legend label for ``plot()``. Features sharing a
+                label share one legend entry; unlabelled features get none.
 
         Deprecated parameters:
             dist_min (float, optional): Distance from the polygon boundary where
@@ -588,13 +591,14 @@ class ConceptualMesh:
                 'growth_factor': growth_factor,
                 'border_lc': border_lc,
                 'dist_max_in': dist_max_in if border_lc is not None else None,
+                'label': label,
             }
         )
 
     def add_line(self, geometry, line_id, resolution, snap_to_polygons=True, is_barrier=False,
                   dist_min=None, dist_max=None, straddle_width=None, fields=None, embed=True, densify=True,
                   simplify_tolerance=None, quad_buffer=False, quad_buffer_thickness=1, z_order=0,
-                  growth_factor=None):
+                  growth_factor=None, label=None, color=None):
         """
         Adds a line feature, such as a river, fault, or other linear boundary.
 
@@ -642,6 +646,10 @@ class ConceptualMesh:
             growth_factor (float, optional): Cell-to-cell growth ratio (>1.0) for the default
                 GeometricGrowthField size transition away from the line. Defaults to 1.2.
                 Ignored when an explicit ``fields`` list or the legacy dist_min/dist_max is given.
+            label (str, optional): Legend label for ``plot()``. Features sharing a
+                label share one legend entry; unlabelled features get none.
+            color (optional): Matplotlib colour for the line in ``plot()``. None
+                (default) draws barriers red and other lines blue.
 
         Deprecated parameters:
             dist_min (float, optional): Distance from the line where the mesh size
@@ -692,10 +700,13 @@ class ConceptualMesh:
             'quad_buffer_thickness': int(quad_buffer_thickness),
             'z_order': z_order,
             'growth_factor': growth_factor,
+            'label': label,
+            'color': color,
         })
 
     def add_point(self, geometry, point_id, resolution, dist_min=None, dist_max=None, fields=None,
-                  embed=True, simplify_tolerance=None, growth_factor=None, hex_ring=False):
+                  embed=True, simplify_tolerance=None, growth_factor=None, hex_ring=False,
+                  label=None):
         """
         Adds a point feature, such as a well or an observation point.
 
@@ -732,6 +743,8 @@ class ConceptualMesh:
                 below the ring radius) are caught after meshing: ``MeshGenerator``
                 warns when a ring was split and records the outcome per point in
                 ``diagnostics['hex_rings']``.
+            label (str, optional): Legend label for ``plot()``. Features sharing a
+                label share one legend entry; unlabelled features get none.
 
         Deprecated parameters:
             dist_min (float, optional): Distance from the point where the mesh size
@@ -772,6 +785,7 @@ class ConceptualMesh:
             'simplify_tolerance': simplify_tolerance,
             'growth_factor': growth_factor,
             'hex_ring': bool(hex_ring),
+            'label': label,
         })
 
     def _apply_simplification(self):
@@ -873,6 +887,7 @@ class ConceptualMesh:
                     "growth_factor",
                     "border_lc",
                     "dist_max_in",
+                    "label",
                 ],
                 crs=self.crs,
             )
@@ -1191,7 +1206,9 @@ class ConceptualMesh:
     def plot(self, ax=None, clean=False, column="zone_id", **kwargs):
         """
         Plots the conceptual model: polygons coloured by ``column``, with lines
-        and points on top.
+        and points on top. Lines take the ``color`` given to ``add_line``
+        (default: barriers red, others blue), and features with a ``label``
+        get one legend entry per label for ``ax.legend()``.
 
         Field-only (``embed=False``) features are drawn as dashed outlines,
         dashed lines and hollow points. Needs Matplotlib
@@ -1301,6 +1318,8 @@ class ConceptualMesh:
                     'quad_buffer_thickness',
                     'z_order',
                     'growth_factor',
+                    'label',
+                    'color',
                 ],
                 crs=self.crs,
             )
@@ -1321,6 +1340,7 @@ class ConceptualMesh:
                     'simplify_tolerance',
                     'growth_factor',
                     'hex_ring',
+                    'label',
                     'ring_seeds',
                 ],
                 crs=self.crs,
@@ -1375,6 +1395,7 @@ class ConceptualMesh:
                     'quad_buffer',
                     'quad_buffer_thickness',
                     'growth_factor',
+                    'label',
                 ]
                 self.clean_polygons = self.clean_polygons.reindex(columns=polygon_columns)
                 field_only_gdf = field_only_gdf.reindex(columns=polygon_columns)

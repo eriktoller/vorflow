@@ -25,6 +25,17 @@ and the project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   ([#42](https://github.com/rhugman/vorflow/issues/42)). Each takes an
   optional `ax` and returns the axes. Matplotlib stays optional: it is
   imported only when `plot()` is called, and the new `plot` extra installs it.
+- `label=` on `ConceptualMesh.add_polygon`, `add_line` and `add_point`:
+  `ConceptualMesh.plot()` gives each label one legend entry, so
+  `ax.legend()` needs no arguments
+  ([#50](https://github.com/rhugman/vorflow/issues/50)). Features sharing a
+  label share an entry; unlabelled features get none. Before, all lines (and
+  all points) were drawn as one artist, so a hand-written legend could label
+  only the first of them.
+- `color=` on `ConceptualMesh.add_line`: the line's colour in `plot()`
+  (default: barriers red, others blue).
+- `examples/plotting_demo.ipynb`: the three `plot()` methods, legend labels
+  and layering the conceptual model over the grid.
 - `MeshGenerator(conceptual_mesh=...)`: `generate()` called without the clean
   frames runs `conceptual_mesh.generate()` itself, and
   `VoronoiTessellator(mesher)` takes the conceptual mesh from the generator

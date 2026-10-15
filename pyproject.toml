@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "vorflow"
-version = "0.2.0"
+version = "0.3.0"
 description = "Voronoi mesh generation for MODFLOW 6 using Gmsh and GeoPandas"
 readme = "README.md"
 license = "MIT"

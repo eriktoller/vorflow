@@ -9,8 +9,8 @@ authors:
     affiliation: INTERA Geoscience Pty Ltd
   - given-names: Oscar
     family-names: Sanchez
-version: 0.2.0
-date-released: 2026-10-05
+version: 0.3.0
+date-released: 2026-10-15
 license: MIT
 repository-code: "https://github.com/rhugman/vorflow"
 url: "https://rhugman.github.io/vorflow/"

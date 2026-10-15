@@ -7,6 +7,12 @@ and the project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.3.0] - 2026-10-15
+
+MODFLOW 6 DISV export (`to_disv()`, `to_modflowgwfdisv()`), `plot()` methods
+with legend labels and line colours, `to_file()`, and a documentation site.
+`MeshGenerator.generate()` now returns the generator instead of `True`.
+
 ### Added
 
 - `VoronoiTessellator.to_disv()` and `vorflow.utils.grid_to_disv()` return
@@ -416,7 +422,8 @@ First release on PyPI. There are no changes since 0.1.0rc1.
   and `dist_max_in`.
 - `dist_min`/`dist_max` on features; use `growth_factor` or explicit `fields`.
 
-[Unreleased]: https://github.com/rhugman/vorflow/compare/v0.2.0...HEAD
+[Unreleased]: https://github.com/rhugman/vorflow/compare/v0.3.0...HEAD
+[0.3.0]: https://github.com/rhugman/vorflow/compare/v0.2.0...v0.3.0
 [0.2.0]: https://github.com/rhugman/vorflow/compare/v0.1.0...v0.2.0
 [0.1.0]: https://github.com/rhugman/vorflow/compare/v0.1.0rc1...v0.1.0
 [0.1.0rc1]: https://github.com/rhugman/vorflow/tree/v0.1.0rc1

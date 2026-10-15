@@ -1,10 +1,16 @@
-# vorflow Roadmap - Porting robust capabilities from `gmshflow`
+# Design notes - porting robust capabilities from `gmshflow`
 
-This roadmap captures the agreed plan for bringing the strongest features of the
+> **Archived.** This was the roadmap for porting `gmshflow` features into
+> `vorflow`. All milestones are done, and `0.1.0` and `0.2.0` are released.
+> It is kept as a design record; current work is tracked in
+> [GitHub issues](https://github.com/rhugman/vorflow/issues) and the
+> [changelog](../../CHANGELOG.md).
+
+This plan set out how to bring the strongest features of the
 pre-refactor `gmshflow` library into `vorflow`, while keeping `vorflow`'s current
 defaults backward-compatible and adding robust paths as opt-in options.
 
-Each milestone has a self-contained document under [`docs/roadmap/`](docs/roadmap/)
+Each milestone has a self-contained document in this folder
 with goals, files to touch, source references, reuse notes, and verification
 steps.
 
@@ -44,27 +50,20 @@ or useful enough to port.
 - A general `merge_many_multilinestring_into_one_linestring` helper: add only a
   localized repair if structured buffers actually encounter offset-curve splits.
 
-## Current Objective
-
-| # | Milestone | Status | Risk | Behavior change | Doc |
-|---|-----------|--------|------|-----------------|-----|
-| 6 | First PyPI release | TestPyPI verified | Low | None (packaging/metadata only) | [06-pypi-publishing.md](docs/roadmap/06-pypi-publishing.md) |
-
-`0.1.0rc1` was published to TestPyPI and verified on 2026-09-30. The
-milestone becomes **Done** once `0.1.0` is published to PyPI.
-
-## Completed Milestones
+## Milestones
 
 | # | Milestone | Status | Doc |
 |---|-----------|--------|-----|
-| 1 | Quality metrics | Done | [01-quality-metrics.md](docs/roadmap/01-quality-metrics.md) |
-| 2 | Active-domain filtering workflow | Done (example) | [02-robust-clipping.md](docs/roadmap/02-robust-clipping.md) |
-| 3 | Boundary inset/mirror points | Done | [03-boundary-mirror-points.md](docs/roadmap/03-boundary-mirror-points.md) |
-| 4 | Structured-quad transfinite buffer | Done | [04-structured-quad-buffer.md](docs/roadmap/04-structured-quad-buffer.md) |
-| 5 | Triangular/mixed element-grid output | Done | [05-triangular-grid-output.md](docs/roadmap/05-triangular-grid-output.md) |
-| 7 | Centred point cells and Lloyd relaxation | Done | [07-point-centring-lloyd.md](docs/roadmap/07-point-centring-lloyd.md) |
+| 1 | Quality metrics | Done | [01-quality-metrics.md](01-quality-metrics.md) |
+| 2 | Active-domain filtering workflow | Done (example) | [02-robust-clipping.md](02-robust-clipping.md) |
+| 3 | Boundary inset/mirror points | Done | [03-boundary-mirror-points.md](03-boundary-mirror-points.md) |
+| 4 | Structured-quad transfinite buffer | Done | [04-structured-quad-buffer.md](04-structured-quad-buffer.md) |
+| 5 | Triangular/mixed element-grid output | Done | [05-triangular-grid-output.md](05-triangular-grid-output.md) |
+| 6 | First PyPI release | Done (`0.1.0`) | [06-pypi-publishing.md](06-pypi-publishing.md) |
+| 7 | Centred point cells and Lloyd relaxation | Done | [07-point-centring-lloyd.md](07-point-centring-lloyd.md) |
 
-Six milestones are implemented (1-5 and 7): quality metrics and connectivity
+All seven milestones are done. `0.1.0` was released to PyPI (milestone 6),
+and the features are: quality metrics and connectivity
 reports (`get_triangular_quality`, `utils.build_connectivity`), the
 active-domain workflow example (`examples/active_domain_quality_example.py`),
 opt-in boundary inset/mirror points

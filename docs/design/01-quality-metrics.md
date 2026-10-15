@@ -1,7 +1,7 @@
 # Milestone 1 — Quality metrics
 
 **Status:** planned · **Risk:** low · **Behavior change:** additive only
-**Back to** [ROADMAP.md](../../ROADMAP.md)
+**Back to** [design notes](README.md)
 
 ## Goal
 

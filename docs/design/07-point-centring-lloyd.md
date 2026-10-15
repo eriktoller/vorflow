@@ -1,7 +1,7 @@
 # Milestone 7 — Centred point cells and Lloyd relaxation (opt-in)
 
 **Status:** done · **Risk:** medium · **Behavior change:** none by default
-**Back to** [ROADMAP.md](../../ROADMAP.md)
+**Back to** [design notes](README.md)
 
 ## Outcome
 

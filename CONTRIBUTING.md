@@ -26,8 +26,9 @@ Meshing problems are often geometry-specific. A plot of the conceptual mesh
 
 ## Suggesting features
 
-Open an issue describing the modelling problem the feature would solve. Check
-[ROADMAP.md](ROADMAP.md) first; the feature may already be planned.
+Open an issue describing the modelling problem the feature would solve. Check the
+[open issues](https://github.com/rhugman/vorflow/issues) first; the feature
+may already be planned.
 
 ## Development setup
 

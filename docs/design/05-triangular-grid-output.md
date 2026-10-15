@@ -1,7 +1,7 @@
 # Milestone 5 — Triangular-grid output option
 
 **Status:** planned · **Risk:** low–medium · **Behavior change:** opt-in
-**Back to** [ROADMAP.md](../../ROADMAP.md)
+**Back to** [design notes](README.md)
 
 ## Goal
 

@@ -1,7 +1,7 @@
 # Milestone 2 - Active-Domain Filtering Workflow
 
 **Status:** replaced by example workflow | **Risk:** low | **Behavior change:** none
-**Back to** [ROADMAP.md](../../ROADMAP.md)
+**Back to** [design notes](README.md)
 
 ## Decision
 

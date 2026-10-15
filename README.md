@@ -314,11 +314,6 @@ buffers, active-domain workflows, and triangular element-grid export.
 compares Gmsh smoothing, `hex_ring` and `lloyd_iterations` for centring cells
 around wells.
 
-## Roadmap
-
-See [ROADMAP.md](https://github.com/rhugman/vorflow/blob/main/ROADMAP.md)
-for planned and completed milestones.
-
 ## Contributing
 
 Bug reports, questions and pull requests are welcome; see

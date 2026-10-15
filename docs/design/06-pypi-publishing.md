@@ -1,7 +1,7 @@
 # Milestone 6 — First PyPI release
 
 **Status:** TestPyPI verified · **Current target:** PyPI `0.1.0` · **Risk:** low · **Behavior change:** none (packaging/metadata only)
-**Back to** [ROADMAP.md](../../ROADMAP.md)
+**Back to** [design notes](README.md)
 
 ## Goal
 

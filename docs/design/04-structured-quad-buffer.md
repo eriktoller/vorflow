@@ -1,7 +1,7 @@
 # Milestone 4 — Structured-quad transfinite buffer (OCC)
 
 **Status:** planned · **Risk:** high · **Behavior change:** opt-in
-**Back to** [ROADMAP.md](../../ROADMAP.md)
+**Back to** [design notes](README.md)
 
 ## Goal
 

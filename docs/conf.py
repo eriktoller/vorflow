@@ -52,7 +52,7 @@ extensions = [
 source_suffix = {".rst": "restructuredtext", ".md": "myst-nb", ".ipynb": "myst-nb"}
 exclude_patterns = [
     "_build",
-    "roadmap",
+    "design",
     "benchmark-plan.md",
     "make_splash.py",
     "**.ipynb_checkpoints",

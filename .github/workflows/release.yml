@@ -15,6 +15,11 @@
 #
 # The version is read from pyproject.toml; bump it there before tagging.
 # scripts/check_dist.py fails the build if the tag and pyproject disagree.
+#
+# After a final release reaches PyPI, the github-release job creates the GitHub
+# Release for the tag, with notes from the tag's CHANGELOG.md section
+# (scripts/release_notes.py) and the wheel and sdist attached. A tag without a
+# changelog section fails the build before anything is uploaded.
 
 name: Release
 
@@ -52,6 +57,10 @@ jobs:
         env:
           RELEASE_TAG: ${{ github.ref_name }}
         run: python scripts/check_dist.py dist --expected-tag "$RELEASE_TAG"
+      - name: Write release notes from CHANGELOG.md
+        env:
+          RELEASE_TAG: ${{ github.ref_name }}
+        run: python scripts/release_notes.py "$RELEASE_TAG" "$RUNNER_TEMP/release-notes.md"
       - name: Smoke-test the built wheel
         env:
           RELEASE_TAG: ${{ github.ref_name }}
@@ -67,6 +76,11 @@ jobs:
         with:
           name: python-package-distributions
           path: dist/
+          if-no-files-found: error
+      - uses: actions/upload-artifact@v7
+        with:
+          name: release-notes
+          path: ${{ runner.temp }}/release-notes.md
           if-no-files-found: error
 
   publish-testpypi:
@@ -106,3 +120,29 @@ jobs:
           path: dist/
       - name: Publish package distributions to PyPI
         uses: pypa/gh-action-pypi-publish@release/v1
+
+  github-release:
+    needs: publish-pypi
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v8
+        with:
+          name: python-package-distributions
+          path: dist/
+      - uses: actions/download-artifact@v8
+        with:
+          name: release-notes
+          path: notes/
+      - name: Create the GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ github.ref_name }}
+        run: >-
+          gh release create "$RELEASE_TAG" dist/*
+          --repo "$GITHUB_REPOSITORY"
+          --title "vorflow ${RELEASE_TAG#v}"
+          --notes-file notes/release-notes.md
+          --verify-tag
+          --latest

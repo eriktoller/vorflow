@@ -7,6 +7,13 @@ and the project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Added
+
+- The release workflow creates the GitHub Release for each final tag once it
+  is on PyPI, with notes from the tag's changelog section and the wheel and
+  sdist attached (`scripts/release_notes.py`). A tag without a changelog
+  section now fails the build before anything is uploaded.
+
 ## [0.3.0] - 2026-10-15
 
 MODFLOW 6 DISV export (`to_disv()`, `to_modflowgwfdisv()`), `plot()` methods

@@ -13,6 +13,24 @@ and the project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   is on PyPI, with notes from the tag's changelog section and the wheel and
   sdist attached (`scripts/release_notes.py`). A tag without a changelog
   section now fails the build before anything is uploaded.
+- MODFLOW-USG-specific `to_mfusg_disu()` / `grid_to_mfusg_disu()` arrays and
+  mapping/orthogonality diagnostics, plus optional `to_mfusgdisu()` FloPy
+  package creation. These use USG DISU conventions, not MF6 DISU. Stacked
+  layers share one horizontal mesh; invalid geometry, unsupported shared
+  faces and nonpositive thickness are rejected.
+- Original 3D GSF geometry export with `to_gsf()` / `grid_to_gsf()`, using
+  the same centres, elevations and node numbering as USG DISU. FloPy and
+  MFUSG executables remain optional.
+- A simple executed MODFLOW-USG notebook: one confined layer, two fixed-head
+  sides, paired DISU/GSF export, head plot and water-budget checks.
+- The Conda development environment includes FloPy and installs both the
+  `dev` and `examples` extras in editable mode, so model experiments use the
+  checkout selected when updating the environment.
+
+### Fixed
+
+- Clockwise ring orientation uses local coordinates to avoid cancellation
+  when small cells have large projected coordinate offsets.
 
 ## [0.3.0] - 2026-10-15
 

@@ -135,12 +135,14 @@ def _prepare_grid(gdf, top, botm, nlay):
     centres = gdf[["x", "y"]].to_numpy(dtype=float)
     if not np.isfinite(centres).all():
         raise ValueError("Cell centres must be finite.")
-    for i, (geom, centre) in enumerate(zip(geoms, centres)):
-        if not geom.covers(shapely.Point(centre)):
-            raise ValueError(f"Centre of cell {i} lies outside its polygon.")
-    layer_top, bot = _layer_arrays(top, botm, nlay, len(gdf))
     coords = shapely.get_coordinates(geoms)
     tolerance = 32 * np.finfo(float).eps * max(1.0, float(np.abs(coords).max()))
+    for i, (geom, centre) in enumerate(zip(geoms, centres)):
+        # Clipping a slanted edge can leave a boundary generator a few ulps
+        # outside its polygon. Accept roundoff without moving the generator.
+        if not shapely.dwithin(geom, shapely.Point(centre), tolerance):
+            raise ValueError(f"Centre of cell {i} lies outside its polygon.")
+    layer_top, bot = _layer_arrays(top, botm, nlay, len(gdf))
     # Reuse conforming rings, not MF6 solver semantics. Limit insertion to
     # coordinate roundoff: a looser map-scale tolerance can bend very short
     # faces, making GSF footprints disagree with the numerical geometry.
@@ -149,9 +151,22 @@ def _prepare_grid(gdf, top, botm, nlay):
     left, right = tree.query(geoms, predicate="intersects")
     records = []
     for i, j in sorted(zip(left[left < right], right[left < right])):
-        if geoms[i].intersection(geoms[j]).area > 0:
-            raise ValueError(f"Overlapping cells {i} and {j}.")
-        shared = geoms[i].boundary.intersection(geoms[j].boundary)
+        overlap = geoms[i].intersection(geoms[j])
+        if overlap.area > 0:
+            # Only forgive slivers contained within BOTH boundary roundoff
+            # bands. An area-only cutoff could accept small but deep overlaps.
+            for geom in (geoms[i], geoms[j]):
+                if not overlap.difference(geom.boundary.buffer(tolerance)).is_empty:
+                    raise ValueError(f"Overlapping cells {i} and {j}.")
+            # Recover the common face as well as accepting the sliver; otherwise
+            # exact boundary intersection could silently lose this connection.
+            shared = shapely.intersection(
+                geoms[i].boundary, geoms[j].boundary, grid_size=tolerance,
+            )
+            if shared.is_empty:
+                raise ValueError(f"Cannot resolve roundoff overlap between cells {i} and {j}.")
+        else:
+            shared = geoms[i].boundary.intersection(geoms[j].boundary)
         record = _straight_face(shared, centres[[i, j]], (int(i), int(j)), tolerance)
         if record is not None:
             records.append(record)

@@ -7,9 +7,9 @@ import sys
 import geopandas as gpd
 import numpy as np
 import pytest
-from shapely.geometry import Polygon, box
+from shapely.geometry import Point, Polygon, box
 
-from vorflow import ConceptualMesh, VoronoiTessellator
+from vorflow import ConceptualMesh, MeshGenerator, ThresholdField, VoronoiTessellator
 from vorflow.utils import grid_to_gsf, grid_to_mfusg_disu
 
 from test_pipeline import FakeMeshGenerator
@@ -98,6 +98,71 @@ def test_nonorthogonality_is_diagnosed_without_replacing_centres(tmp_path):
     np.testing.assert_allclose(np.array(cells, dtype=object)[:, 1:3].astype(float), grid[["x", "y"]])
 
 
+@pytest.mark.parametrize("offset", [0, 5_000_000])
+def test_boundary_roundoff_preserves_centres_but_rejects_real_errors(tmp_path, offset):
+    eps = np.spacing(float(offset + 1))
+    polygon = box(offset, offset, offset + 1, offset + 1)
+    centre = (offset - 2 * eps, offset + .5)
+    grid = _grid([polygon], [centre])
+    assert not polygon.covers(Point(centre))
+    disu = grid_to_mfusg_disu(grid, 10, 0)
+    assert disu["nodes"] == 1
+    _, cells = _read_gsf(grid_to_gsf(grid, tmp_path / "roundoff.gsf", 10, 0))
+    np.testing.assert_array_equal(np.array(cells, dtype=object)[:, 1:3].astype(float), [centre])
+    bad = _grid([polygon], [(offset - 1e-4, offset + .5)])
+    with pytest.raises(ValueError, match="outside"):
+        grid_to_mfusg_disu(bad, 10, 0)
+
+
+@pytest.mark.parametrize("offset", [0, 5_000_000])
+def test_roundoff_overlap_keeps_reciprocal_face_and_rejects_real_overlap(offset):
+    eps = np.spacing(float(offset + 1))
+    grid = _grid([
+        box(offset, offset, offset + 1, offset + 1),
+        box(offset + 1 - 2 * eps, offset, offset + 2, offset + 1),
+    ])
+    assert grid.geometry.iloc[0].intersection(grid.geometry.iloc[1]).area > 0
+    original = grid.copy(deep=True)
+    disu = grid_to_mfusg_disu(grid, 10, 0)
+    np.testing.assert_array_equal(disu["ja"], [0, 1, 1, 0])
+    np.testing.assert_allclose(disu["fahl"], [0, 10, 0, 10], rtol=1e-6)
+    np.testing.assert_allclose(disu["cl12"], [0, .5, 0, .5], rtol=1e-6)
+    assert grid.equals(original)
+    grid.iloc[1, grid.columns.get_loc("geometry")] = box(
+        offset + 1 - 1e-4, offset, offset + 2, offset + 1,
+    )
+    with pytest.raises(ValueError, match="Overlapping"):
+        grid_to_mfusg_disu(grid, 10, 0)
+
+
+def test_overlap_tolerance_does_not_connect_corners_or_hide_small_deep_overlaps():
+    eps = np.spacing(1.0)
+    corner = _grid([box(0, 0, 1, 1), box(1 - eps, 1 - eps, 2, 2)])
+    disu = grid_to_mfusg_disu(corner, 10, 0)
+    np.testing.assert_array_equal(disu["iac"], [1, 1])
+    # Small area alone does not imply coordinate roundoff.
+    deep = _grid([box(0, 0, 1, 1), box(1 - 1e-7, 1 - 1e-7, 2, 2)])
+    with pytest.raises(ValueError, match="Overlapping"):
+        grid_to_mfusg_disu(deep, 10, 0)
+
+
+@pytest.mark.slow
+def test_slanted_concave_domain_exports_with_default_boundary_centres(tmp_path):
+    cm = ConceptualMesh()
+    cm.add_polygon(Polygon([(0, 0), (300, 0), (300, 100), (120, 130),
+                            (300, 300), (0, 300)]), zone_id=1, resolution=20)
+    mg = MeshGenerator(background_lc=20, conceptual_mesh=cm)
+    mg.generate()
+    vt = VoronoiTessellator(mg, cm)
+    grid = vt.generate()
+    original = grid.copy(deep=True)
+    disu = vt.to_mfusg_disu(10, 0)
+    assert disu["nodes"] == len(grid)
+    _, cells = _read_gsf(vt.to_gsf(tmp_path / "concave.gsf", 10, 0))
+    np.testing.assert_array_equal(np.array([cell[1:3] for cell in cells], dtype=float), grid[["x", "y"]])
+    assert grid.equals(original)
+
+
 @pytest.mark.parametrize("nlay", [0, -1, True, 1.5])
 def test_bad_layer_count(nlay):
     with pytest.raises(ValueError, match="positive integer"):
@@ -169,7 +234,7 @@ def _read_gsf(path):
 
 @pytest.mark.parametrize("width", [.01, .0001])
 def test_original_3d_gsf_round_trip_and_large_coordinates(tmp_path, width):
-    flopy = pytest.importorskip("flopy")
+    flopy = pytest.importorskip("flopy", minversion="3.10")
     x0, y0 = 500000., 5000000.
     grid = _grid([box(x0, y0, x0 + width, y0 + width),
                   box(x0 + width, y0, x0 + 2 * width, y0 + width)])
@@ -228,7 +293,7 @@ def test_plain_exports_work_without_flopy(tmp_path, monkeypatch):
 
 
 def test_flopy_disu_round_trip_and_independent_results(tmp_path):
-    flopy = pytest.importorskip("flopy")
+    flopy = pytest.importorskip("flopy", minversion="3.10")
     vt = _tessellator()
     model = flopy.mfusg.MfUsg(modelname="vorflow", structured=False, model_ws=tmp_path)
     original = vt.to_mfusg_disu(10, [0, -10], nlay=2)
@@ -249,7 +314,7 @@ def test_flopy_disu_round_trip_and_independent_results(tmp_path):
 
 
 def test_wrapper_rejects_mf6_and_grid_overrides(tmp_path):
-    flopy = pytest.importorskip("flopy")
+    flopy = pytest.importorskip("flopy", minversion="3.10")
     vt = _tessellator()
     mf6 = flopy.mf6.ModflowGwf(flopy.mf6.MFSimulation(sim_ws=tmp_path))
     with pytest.raises(ValueError, match="not an MF6"):
@@ -261,32 +326,16 @@ def test_wrapper_rejects_mf6_and_grid_overrides(tmp_path):
         vt.to_mfusgdisu(model, 10, 0, laycbd=1)
 
 
-@pytest.mark.parametrize("direction", ["horizontal", "vertical"])
-def test_layered_linear_flow_with_mfusg_executable(tmp_path, direction):
-    """An independent analytic check of horizontal and vertical conductances."""
-    flopy = pytest.importorskip("flopy")
+def _run_linear_model(tmp_path, props, ibound, exact):
+    flopy = pytest.importorskip("flopy", minversion="3.10")
     executable = os.environ.get("MFUSG_EXE") or shutil.which("mfusg")
     if not executable:
         pytest.skip("MFUSG executable not installed (set MFUSG_EXE or PATH).")
-    polygons = ([box(i, j, i + 1, j + 1) for j in range(3) for i in range(3)]
-                if direction == "horizontal" else [box(0, 0, 1, 1)])
-    grid = _grid(polygons)
-    bottoms = [0, -5] if direction == "horizontal" else [0, -5, -25]
-    props = grid_to_mfusg_disu(grid, 10, bottoms, nlay=len(bottoms))
     model = flopy.mfusg.MfUsg(
         modelname="linear", structured=False, model_ws=tmp_path, exe_name=executable,
     )
     metadata = {"node_id", "cell_map", "connectivity"}
     flopy.mfusg.MfUsgDisU(model, **{k: v for k, v in props.items() if k not in metadata})
-    if direction == "horizontal":
-        x = np.tile(grid.x.to_numpy(), 2)
-        exact = 20.0 - 5.0 * (x - .5)
-        ibound = np.where((x == .5) | (x == 2.5), -1, 1)
-    else:
-        # Centre elevations 5, -2.5, -15; distances 7.5 and 12.5 m.
-        # Series resistance places the interior head at 16.25, not 15 m.
-        exact = np.array([20.0, 16.25, 10.0])
-        ibound = np.array([-1, 1, -1])
     flopy.mfusg.MfUsgBas(model, ibound=ibound, strt=exact)
     flopy.mfusg.MfUsgLpf(model, laytyp=0, hk=10, vka=10, ipakcb=53)
     # The confined isotropic system is symmetric. CG also handles the
@@ -306,3 +355,58 @@ def test_layered_linear_flow_with_mfusg_executable(tmp_path, direction):
     incremental, _ = flopy.utils.MfusgListBudget(tmp_path / "linear.list").get_budget()
     assert np.isfinite(incremental["PERCENT_DISCREPANCY"]).all()
     assert np.abs(incremental["PERCENT_DISCREPANCY"]).max() < .1
+    return heads, incremental
+
+
+@pytest.mark.parametrize("direction", ["horizontal", "vertical"])
+def test_layered_linear_flow_with_mfusg_executable(tmp_path, direction):
+    """An independent analytic check of horizontal and vertical conductances."""
+    polygons = ([box(i, j, i + 1, j + 1) for j in range(3) for i in range(3)]
+                if direction == "horizontal" else [box(0, 0, 1, 1)])
+    grid = _grid(polygons)
+    bottoms = [0, -5] if direction == "horizontal" else [0, -5, -25]
+    props = grid_to_mfusg_disu(grid, 10, bottoms, nlay=len(bottoms))
+    if direction == "horizontal":
+        x = np.tile(grid.x.to_numpy(), 2)
+        exact = 20.0 - 5.0 * (x - .5)
+        ibound = np.where((x == .5) | (x == 2.5), -1, 1)
+    else:
+        # Centre elevations 5, -2.5, -15; distances 7.5 and 12.5 m.
+        # Series resistance places the interior head at 16.25, not 15 m.
+        exact = np.array([20.0, 16.25, 10.0])
+        ibound = np.array([-1, 1, -1])
+    _, incremental = _run_linear_model(tmp_path, props, ibound, exact)
+    # Heads and budget balance alone cannot detect uniform conductance errors.
+    # Q = K * A * delta_h / distance_between_fixed_head_centres.
+    expected_flow = 10 * (3 * 15) * 10 / 2 if direction == "horizontal" else 10 * 1 * 10 / 20
+    np.testing.assert_allclose(incremental["CONSTANT_HEAD_IN"], expected_flow, rtol=1e-5)
+    np.testing.assert_allclose(incremental["CONSTANT_HEAD_OUT"], expected_flow, rtol=1e-5)
+
+
+@pytest.mark.slow
+def test_refined_multilayer_voronoi_flow_with_mfusg_executable(tmp_path):
+    """Exercise Gmsh, Voronoi geometry, DISU and USG on one refined model."""
+    pytest.importorskip("flopy", minversion="3.10")
+    if not (os.environ.get("MFUSG_EXE") or shutil.which("mfusg")):
+        pytest.skip("MFUSG executable not installed (set MFUSG_EXE or PATH).")
+    cm = ConceptualMesh()
+    cm.add_polygon(box(0, 0, 200, 100), zone_id=1, resolution=20)
+    cm.add_point(Point(100, 50), "refinement", resolution=5,
+                 fields=[ThresholdField(size_min=5, dist_min=10, dist_max=60)])
+    mg = MeshGenerator(background_lc=20, conceptual_mesh=cm)
+    mg.generate()
+    vt = VoronoiTessellator(mg, cm)
+    grid = vt.generate()
+    assert grid.geometry.area.max() / grid.geometry.area.min() > 4
+    props = vt.to_mfusg_disu(10, [0, -5, -25], nlay=3)
+    x = np.tile(grid.x.to_numpy(), 3)
+    # Boundary generators are at x=0/200, so the imposed gradient spans 200 m.
+    left, right = np.isclose(x, 0), np.isclose(x, 200)
+    assert left.any() and right.any()
+    ibound = np.where(left | right, -1, 1)
+    exact = 20 - x / 20
+    _, incremental = _run_linear_model(tmp_path, props, ibound, exact)
+    # Three layers, total thickness 35 m, width 100 m, delta_h=10 m.
+    expected_flow = 10 * (100 * 35) * 10 / 200
+    np.testing.assert_allclose(incremental["CONSTANT_HEAD_IN"], expected_flow, rtol=1e-5)
+    np.testing.assert_allclose(incremental["CONSTANT_HEAD_OUT"], expected_flow, rtol=1e-5)

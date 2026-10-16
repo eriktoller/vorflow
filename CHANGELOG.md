@@ -29,6 +29,11 @@ and the project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
+- MFUSG exports allow coordinate roundoff at clipped boundary centres and
+  overlapping boundary slivers without moving input centres or polygons.
+  Sliver faces retain reciprocal connections; real overlaps remain errors.
+- MFUSG executable tests check analytical flow rates as well as heads and
+  cover a refined three-layer Vorflow mesh. Optional tests require FloPy 3.10.
 - Clockwise ring orientation uses local coordinates to avoid cancellation
   when small cells have large projected coordinate offsets.
 

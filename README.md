@@ -261,6 +261,12 @@ supported. Grid arrays cannot be overridden through the FloPy wrapper;
 time settings and units can be passed as extra keywords. Barrier geometry
 does not assign hydraulic resistance automatically.
 
+DISU and GSF currently require contiguous, straight shared faces. A barrier
+that changes direction inside a cell can create a bent face and prevent both
+exports; disconnected shared faces are also rejected. Effective connection
+distances for bent faces are not yet implemented. Centre and overlap checks
+allow coordinate roundoff while preserving the supplied centres and polygons.
+
 For an existing GeoDataFrame, use `vorflow.utils.grid_to_mfusg_disu()` and
 `vorflow.utils.grid_to_gsf()`. Plain arrays and GSF output do not need FloPy.
 The [simple MFUSG notebook](examples/basic_example_mfusg.ipynb) runs a

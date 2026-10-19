@@ -87,11 +87,11 @@ def _face_skewness(center_1, center_2, face_start, face_end, parallel_tol=1e-12)
     return skewness
 
 
-def _center_point(row, center):
+def _center_point(geometry_obj, x_data, y_data, left_idx, center):
     if center == "generator":
-        return Point(float(row["x"]), float(row["y"]))
+        return Point(float(x_data[left_idx]), float(y_data[left_idx]))
     if center == "centroid":
-        return row.geometry.centroid
+        return geometry_obj.centroid
     raise ValueError("center must be either 'generator' or 'centroid'.")
 
 
@@ -135,21 +135,40 @@ def build_connectivity(gdf: gpd.GeoDataFrame, center: str = "generator") -> gpd.
     df["__orig_index"] = df.index
     df = df.reset_index(drop=True)
 
-    neighbors = gpd.sjoin(df, df, how="inner", predicate="touches")
-    pairs = neighbors[neighbors.index < neighbors.index_right].copy()
+    geoms = df.geometry.values
+    cell_ids = df["__cell_id"].values
+    orig_indices = df["__orig_index"].values
+    node_ids = df["node_id"].values if "node_id" in df.columns else None
+    if center == "generator":
+        x_data = df["x"].values
+        y_data = df["y"].values
+    else:
+        x_data = None
+        y_data = None
+
+    # Set-up STRtree
+    tree = shapely.STRtree(geoms)
+    left_idx, right_idx = tree.query(geoms, predicate="touches")
+
+    # filter using numpy arrays
+    mask = left_idx < right_idx
+    left_idx = left_idx[mask]
+    right_idx = right_idx[mask]
 
     records = []
-    for left_idx, pair in pairs.iterrows():
-        right_idx = int(pair["index_right"])
-        left = df.loc[left_idx]
-        right = df.loc[right_idx]
+    for i in range(len(left_idx)):
+        l_idx = left_idx[i]
+        r_idx = right_idx[i]
 
-        shared_edge = _longest_line(left.geometry.intersection(right.geometry))
+        geom_left = geoms[l_idx]
+        geom_right = geoms[r_idx]
+
+        shared_edge = _longest_line(geom_left.intersection(geom_right))
         if shared_edge is None:
             continue
 
-        center_1 = _center_point(left, center)
-        center_2 = _center_point(right, center)
+        center_1 = _center_point(geom_left, x_data, y_data, l_idx, center)
+        center_2 = _center_point(geom_right, x_data, y_data, r_idx, center)
         if center_1.is_empty or center_2.is_empty:
             continue
 
@@ -182,10 +201,10 @@ def build_connectivity(gdf: gpd.GeoDataFrame, center: str = "generator") -> gpd.
         )
 
         record = {
-            "cell_id_1": int(left["__cell_id"]),
-            "cell_id_2": int(right["__cell_id"]),
-            "orig_index_1": left["__orig_index"],
-            "orig_index_2": right["__orig_index"],
+            "cell_id_1": int(cell_ids[l_idx]),
+            "cell_id_2": int(cell_ids[r_idx]),
+            "orig_index_1": orig_indices[l_idx],
+            "orig_index_2": orig_indices[r_idx],
             "center_mode": center,
             "center_1": center_1,
             "center_2": center_2,
@@ -196,8 +215,8 @@ def build_connectivity(gdf: gpd.GeoDataFrame, center: str = "generator") -> gpd.
             "shared_edge": shared_edge,
         }
         if "node_id" in df.columns:
-            record["node_id_1"] = left["node_id"]
-            record["node_id_2"] = right["node_id"]
+            record["node_id_1"] = node_ids[l_idx]
+            record["node_id_2"] = node_ids[r_idx]
         records.append(record)
 
     if not records:

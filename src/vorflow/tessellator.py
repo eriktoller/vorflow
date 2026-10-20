@@ -896,36 +896,22 @@ class VoronoiTessellator:
         origin = (nodes.min(axis=0) + nodes.max(axis=0)) / 2.0
         vor = Voronoi(nodes - origin)
         vertices = vor.vertices + origin
-        polygons = []
-        ids = []
-        gen_x = []
-        gen_y = []
-        
-        for i, region_index in enumerate(vor.point_region):
-            region = vor.regions[region_index]
-            # Skip infinite regions (those containing -1).
-            if not region or -1 in region:
-                continue
-            
-            verts = vertices[region]
-            poly = Polygon(verts)
-            
-            if poly.is_valid:
-                polygons.append(poly)
-                # Store the coordinates of the generator point for this cell.
-                gen_x.append(nodes[i][0])
-                gen_y.append(nodes[i][1])
-                
-                # Assign the node tag (ID) to the cell. Ghost nodes (used to
-                # bound the diagram) will not have a tag.
-                if i < len(node_tags):
-                    ids.append(node_tags[i])
-                else:
-                    ids.append(-1) 
-        
+        regions = [vor.regions[r] for r in vor.point_region]
+        # Skip infinite regions (those containing -1).
+        finite = np.flatnonzero([bool(region) and -1 not in region for region in regions])
+        kept = [regions[i] for i in finite]
+        ring_of = np.repeat(np.arange(len(kept)), [len(region) for region in kept])
+        ring_vertices = np.concatenate(kept) if kept else np.empty(0, dtype=int)
+        polygons = shapely.polygons(shapely.linearrings(vertices[ring_vertices], indices=ring_of))
+        valid = shapely.is_valid(polygons)
+        generators = finite[valid]
+
+        # Ghost nodes (used to bound the diagram) have no tag.
+        ids = [node_tags[i] if i < len(node_tags) else -1 for i in generators]
+
         gdf = gpd.GeoDataFrame(
-            {'node_id': ids, 'x': gen_x, 'y': gen_y}, 
-            geometry=polygons, 
+            {'node_id': ids, 'x': nodes[generators, 0], 'y': nodes[generators, 1]},
+            geometry=polygons[valid],
             crs=self.cm.crs
         )
         return gdf

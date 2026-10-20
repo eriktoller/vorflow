@@ -906,8 +906,9 @@ class VoronoiTessellator:
         valid = shapely.is_valid(polygons)
         generators = finite[valid]
 
-        # Ghost nodes (used to bound the diagram) have no tag.
-        ids = [node_tags[i] if i < len(node_tags) else -1 for i in generators]
+        # Ghost nodes (used to bound the diagram) have no tag. An explicit
+        # dtype: a list mixing uint64 tags and -1 infers object.
+        ids = np.array([node_tags[i] if i < len(node_tags) else -1 for i in generators], dtype=np.int64)
 
         gdf = gpd.GeoDataFrame(
             {'node_id': ids, 'x': nodes[generators, 0], 'y': nodes[generators, 1]},
@@ -1200,6 +1201,10 @@ class VoronoiTessellator:
         tags = np.asarray(tags)
         if len(tags) != len(nodes):
             raise ValueError("MeshGenerator nodes and node_tags must have the same length.")
+        # gmsh returns uint64 tags, but ghost cells use -1, so node_id is
+        # int64 throughout and in the final grid, whatever boundary_centering.
+        assert len(tags) == 0 or int(tags.max()) <= np.iinfo(np.int64).max, "node_tags exceed int64"
+        tags = tags.astype(np.int64)
 
         self.lloyd_report = None
         self.short_face_report = None

@@ -94,7 +94,7 @@ def test_raw_voronoi_keeps_bounded_cells_with_their_tags():
     assert raw["node_id"].tolist() == [11, 12, 13, 14, -1]
     assert raw[["x", "y"]].to_numpy().tolist() == np.vstack([inner, ghosts[-1:]]).tolist()
     assert raw.geometry.is_valid.all()
-    assert shapely.contains_xy(raw.geometry.to_numpy(), raw["x"], raw["y"]).all()
+    assert shapely.contains_xy(raw.geometry.to_numpy(), raw["x"].to_numpy(), raw["y"].to_numpy()).all()
 
 
 def test_enforce_barriers_leaves_cells_whose_face_lies_on_the_barrier():

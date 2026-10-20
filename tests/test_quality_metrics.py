@@ -201,6 +201,44 @@ def test_build_connectivity_skewness_uses_face_line_when_connector_misses_face()
     assert connectivity.iloc[0]["skewness"] == pytest.approx(1.5)
 
 
+def test_build_connectivity_skips_rows_without_geometry():
+    gdf = gpd.GeoDataFrame(
+        {
+            "node_id": [10, 20, 30, 40],
+            "x": [0.5, 1.5, 0.0, 0.0],
+            "y": [0.5, 0.5, 0.0, 0.0],
+            "geometry": [box(0, 0, 1, 1), box(1, 0, 2, 1), None, Polygon()],
+        },
+        index=[5, 3, 9, 1],
+    )
+
+    for center in ("generator", "centroid"):
+        connectivity = build_connectivity(gdf, center=center)
+
+        assert len(connectivity) == 1
+        row = connectivity.iloc[0]
+        assert [row["cell_id_1"], row["cell_id_2"]] == [0, 1]
+        assert [row["orig_index_1"], row["orig_index_2"]] == [5, 3]
+        assert [row["node_id_1"], row["node_id_2"]] == [10, 20]
+        assert row["center_1"].equals(Point(0.5, 0.5))
+        assert row["connector"].equals(LineString([(0.5, 0.5), (1.5, 0.5)]))
+        assert row["shared_edge"].length == pytest.approx(1.0)
+        assert row["angle"] == pytest.approx(90.0)
+
+
+def test_build_connectivity_infers_node_id_dtype_from_object_column(paired_polygons):
+    # inset_mirror grids carry uint64 tags in an object column (ghost cells add -1).
+    grid = paired_polygons.copy()
+    grid["node_id"] = pd.Series([np.uint64(5), np.uint64(7)], dtype=object)
+    grid.index = pd.Index([np.uint64(3), np.uint64(4)], dtype=object)
+
+    connectivity = build_connectivity(grid)
+
+    assert connectivity["node_id_1"].dtype == np.uint64
+    assert connectivity["node_id_2"].dtype == np.uint64
+    assert connectivity["orig_index_1"].dtype == np.uint64
+
+
 def test_calculate_orthogonality_regression_value_unchanged(paired_polygons):
     result = calculate_orthogonality(paired_polygons)
     expected = pd.Series([0.0, 0.0], index=paired_polygons.index)

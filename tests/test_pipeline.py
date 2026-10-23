@@ -112,6 +112,29 @@ def test_lattice_grid_has_no_zero_length_edges(boundary_centering):
     assert unary_union(grid.geometry).area == pytest.approx(4.0, rel=1e-12)
 
 
+@pytest.mark.parametrize("boundary_centering", ["clip", "inset_mirror"])
+def test_node_id_is_int64_with_uint64_mesh_tags(boundary_centering):
+    """Catches an object node_id: gmsh's uint64 tags mixed with -1 ghost IDs.
+
+    With inset_mirror some boundary-ghost cells are bounded, so the raw
+    Voronoi IDs held both np.uint64 tags and Python -1s.
+    """
+    cm = _build_simple_conceptual_mesh()
+    clean_polys, _, _ = cm.generate()
+    mesh_gen = FakeMeshGenerator(clean_polys)
+    mesh_gen.node_tags = np.arange(1, len(mesh_gen.nodes) + 1, dtype=np.uint64)
+    tessellator = VoronoiTessellator(mesh_gen, cm, boundary_centering=boundary_centering)
+
+    grid = tessellator.generate()
+    connectivity = build_connectivity(grid)
+
+    assert grid["node_id"].dtype == np.dtype("int64")
+    assert set(grid["node_id"]) == set(int(t) for t in mesh_gen.node_tags)
+    assert tessellator.to_disv()["node_id"].dtype == np.dtype("int64")
+    assert connectivity["node_id_1"].dtype == np.dtype("int64")
+    assert connectivity["node_id_2"].dtype == np.dtype("int64")
+
+
 @pytest.mark.parametrize("offset", [(5e5, 5e6), (5e6, 5e6)])
 def test_offset_lattice_cells_do_not_overlap(offset):
     """Catches Qhull precision loss on large coordinate offsets (UTM-like).

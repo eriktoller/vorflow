@@ -896,36 +896,23 @@ class VoronoiTessellator:
         origin = (nodes.min(axis=0) + nodes.max(axis=0)) / 2.0
         vor = Voronoi(nodes - origin)
         vertices = vor.vertices + origin
-        polygons = []
-        ids = []
-        gen_x = []
-        gen_y = []
-        
-        for i, region_index in enumerate(vor.point_region):
-            region = vor.regions[region_index]
-            # Skip infinite regions (those containing -1).
-            if not region or -1 in region:
-                continue
-            
-            verts = vertices[region]
-            poly = Polygon(verts)
-            
-            if poly.is_valid:
-                polygons.append(poly)
-                # Store the coordinates of the generator point for this cell.
-                gen_x.append(nodes[i][0])
-                gen_y.append(nodes[i][1])
-                
-                # Assign the node tag (ID) to the cell. Ghost nodes (used to
-                # bound the diagram) will not have a tag.
-                if i < len(node_tags):
-                    ids.append(node_tags[i])
-                else:
-                    ids.append(-1) 
-        
+        regions = [vor.regions[r] for r in vor.point_region]
+        # Skip infinite regions (those containing -1).
+        finite = np.flatnonzero([bool(region) and -1 not in region for region in regions])
+        kept = [regions[i] for i in finite]
+        ring_of = np.repeat(np.arange(len(kept)), [len(region) for region in kept])
+        ring_vertices = np.concatenate(kept) if kept else np.empty(0, dtype=int)
+        polygons = shapely.polygons(shapely.linearrings(vertices[ring_vertices], indices=ring_of))
+        valid = shapely.is_valid(polygons)
+        generators = finite[valid]
+
+        # Ghost nodes (used to bound the diagram) have no tag. An explicit
+        # dtype: a list mixing uint64 tags and -1 infers object.
+        ids = np.array([node_tags[i] if i < len(node_tags) else -1 for i in generators], dtype=np.int64)
+
         gdf = gpd.GeoDataFrame(
-            {'node_id': ids, 'x': gen_x, 'y': gen_y}, 
-            geometry=polygons, 
+            {'node_id': ids, 'x': nodes[generators, 0], 'y': nodes[generators, 1]},
+            geometry=polygons[valid],
             crs=self.cm.crs
         )
         return gdf
@@ -1214,6 +1201,10 @@ class VoronoiTessellator:
         tags = np.asarray(tags)
         if len(tags) != len(nodes):
             raise ValueError("MeshGenerator nodes and node_tags must have the same length.")
+        # gmsh returns uint64 tags, but ghost cells use -1, so node_id is
+        # int64 throughout and in the final grid, whatever boundary_centering.
+        assert len(tags) == 0 or int(tags.max()) <= np.iinfo(np.int64).max, "node_tags exceed int64"
+        tags = tags.astype(np.int64)
 
         self.lloyd_report = None
         self.short_face_report = None

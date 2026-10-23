@@ -7,7 +7,7 @@ import numpy as np
 import geopandas as gpd
 import pandas as pd
 import shapely
-from shapely.geometry import LineString, MultiLineString, Point, Polygon, MultiPolygon
+from shapely.geometry import LineString, MultiLineString, Polygon, MultiPolygon
 
 
 logger = logging.getLogger(__name__)
@@ -87,12 +87,39 @@ def _face_skewness(center_1, center_2, face_start, face_end, parallel_tol=1e-12)
     return skewness
 
 
-def _center_point(row, center):
+def _neighbour_pairs(geoms: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+    """Row positions (i, j), i < j, of every pair of geometries that touch."""
+    left, right = shapely.STRtree(geoms).query(geoms, predicate="touches")
+    keep = left < right
+    return left[keep], right[keep]
+
+
+def _shared_edges(geoms: np.ndarray, left: np.ndarray, right: np.ndarray) -> np.ndarray:
+    """Longest shared line of each (left, right) pair; None where they share no line."""
+    edges = shapely.intersection(geoms[left], geoms[right])
+    is_line = shapely.get_type_id(edges) == shapely.GeometryType.LINESTRING
+    edges[~is_line] = [_longest_line(geom) for geom in edges[~is_line]]
+    edges[is_line & (shapely.length(edges) <= 0)] = None
+    return edges
+
+
+def _cell_centers(gdf: gpd.GeoDataFrame, center: str) -> np.ndarray:
+    """One center point per row: the generator (``x``, ``y``) or the polygon centroid."""
     if center == "generator":
-        return Point(float(row["x"]), float(row["y"]))
+        return shapely.points(gdf["x"].to_numpy(dtype=float), gdf["y"].to_numpy(dtype=float))
     if center == "centroid":
-        return row.geometry.centroid
+        return shapely.centroid(gdf.geometry.to_numpy())
     raise ValueError("center must be either 'generator' or 'centroid'.")
+
+
+def _end_points(lines: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+    """(n, 2) first and last coordinates of each line; NaN rows where the line is None."""
+    present = ~shapely.is_missing(lines)
+    start = np.full((len(lines), 2), np.nan)
+    end = np.full((len(lines), 2), np.nan)
+    start[present] = shapely.get_coordinates(shapely.get_point(lines[present], 0))
+    end[present] = shapely.get_coordinates(shapely.get_point(lines[present], -1))
+    return start, end
 
 
 def build_connectivity(gdf: gpd.GeoDataFrame, center: str = "generator") -> gpd.GeoDataFrame:
@@ -130,80 +157,59 @@ def build_connectivity(gdf: gpd.GeoDataFrame, center: str = "generator") -> gpd.
     if gdf.empty:
         return _empty_connectivity(gdf.crs)
 
-    df = gdf.copy()
-    df["__cell_id"] = np.arange(len(df), dtype=np.int64)
-    df["__orig_index"] = df.index
-    df = df.reset_index(drop=True)
+    geoms = gdf.geometry.to_numpy()
+    left, right = _neighbour_pairs(geoms)
+    edges = _shared_edges(geoms, left, right)
+    start, end = _end_points(edges)
 
-    neighbors = gpd.sjoin(df, df, how="inner", predicate="touches")
-    pairs = neighbors[neighbors.index < neighbors.index_right].copy()
+    centers = _cell_centers(gdf, center)
+    center_ok = shapely.is_geometry(centers) & ~shapely.is_empty(centers)
+    center_xy = np.full((len(centers), 2), np.nan)
+    center_xy[center_ok] = shapely.get_coordinates(centers[center_ok])
+    xy1, xy2 = center_xy[left], center_xy[right]
 
-    records = []
-    for left_idx, pair in pairs.iterrows():
-        right_idx = int(pair["index_right"])
-        left = df.loc[left_idx]
-        right = df.loc[right_idx]
-
-        shared_edge = _longest_line(left.geometry.intersection(right.geometry))
-        if shared_edge is None:
-            continue
-
-        center_1 = _center_point(left, center)
-        center_2 = _center_point(right, center)
-        if center_1.is_empty or center_2.is_empty:
-            continue
-
-        x1, y1 = float(center_1.x), float(center_1.y)
-        x2, y2 = float(center_2.x), float(center_2.y)
-        gx = x2 - x1
-        gy = y2 - y1
-        gmag = np.sqrt(gx * gx + gy * gy)
-        if gmag == 0:
-            continue
-
-        coords = list(shared_edge.coords)
-        if len(coords) < 2:
-            continue
-
-        ex = coords[-1][0] - coords[0][0]
-        ey = coords[-1][1] - coords[0][1]
-        emag = np.sqrt(ex * ex + ey * ey)
-        if emag == 0:
-            continue
-
-        cos_theta = abs(gx * ex + gy * ey) / (gmag * emag)
-        cos_theta = min(1.0, max(0.0, cos_theta))
-        angle = float(np.degrees(np.arccos(cos_theta)))
-        ortho_error = abs(90.0 - angle)
-
-        connector = LineString([(x1, y1), (x2, y2)])
-        skewness = float(
-            _face_skewness((x1, y1), (x2, y2), coords[0][:2], coords[-1][:2])[0]
-        )
-
-        record = {
-            "cell_id_1": int(left["__cell_id"]),
-            "cell_id_2": int(right["__cell_id"]),
-            "orig_index_1": left["__orig_index"],
-            "orig_index_2": right["__orig_index"],
-            "center_mode": center,
-            "center_1": center_1,
-            "center_2": center_2,
-            "angle": angle,
-            "ortho_error": float(ortho_error),
-            "skewness": skewness,
-            "connector": connector,
-            "shared_edge": shared_edge,
-        }
-        if "node_id" in df.columns:
-            record["node_id_1"] = left["node_id"]
-            record["node_id_2"] = right["node_id"]
-        records.append(record)
-
-    if not records:
+    gx, gy = (xy2 - xy1).T
+    ex, ey = (end - start).T
+    gmag = np.sqrt(gx * gx + gy * gy)
+    emag = np.sqrt(ex * ex + ey * ey)
+    valid = (
+        ~shapely.is_missing(edges)
+        & center_ok[left]
+        & center_ok[right]
+        & (gmag != 0)
+        & (emag != 0)
+    )
+    if not valid.any():
         return _empty_connectivity(gdf.crs)
 
-    return gpd.GeoDataFrame(records, geometry="shared_edge", crs=gdf.crs)
+    left, right, edges = left[valid], right[valid], edges[valid]
+    start, end, xy1, xy2 = start[valid], end[valid], xy1[valid], xy2[valid]
+    gx, gy, ex, ey = gx[valid], gy[valid], ex[valid], ey[valid]
+    cos_theta = np.abs(gx * ex + gy * ey) / (gmag[valid] * emag[valid])
+    angle = np.degrees(np.arccos(np.clip(cos_theta, 0.0, 1.0)))
+
+    # infer_objects matches the per-row values the old records path produced,
+    # e.g. uint64 tags held in an object column come back as uint64.
+    orig_index = gdf.index.to_series().infer_objects().to_numpy()
+    columns = {
+        "cell_id_1": left.astype(np.int64),
+        "cell_id_2": right.astype(np.int64),
+        "orig_index_1": orig_index[left],
+        "orig_index_2": orig_index[right],
+        "center_mode": center,
+        "center_1": centers[left],
+        "center_2": centers[right],
+        "angle": angle,
+        "ortho_error": np.abs(90.0 - angle),
+        "skewness": _face_skewness(xy1, xy2, start, end),
+        "connector": shapely.linestrings(np.stack([xy1, xy2], axis=1)),
+        "shared_edge": edges,
+    }
+    if "node_id" in gdf.columns:
+        node_id = gdf["node_id"].infer_objects().to_numpy()
+        columns["node_id_1"] = node_id[left]
+        columns["node_id_2"] = node_id[right]
+    return gpd.GeoDataFrame(columns, geometry="shared_edge", crs=gdf.crs)
 
 
 def boundary_connectivity_report(
@@ -737,36 +743,38 @@ def grid_to_disv(gdf: gpd.GeoDataFrame, tolerance: float | None = None) -> dict:
     if gdf.empty:
         raise ValueError("grid_to_disv needs a non-empty grid.")
     geoms = gdf.geometry.to_numpy()
-    bad = [i for i, geom in enumerate(geoms) if geom.geom_type != "Polygon" or len(geom.interiors) > 0]
-    if bad:
+    bad = np.flatnonzero(
+        (shapely.get_type_id(geoms) != shapely.GeometryType.POLYGON)
+        | (shapely.get_num_interior_rings(geoms) > 0)
+    )
+    if len(bad):
         raise ValueError(
             f"DISV cells must be single polygons without holes; {len(bad)} are not "
             f"(first at row {bad[0]})."
         )
 
-    rings = [np.asarray(geom.exterior.coords)[:-1, :2] for geom in geoms]
-    coords = np.vstack(rings)
-    vertex_xy, vertex_of = np.unique(coords, axis=0, return_inverse=True)
-    vertex_of = vertex_of.ravel()
-    splits = np.cumsum([len(ring) for ring in rings])[:-1]
-    cell_vertices = [list(ids) for ids in np.split(vertex_of, splits)]
+    exteriors = shapely.get_exterior_ring(geoms)
+    vertex_xy, cell_vertices = _ring_vertex_ids(exteriors)
 
     if tolerance is None:
         scale = max(float(np.ptp(vertex_xy, axis=0).max()), float(np.abs(vertex_xy).max()), 1.0)
         tolerance = DISV_VERTEX_FRACTION * scale
     cell_vertices = _insert_hanging_vertices(cell_vertices, vertex_xy, tolerance)
-    cell_vertices = [_clockwise(ids, vertex_xy) for ids in cell_vertices]
+    # Hanging vertices are collinear with their edge, so each ring keeps its
+    # orientation; MODFLOW 6 expects clockwise (negative shoelace area).
+    counter_clockwise = shapely.is_ccw(exteriors)
+    cell_vertices = [ids[::-1] if ccw else ids for ids, ccw in zip(cell_vertices, counter_clockwise)]
 
     # Drop vertices no cell uses (none today; kept for robustness) and renumber.
     used = np.unique(np.concatenate([np.asarray(ids) for ids in cell_vertices]))
     renumber = np.full(len(vertex_xy), -1, dtype=np.int64)
     renumber[used] = np.arange(len(used))
-    vertices = [[i, float(x), float(y)] for i, (x, y) in enumerate(vertex_xy[used])]
+    vertices = [[i, x, y] for i, (x, y) in enumerate(vertex_xy[used].tolist())]
 
-    xc = gdf["x"].to_numpy(dtype=float)
-    yc = gdf["y"].to_numpy(dtype=float)
+    xc = gdf["x"].to_numpy(dtype=float).tolist()
+    yc = gdf["y"].to_numpy(dtype=float).tolist()
     cell2d = [
-        [icell, float(xc[icell]), float(yc[icell]), len(ids), *(int(renumber[v]) for v in ids)]
+        [icell, xc[icell], yc[icell], len(ids), *renumber[ids].tolist()]
         for icell, ids in enumerate(cell_vertices)
     ]
     node_id = gdf["node_id"].to_numpy() if "node_id" in gdf.columns else np.arange(len(gdf))
@@ -777,6 +785,17 @@ def grid_to_disv(gdf: gpd.GeoDataFrame, tolerance: float | None = None) -> dict:
         "cell2d": cell2d,
         "node_id": node_id,
     }
+
+
+def _ring_vertex_ids(rings: np.ndarray) -> tuple[np.ndarray, list[list[int]]]:
+    """Unique (m, 2) vertex coordinates and, per ring, its vertex ids without the closing repeat."""
+    coords, ring_of = shapely.get_coordinates(rings, return_index=True)
+    sizes = np.bincount(ring_of, minlength=len(rings))
+    is_open = np.ones(len(coords), dtype=bool)
+    is_open[np.cumsum(sizes) - 1] = False
+    vertex_xy, vertex_of = np.unique(coords[is_open], axis=0, return_inverse=True)
+    splits = np.cumsum(sizes - 1)[:-1]
+    return vertex_xy, [ids.tolist() for ids in np.split(vertex_of.ravel(), splits)]
 
 
 def _insert_hanging_vertices(cell_vertices, vertex_xy, tolerance):
@@ -812,16 +831,6 @@ def _insert_hanging_vertices(cell_vertices, vertex_xy, tolerance):
         pos = edge_pos[e] + 1
         ring[pos:pos] = inserted
     return out
-
-
-def _clockwise(ids, vertex_xy):
-    """Ring vertex ids in clockwise order (negative shoelace area), as MODFLOW 6 expects."""
-    xy = vertex_xy[np.asarray(ids)]
-    # Translation avoids cancellation of large UTM-coordinate products.
-    xy = xy - xy[0]
-    x, y = xy[:, 0], xy[:, 1]
-    signed_area = 0.5 * float(np.dot(x, np.roll(y, -1)) - np.dot(np.roll(x, -1), y))
-    return list(ids) if signed_area < 0 else list(ids)[::-1]
 
 
 def grid_to_mfusg_disu(gdf: gpd.GeoDataFrame, top, botm, nlay: int = 1) -> dict:

@@ -59,6 +59,18 @@ def test_small_clockwise_cell_at_utm_coordinates_stays_clockwise():
     assert _signed_area(ring - ring[0]) < 0
 
 
+def test_mixed_orientations_share_vertices_and_all_list_clockwise():
+    ccw = Polygon([(1, 0), (2, 0), (2, 1), (1, 1)])
+    cw = Polygon([(0, 0), (0, 1), (1, 1), (1, 0)])
+    hanging = Polygon([(0, 1), (2, 1), (2, 2), (0, 2)])
+    disv = grid_to_disv(_grid([cw, ccw, hanging]))
+
+    rings = _cell_rings(disv)
+    assert all(_signed_area(ring) < 0 for ring in rings)
+    assert (1.0, 1.0) in rings[2]
+    assert disv["nvert"] == 8
+
+
 def test_cell_centres_are_generator_points_not_centroids():
     disv = grid_to_disv(_grid([box(0, 0, 1, 1)], centres=[(0.2, 0.3)]))
     assert disv["cell2d"][0][1:3] == [0.2, 0.3]

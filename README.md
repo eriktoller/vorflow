@@ -270,7 +270,10 @@ allow coordinate roundoff while preserving the supplied centres and polygons.
 For an existing GeoDataFrame, use `vorflow.utils.grid_to_mfusg_disu()` and
 `vorflow.utils.grid_to_gsf()`. Plain arrays and GSF output do not need FloPy.
 The [simple MFUSG notebook](examples/basic_example_mfusg.ipynb) runs a
-single confined layer between two fixed heads and plots the result. It
+single confined layer between two fixed heads, plots the result and checks
+analytical heads and the 500 m³/day flow rate as well as budget balance. From
+the repository root, install `python -m pip install -e ".[examples]"` in the
+notebook kernel's environment. The example
 requires the separate `mfusg` executable on PATH or an `MFUSG_EXE` path;
 install it outside the notebook with `get-modflow /path/to/bin --subset mfusg`.
 

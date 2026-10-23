@@ -34,8 +34,11 @@ and the project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   Sliver faces retain reciprocal connections; real overlaps remain errors.
 - MFUSG executable tests check analytical flow rates as well as heads and
   cover a refined three-layer Vorflow mesh. Optional tests require FloPy 3.10.
-- Clockwise ring orientation uses local coordinates to avoid cancellation
-  when small cells have large projected coordinate offsets.
+- The simple MFUSG notebook selects fixed-head generators at the domain
+  boundaries and checks analytical heads and total flow, with actionable
+  executable setup instructions and explicit result-to-cell mapping.
+- Clockwise ring orientation remains correct for small cells at large
+  projected coordinates, using upstream's vectorized ring handling.
 
 ## [0.3.0] - 2026-10-15
 

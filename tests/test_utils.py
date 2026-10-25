@@ -1,6 +1,7 @@
 import logging
 
 import geopandas as gpd
+import pandas as pd
 import numpy as np
 import pytest
 from shapely.geometry import LineString, MultiLineString, Point, Polygon
@@ -62,19 +63,19 @@ def test_cells_on_line_returns_cell_areas_and_intersection_lengths(paired_polygo
 def test_cells_on_point_returns_containing_cell_and_zero_length(paired_polygons):
     cells = cells_on(paired_polygons, Point(0.5, 0.5))
 
-    assert len(cells) == 1
-    assert cells["cell_area"].tolist() == pytest.approx([1.0])
-    assert cells["length"].tolist() == pytest.approx([0.0])
+    assert isinstance(cells, pd.Series)
+    assert cells["cell_area"] == pytest.approx(1.0)
+    assert cells["length"] == pytest.approx(0.0)
 
 
 def test_cells_on_point_on_shared_edge_returns_both_touching_cells(paired_polygons):
     cells = cells_on(paired_polygons, Point(1.0, 0.5))
 
-    assert len(cells) == 2
+    assert isinstance(cells, pd.Series)
 
 
 def test_cells_on_rejects_unsupported_geometry(paired_polygons):
-    with pytest.raises(TypeError, match="Point, LineString, or MultiLineString"):
+    with pytest.raises(ValueError, match="Point, LineString, or MultiLineString"):
         cells_on(paired_polygons, Polygon([(0, 0), (1, 0), (1, 1), (0, 1)]))
 
 
@@ -100,13 +101,13 @@ def test_faces_on_tolerance_selects_nearby_shared_faces(paired_polygons):
 
 
 def test_faces_on_rejects_negative_tolerance(paired_polygons):
-    with pytest.raises(ValueError, match="tolerance must be non-negative"):
+    with pytest.raises(ValueError, match="tolerance must be greater than zero."):
         faces_on(paired_polygons, LineString([(0, 0), (1, 1)]), tolerance=-1)
 
 
 def test_faces_on_rejects_non_line_geometry(paired_polygons):
     connectivity = build_connectivity(paired_polygons, center="centroid")
-    with pytest.raises(TypeError, match="LineString or MultiLineString"):
+    with pytest.raises(ValueError, match="LineString or MultiLineString"):
         faces_on(connectivity, Point(0.5, 0.5))
 
 

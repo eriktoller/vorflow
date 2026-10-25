@@ -15,6 +15,8 @@ from scipy.spatial import cKDTree
 from shapely.geometry import LineString, MultiLineString, MultiPolygon, Polygon
 from shapely.validation import make_valid
 
+DEFAULT_CONNECTIVITY_TOLERANCE = 1e-3
+
 
 def is_embedded(row) -> bool:
     """True unless the row sets ``embed`` to a falsy, non-NaN value."""

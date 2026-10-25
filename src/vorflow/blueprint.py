@@ -14,6 +14,7 @@ from shapely.validation import make_valid
 from . import _junctions
 from ._features import line_parts as _line_parts
 from ._features import positive_number, row_bool
+from ._features import DEFAULT_CONNECTIVITY_TOLERANCE
 from ._plot import features_frame, get_ax, plot_features
 from ._straddle import is_straddle_line, straddle_epsilon
 from .fields import DEFAULT_GROWTH_FACTOR, GeometricGrowthField, MeshField, ThresholdField
@@ -23,7 +24,6 @@ logger = logging.getLogger(__name__)
 
 # Constants for geometry simplification and reporting
 SIGNIFICANT_REDUCTION_PCT = 1.0
-DEFAULT_CONNECTIVITY_TOLERANCE = 1e-3
 # Where embedded lines meet, ends that miss another line by less than this
 # fraction of their vertex spacing are snapped onto it, shorter overshoots are
 # trimmed, and line vertices closer than it to the junction are dropped (#31).

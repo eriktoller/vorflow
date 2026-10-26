@@ -116,6 +116,78 @@ def test_faces_on_requires_connectivity_geodataframe(paired_polygons):
         faces_on(paired_polygons, LineString([(0, 0), (1, 1)]))
 
 
+@pytest.fixture
+def grid_3x2():
+    """Six unit squares, row positions 0-2 along y=0..1 and 3-5 along y=1..2.
+
+    The index labels (10..60) differ from the row positions so tests catch
+    label/position mix-ups. Generators sit at the cell centroids.
+    """
+    polys = [
+        Polygon([(i, j), (i + 1, j), (i + 1, j + 1), (i, j + 1)])
+        for j in range(2)
+        for i in range(3)
+    ]
+    return gpd.GeoDataFrame(
+        {
+            "geometry": polys,
+            "x": [p.centroid.x for p in polys],
+            "y": [p.centroid.y for p in polys],
+        },
+        index=[10, 20, 30, 40, 50, 60],
+    )
+
+
+def test_cells_on_line_returns_row_positions_not_index_labels(grid_3x2):
+    cells = cells_on(grid_3x2, LineString([(-1, 0.5), (4, 0.5)]))
+
+    assert cells["cell_id"].tolist() == [0, 1, 2]
+
+
+@pytest.mark.parametrize(
+    "point, nearer_position, nearer_xy",
+    [
+        # On the face shared by positions 4 and 5; position 4's generator is nearer.
+        (Point(2.0, 1.4), 4, (1.8, 1.5)),
+        # On the vertex shared by positions 1, 2, 4 and 5; position 2's generator is nearer.
+        (Point(2.0, 1.0), 2, (2.2, 0.8)),
+    ],
+)
+def test_cells_on_point_on_cell_boundary_returns_nearest_generator_cell(
+    grid_3x2, point, nearer_position, nearer_xy
+):
+    grid = grid_3x2.copy()
+    label = grid.index[nearer_position]
+    grid.loc[label, ["x", "y"]] = nearer_xy
+
+    cells = cells_on(grid, point)
+
+    assert np.ravel(cells["cell_id"]).tolist() == [nearer_position]
+
+
+def test_cells_on_point_outside_grid_raises_value_error(grid_3x2):
+    with pytest.raises(ValueError):
+        cells_on(grid_3x2, Point(10.0, 10.0))
+
+
+def test_faces_on_default_excludes_faces_touching_line_at_an_endpoint(grid_3x2):
+    connectivity = build_connectivity(grid_3x2, center="centroid")
+    # Runs along the faces between the rows; the faces between neighbours in
+    # the same row only touch it at one end.
+    faces = faces_on(connectivity, LineString([(0, 1), (3, 1)]))
+
+    pairs = sorted(zip(faces["cell_id_1"], faces["cell_id_2"]))
+    assert pairs == [(0, 3), (1, 4), (2, 5)]
+
+
+def test_faces_on_uses_shared_edge_when_another_geometry_is_active(paired_polygons):
+    connectivity = build_connectivity(paired_polygons, center="centroid")
+    faces = faces_on(connectivity.set_geometry("connector"), LineString([(1, -1), (1, 2)]))
+
+    assert len(faces) == 1
+    assert faces["face_length"].tolist() == pytest.approx([1.0])
+
+
 class TestCheckGeometryResolution:
     def test_reports_segment_statistics_for_square(self):
         square = Polygon([(0, 0), (2, 0), (2, 2), (0, 2)])

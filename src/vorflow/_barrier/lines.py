@@ -211,8 +211,28 @@ def drop_boundary_parts(barriers: list, domain, connectivity_tolerance: float) -
         if not parts:
             dropped.append(b)
         for n, (start, stop) in enumerate(parts):
-            kept.append(dataclasses.replace(b, xy=b.xy[start:stop + 1].copy(), events=b.events if n == 0 else []))
+            part = dataclasses.replace(b, xy=b.xy[start:stop + 1].copy(), events=b.events if n == 0 else [])
+            _end_on_boundary(part, start > 0, stop < len(on), domain.boundary, tol)
+            kept.append(part)
     return kept, dropped
+
+
+def _end_on_boundary(part: BarrierLine, at_start: bool, at_stop: bool, boundary, tol: float) -> None:
+    """Move the ends of ``part`` where a boundary run was cut off onto the boundary, so it stays sealed there.
+
+    Those ends are within ``tol`` of the boundary (they ended a segment
+    lying on it); left where they are, they would open a gap that short.
+    """
+    for end, cut in ((0, at_start), (-1, at_stop)):
+        point = Point(part.xy[end])
+        d = boundary.distance(point)
+        if not cut or d == 0:
+            continue
+        part.xy[end] = np.array(boundary.interpolate(boundary.project(point)).coords[0])
+        part.events.append(_event("snap", np.asarray(point.coords[0]), d,
+                                  f"end moved onto the domain boundary where its part along it was dropped "
+                                  f"(tolerance {tol:.3g})"))
+    part.xy = _dedupe(part.xy)
 
 
 # ---------------------------------------------------------------------------

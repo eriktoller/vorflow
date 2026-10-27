@@ -4,6 +4,8 @@ import logging
 import math
 import warnings
 import geopandas as gpd
+import shapely
+import shapely.affinity
 import pandas as pd
 import numpy as np
 from shapely.geometry import Polygon, LineString, MultiPolygon
@@ -13,9 +15,9 @@ from shapely.validation import make_valid
 
 from . import _junctions
 from ._features import line_parts as _line_parts
-from ._features import positive_number, row_bool
+from ._features import is_face_line, positive_number, row_bool
 from ._plot import features_frame, get_ax, plot_features
-from ._straddle import is_straddle_line, straddle_epsilon
+from ._barrier import lines as _barrier_lines
 from .fields import DEFAULT_GROWTH_FACTOR, GeometricGrowthField, MeshField, ThresholdField
 from shapely.strtree import STRtree
 
@@ -111,7 +113,7 @@ def _takes_part_in_junctions(feature) -> bool:
         and geom.length > 0
         and row_bool(feature, 'embed', True)
         and not row_bool(feature, 'quad_buffer', False)
-        and not is_straddle_line(feature)
+        and not is_face_line(feature)
         and _line_vertex_spacing(feature) is not None
     )
 
@@ -220,18 +222,16 @@ def _hex_ring_seeds(point, lc: float) -> list[tuple[float, float]]:
 def _meshed_half_width(feature) -> float:
     """Half-width of the node band a line or polygon feature meshes about its geometry.
 
-    Quad buffers straddle the geometry by ``thickness * lc / 2`` and
-    barrier/straddle lines place their point pairs at ``straddle_epsilon``;
-    plain features put their nodes on the geometry itself. An unset ``lc``
+    Quad buffers straddle the geometry by ``thickness * lc / 2``; plain
+    features put their nodes on the geometry itself, and barrier sites stay
+    within half a face length of the line, which the barrier sizing keeps
+    clear of every feature node (zero width here). An unset ``lc``
     (background resolution, unknown here) counts as zero width.
     """
     lc = positive_number(feature.get('lc'))
     if row_bool(feature, 'quad_buffer', False):
         thickness = positive_number(feature.get('quad_buffer_thickness')) or 1
         return thickness * lc / 2.0 if lc is not None else 0.0
-    if is_straddle_line(feature):
-        straddle = positive_number(feature.get('straddle_width'))
-        return straddle_epsilon(lc, straddle) if (lc is not None or straddle) else 0.0
     return 0.0
 
 
@@ -424,14 +424,24 @@ class ConceptualMesh:
             ``junctions`` (``point`` and the ``line_ids`` through it),
             ``snapped_ends`` (``line_id``, ``end``, ``from``, ``to``) and
             ``trimmed_ends`` (``line_id``, ``end``, cut ``length``).
+        keep_close_rings (bool): Keep a point's ``hex_ring`` when a barrier
+            passes within ``HEX_RING_CLEARANCE * resolution`` of the point.
+            By default such a ring is dropped with a warning, as next to any
+            embedded line; with True the barrier faces are made shorter
+            there so the ring seeds stay clear of the barrier
+            construction. It is a ``ConceptualMesh`` option because the
+            rings are decided here, in ``generate()``. Default False.
     """
 
     def __init__(self, crs=None, connectivity_tolerance=DEFAULT_CONNECTIVITY_TOLERANCE,
-                 line_junction_fraction=DEFAULT_LINE_JUNCTION_FRACTION):
+                 line_junction_fraction=DEFAULT_LINE_JUNCTION_FRACTION, keep_close_rings=False):
         self.crs = crs
         _warn_if_geographic_crs(crs)
         self.connectivity_tolerance = _coerce_connectivity_tolerance(connectivity_tolerance)
         self.line_junction_fraction = _coerce_line_junction_fraction(line_junction_fraction)
+        if not isinstance(keep_close_rings, (bool, np.bool_)):
+            raise ValueError(f"keep_close_rings must be True or False. Got {keep_close_rings!r}.")
+        self.keep_close_rings = bool(keep_close_rings)
         self.junction_diagnostics = _empty_junction_diagnostics()
         # Store raw geometric inputs before processing.
         self.raw_polygons = [] 
@@ -608,10 +618,10 @@ class ConceptualMesh:
             resolution (float): Target mesh size along the line.
             snap_to_polygons (bool): If True, the line's endpoints will be snapped to
                 nearby polygon boundaries to ensure connectivity.
-            is_barrier (bool): If True, the line is treated as a flow barrier. The mesh
-                will be constructed to prevent cell faces from crossing it.
-            straddle_width (float, optional): If set, forces Voronoi cell edges to align
-                perfectly with the line by creating a "virtual straddle" of mesh nodes.
+            is_barrier (bool): If True, the line is treated as a flow barrier: the
+                cells are built so that the line is made of whole cell faces, each
+                orthogonal to the line joining its two generators (see the barrier
+                notes below).
             fields (list, optional): List of MeshField objects.
             embed (bool): If True, the line is embedded in the mesh. If False, it is used only for fields.
             densify (float or bool, optional): Controls line densification:
@@ -621,9 +631,11 @@ class ConceptualMesh:
                 Raises ValueError if negative or zero.
             simplify_tolerance (float|int|None, optional): If a number > 0, simplifies the line with
                 this tolerance using Douglas-Peucker algorithm. If None or 0, no simplification is applied.
-                Raises ValueError if negative. Boolean values are not supported.
+                Raises ValueError if negative. Boolean values are not supported. For a barrier it is
+                also the snap radius for near-miss ends, and the simplification keeps junctions
+                and crossings (see the barrier notes below).
             quad_buffer (bool): If True, creates an opt-in structured quad buffer
-                strip around the line instead of the lightweight straddle points.
+                strip around the line instead of the exact barrier construction.
                 The strip is meshed as a 4-corner transfinite surface (structured
                 quad rows): with ``quad_buffer_thickness=1`` no nodes fall on
                 the line, so the Voronoi faces align with it (sharp barrier);
@@ -634,7 +646,7 @@ class ConceptualMesh:
                 the higher-priority one stays continuous and only the other is
                 trimmed at the crossing with a warning (priority: ``z_order``,
                 then finer resolution, wider strip, lines over polygons,
-                insertion order). Strips crossing a barrier/straddle corridor
+                insertion order). Strips crossing a barrier's corridor
                 are still trimmed there. Independent of ``is_barrier``.
             quad_buffer_thickness (int): Strip width in local cell widths
                 (multiples of ``resolution``, like gmshflow's ``cs_thick``).
@@ -651,6 +663,20 @@ class ConceptualMesh:
             color (optional): Matplotlib colour for the line in ``plot()``. None
                 (default) draws barriers red and other lines blue.
 
+        Barriers:
+            ``generate()`` cleans every barrier (embedded, no quad buffer) before
+            meshing: an end within ``max(connectivity_tolerance, simplify_tolerance)``
+            of another barrier, of its vertex or of the domain boundary is snapped
+            onto it (a short overshoot is trimmed); junctions and crossings become
+            shared vertices; a ``simplify_tolerance`` simplifies by the fewest chords
+            while keeping them; and vertices closer than 0.1 x resolution to a
+            neighbour (digitising noise) are always dropped, with a warning giving
+            the largest move. Barriers are not densified. ``MeshGenerator`` then
+            places the barrier's cell generators in closed form so each barrier
+            segment is exactly one cell face (``MeshGenerator.barrier_report`` lists
+            what it had to give up, such as the tip of a very sharp spike), and
+            raises ``vorflow.BarrierMeshError`` when it cannot.
+
         Deprecated parameters:
             dist_min (float, optional): Distance from the line where the mesh size
                 is held constant at the line's resolution. Supplying dist_min/dist_max selects
@@ -658,7 +684,18 @@ class ConceptualMesh:
                 omit them to use the default GeometricGrowthField.
             dist_max (float, optional): Distance from the line over which the mesh
                 transitions to the background resolution. See dist_min.
+            straddle_width (float, optional): Ignored, with a DeprecationWarning. It set
+                the width of the node pairs that made cell faces follow the line; the
+                faces are now placed exactly and automatically. A non-barrier line that
+                sets it still gets cell faces along it, as before.
         """
+        if straddle_width is not None:
+            warnings.warn(
+                "straddle_width is deprecated and ignored: barrier faces are now placed exactly and "
+                "automatically. Remove it from add_line().",
+                DeprecationWarning,
+                stacklevel=2,
+            )
         if not geometry.is_valid:
             geometry = make_valid(geometry)
 
@@ -832,7 +869,8 @@ class ConceptualMesh:
                     "Boolean values are not supported."
                 )
 
-            if tol is not None and tol > 0:
+            # Barriers are simplified after their junctions are joined (_clean_barrier_lines).
+            if tol is not None and tol > 0 and not is_face_line(line_data):
                 org_length = line_data['geometry'].length
                 simplified_geom = line_data['geometry'].simplify(tol, preserve_topology=True)
                 self.raw_lines[i]['geometry'] = simplified_geom
@@ -1107,6 +1145,54 @@ class ConceptualMesh:
                 f"{len(trims)} overshoot(s) trimmed."
             )
 
+    def _clean_barrier_lines(self, connectivity_tolerance=None):
+        """Snap, node, simplify and de-noise the barrier lines (see ``vorflow._barrier.lines``).
+
+        Works in a local frame (origin at the lower-left corner of the
+        domain). Each barrier row gets a ``barrier_events`` list recording
+        what was done to it (global coordinates); ``MeshGenerator`` passes
+        them on in ``barrier_report``. Noise cleaning warns with the largest
+        move.
+        """
+        members = [i for i, line in enumerate(self.raw_lines) if is_face_line(line)]
+        for line in self.raw_lines:
+            line['barrier_events'] = [] if is_face_line(line) else None
+        if not members or self.clean_polygons.empty:
+            return
+        domain_global = make_valid(unary_union(self.clean_polygons.geometry))
+        origin = np.asarray(domain_global.bounds[:2], dtype=float)
+        domain = shapely.affinity.translate(domain_global, -origin[0], -origin[1])
+        standard = [
+            shapely.affinity.translate(line['geometry'], -origin[0], -origin[1])
+            for line in self.raw_lines
+            if row_bool(line, 'embed', True) and not row_bool(line, 'quad_buffer', False)
+            and not is_face_line(line) and isinstance(line['geometry'], LineString)
+        ]
+        barriers = [
+            _barrier_lines.BarrierLine(
+                self.raw_lines[i].get('line_id'),
+                np.asarray(self.raw_lines[i]['geometry'].coords, dtype=float)[:, :2] - origin,
+                float(positive_number(self.raw_lines[i].get('lc')) or math.inf),
+                float(positive_number(self.raw_lines[i].get('simplify_tolerance')) or 0.0),
+            )
+            for i in members
+        ]
+        tolerance = self._resolve_connectivity_tolerance(connectivity_tolerance)
+        _barrier_lines.clean_barrier_lines(barriers, standard, domain, tolerance)
+        for i, barrier in zip(members, barriers):
+            self.raw_lines[i]['geometry'] = LineString(barrier.xy + origin)
+            events = [dict(e, location=(float(e['location'][0] + origin[0]), float(e['location'][1] + origin[1])))
+                      for e in barrier.events]
+            self.raw_lines[i]['barrier_events'] = events
+            for e in events:
+                moved = f"; moved {e['distance']:.3g}" if e['distance'] > 0 else ""
+                message = (f"Barrier {barrier.line_id!r}: {e['note']}{moved} "
+                           f"near ({e['location'][0]:.2f}, {e['location'][1]:.2f}).")
+                if e['kind'] == 'noise':
+                    warnings.warn(message, UserWarning, stacklevel=5)
+                else:
+                    logger.info(message)
+
     def _hex_ring_obstacles(self):
         """Embedded polygon boundaries and lines as ``(label, geometry, half_width)`` hex-ring obstacles.
 
@@ -1123,6 +1209,8 @@ class ConceptualMesh:
             ))
         for line_data in self.raw_lines:
             if not bool(line_data.get('embed', True)):
+                continue
+            if self.keep_close_rings and is_face_line(line_data):
                 continue
             obstacles.append((
                 f"line {line_data['line_id']!r}",
@@ -1293,6 +1381,8 @@ class ConceptualMesh:
         logger.info("Joining line junctions...")
         self._join_line_junctions(connectivity_tolerance=connectivity_tolerance)
 
+        self._clean_barrier_lines(connectivity_tolerance=connectivity_tolerance)
+
         # After snapping and clipping, so each ring is built about the final point.
         self._assign_hex_ring_seeds(field_only_polys)
         
@@ -1320,6 +1410,7 @@ class ConceptualMesh:
                     'growth_factor',
                     'label',
                     'color',
+                    'barrier_events',
                 ],
                 crs=self.crs,
             )
@@ -1493,7 +1584,8 @@ class ConceptualMesh:
         # Densify lines based on their target resolution ('lc').
         if not self.clean_lines.empty:
             def _line_densify(row):
-                res = _line_densify_spacing(row)
+                # Barriers place their own nodes (vorflow._barrier).
+                res = None if is_face_line(row) else _line_densify_spacing(row)
                 return self._densify_geometry(row['geometry'], res) if res is not None else row['geometry']
 
             self.clean_lines['geometry'] = self.clean_lines.apply(_line_densify, axis=1)

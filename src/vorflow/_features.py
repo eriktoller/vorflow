@@ -44,6 +44,14 @@ def positive_number(value) -> float | None:
     return value if value > 0 else None
 
 
+def is_face_line(row) -> bool:
+    """True for a line whose cell faces follow it exactly: an embedded barrier (or a line with the
+    deprecated ``straddle_width``) without a quad buffer. These go through ``vorflow._barrier``."""
+    if row_bool(row, 'quad_buffer', False) or not is_embedded(row):
+        return False
+    return row_bool(row, 'is_barrier', False) or positive_number(row.get('straddle_width')) is not None
+
+
 def ring_seed_coords(row) -> list:
     """The row's hex-ring seed ``(x, y)`` list; empty when the column is missing, None or NaN."""
     seeds = row.get('ring_seeds')

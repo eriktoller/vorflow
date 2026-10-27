@@ -493,8 +493,8 @@ class VoronoiTessellator:
             the cell sizes. Only free nodes move: mesh
             nodes inside the embedded polygon surfaces. Nodes on the domain
             and zone boundaries, embedded points (and their hex-ring
-            seeds), embedded and barrier lines (including straddle pairs)
-            and the quad-buffer strips and bands stay fixed. A move is
+            seeds), embedded and barrier lines (including the generators
+            placed on either side of a barrier) and the quad-buffer strips and bands stay fixed. A move is
             rejected if it would leave the node's zone or cross an embedded
             line. With Lloyd on, the cells are no longer the exact dual of
             the triangle mesh (``MeshGenerator.get_element_grid()``) and

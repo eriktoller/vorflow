@@ -3,6 +3,13 @@
 **Status:** done · **Risk:** medium · **Behavior change:** none by default
 **Back to** [design notes](README.md)
 
+> **Update (after 0.3.0):** barrier straddle pairs, mentioned below, were
+> replaced by exact barrier faces ([milestone 8](08-exact-barrier-faces.md)).
+> A hex ring next to a barrier is still dropped, unless
+> `ConceptualMesh(keep_close_rings=True)` is set. Lloyd relaxation keeps the
+> barrier generators fixed and keeps the other generators out of the barrier
+> circles.
+
 ## Outcome
 
 Implemented as three changes, prompted by

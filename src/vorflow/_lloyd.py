@@ -46,8 +46,9 @@ A rejected node stays where it is for that iteration.
 generator other than the barrier sites to stay outside a set of circles
 (the empty-circle condition). With ``circles`` given, an accepted move that
 lands inside a circle is pushed radially out to CIRCLE_PUSH_MARGIN beyond
-it; a move that cannot be pushed clear, or that the push takes out of the
-owner polygon, is rejected.
+it; a move that cannot be pushed clear, or whose pushed end fails the
+safety check above (out of the owner polygon, or across a constraint
+line), is rejected.
 
 *Convergence.* Each step is damped (x + damping * (c - x)), but the stopping
 test uses the undamped residual |c - x| / h(x) of the accepted nodes, so a
@@ -351,8 +352,9 @@ def push_out_of_circles(points, centres, radii, margin=CIRCLE_PUSH_MARGIN, passe
     return pts
 
 
-def keep_out_of_circles(old, new, ok, owner_polys, circles):
-    """(new, ok) with accepted moves pushed out of ``circles``; moves that stay inside or leave their owner rejected.
+def keep_out_of_circles(old, new, ok, owner_polys, circles, constraint_lines=None):
+    """(new, ok) with accepted moves pushed out of ``circles``; a move that stays inside, or whose pushed end
+    ``accept_moves`` refuses (out of its owner, or across ``constraint_lines``), is rejected.
 
     ``circles`` is ``(centres (k, 2), radii (k,))`` or None (no change).
     """
@@ -366,12 +368,9 @@ def keep_out_of_circles(old, new, ok, owner_polys, circles):
         return new, ok
     pushed = push_out_of_circles(new[moved], centres, radii)
     owners = _object_array(owner_polys)[moved]
-    has_owner = np.array([g is not None for g in owners], dtype=bool)
-    stays = np.ones(len(moved), dtype=bool)
-    if has_owner.any():
-        stays[has_owner] = shapely.contains_xy(owners[has_owner], pushed[has_owner, 0], pushed[has_owner, 1])
+    safe = accept_moves(old[moved], pushed, owners, constraint_lines)
     clear = ~inside_circles(pushed, centres, radii)
-    good = stays & clear
+    good = safe & clear
     new[moved[good]] = pushed[good]
     new[moved[~good]] = old[moved[~good]]
     ok[moved[~good]] = False
@@ -398,24 +397,25 @@ def validate_size_smoothing(size_smoothing, prefix=""):
         raise ValueError(f"{prefix}size_smoothing must be a non-negative integer. Got {size_smoothing!r}.")
 
 
-def validate_settings(iterations, damping, tolerance, prefix="", size_smoothing=0):
-    """Raise ValueError unless iterations and size_smoothing are ints >= 0, damping a number in (0, 1] and tolerance a number >= 0.
+def validate_settings(iterations, damping, tolerance, prefix="", size_smoothing=0, max_damping=1.0):
+    """Raise ValueError unless iterations and size_smoothing are ints >= 0, damping a number in (0, max_damping] and tolerance a number >= 0.
 
     Bools and NaN are rejected; iterations and size_smoothing must be integer
     types (2.0 is rejected), damping and tolerance may be any int or float.
     ``prefix`` is prepended to the setting names in the messages (e.g.
-    ``"lloyd_"``).
+    ``"lloyd_"``). ``max_damping`` above 1 allows over-relaxation (the
+    barrier polish).
     """
     if not _is_count(iterations):
         raise ValueError(f"{prefix}iterations must be a non-negative integer. Got {iterations!r}.")
-    if not _is_real_number(damping) or not (0.0 < damping <= 1.0):
-        raise ValueError(f"{prefix}damping must be a number in (0, 1]. Got {damping!r}.")
+    if not _is_real_number(damping) or not (0.0 < damping <= max_damping):
+        raise ValueError(f"{prefix}damping must be a number in (0, {max_damping:g}]. Got {damping!r}.")
     if not _is_real_number(tolerance) or not (tolerance >= 0.0):
         raise ValueError(f"{prefix}tolerance must be a non-negative number. Got {tolerance!r}.")
     validate_size_smoothing(size_smoothing, prefix=prefix)
 
 
-def _validate_relax_args(nodes, free, owner_polys, iterations, damping, tolerance):
+def _validate_relax_args(nodes, free, owner_polys, iterations, damping, tolerance, max_damping=1.0):
     """Raise ValueError for inconsistent relax() arguments."""
     if nodes.ndim != 2 or nodes.shape[1] != 2:
         raise ValueError(f"nodes must have shape (n, 2). Got {nodes.shape}.")
@@ -423,11 +423,11 @@ def _validate_relax_args(nodes, free, owner_polys, iterations, damping, toleranc
         raise ValueError(f"free must be a bool mask of shape ({len(nodes)},). Got {free.shape}.")
     if len(owner_polys) != len(nodes):
         raise ValueError(f"owner_polys must have one entry per node ({len(nodes)}). Got {len(owner_polys)}.")
-    validate_settings(iterations, damping, tolerance)
+    validate_settings(iterations, damping, tolerance, max_damping=max_damping)
 
 
 def relax(nodes, free, size_fn, domain, owner_polys, constraint_lines,
-          iterations, damping=1.0, tolerance=1e-3, circles=None):
+          iterations, damping=1.0, tolerance=1e-3, circles=None, max_damping=1.0):
     """Damped, density-weighted Lloyd relaxation of the free nodes; fixed nodes are returned bit-identical.
 
     Each iteration moves every free node ``x`` towards its weighted centroid
@@ -444,7 +444,8 @@ def relax(nodes, free, size_fn, domain, owner_polys, constraint_lines,
     since the next iteration would be identical).
 
     ``circles`` (``(centres, radii)`` or None): barrier circles every free
-    node must stay out of (see ``keep_out_of_circles``).
+    node must stay out of (see ``keep_out_of_circles``). ``max_damping``
+    above 1 allows over-relaxation (the barrier polish uses 1.3).
 
     Returns (new_nodes, report) with report keys ``iterations`` (run),
     ``max_rel_shift`` (largest residual |c - x| / h(x) over the accepted
@@ -453,7 +454,7 @@ def relax(nodes, free, size_fn, domain, owner_polys, constraint_lines,
     """
     nodes = np.asarray(nodes, dtype=float)
     free = np.asarray(free)
-    _validate_relax_args(nodes, free, owner_polys, iterations, damping, tolerance)
+    _validate_relax_args(nodes, free, owner_polys, iterations, damping, tolerance, max_damping)
     free = free.astype(bool)
     current = nodes.copy()
     report = {"iterations": 0, "max_rel_shift": 0.0, "rejected": 0}
@@ -467,7 +468,7 @@ def relax(nodes, free, size_fn, domain, owner_polys, constraint_lines,
         centroids = weighted_centroids(current, free_idx, size_fn, domain)
         proposal = before + damping * (centroids - before)
         ok = accept_moves(before, proposal, owners, constraint_lines)
-        proposal, ok = keep_out_of_circles(before, proposal, ok, owners, circles)
+        proposal, ok = keep_out_of_circles(before, proposal, ok, owners, circles, constraint_lines)
         current[free_idx[ok]] = proposal[ok]
         residual = np.where(ok, np.hypot(*(centroids - before).T), 0.0)
         max_rel_shift = float(np.max(residual / size_fn(before)))

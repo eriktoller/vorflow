@@ -836,25 +836,37 @@ def _insert_hanging_vertices(cell_vertices, vertex_xy, tolerance):
 
 def cells_on(
     gdf: gpd.GeoDataFrame,
-    geometry: shapely.Point | shapely.LineString | shapely.MultiLineString | shapely.Polygon,
+    geometry: shapely.Point | shapely.LineString | shapely.MultiLineString | shapely.Polygon | gpd.GeoDataFrame,
 ) -> gpd.GeoDataFrame:
     """Returns a GeoPandas DataFrame for the cells that lies on the geometry object. For a Point a single series will be returned.
 
     Args:
         gdf (GeoDataFrame): Grid of single-part polygons without holes, with
             ``x`` and ``y`` columns (e.g. ``VoronoiTessellator.grid``).
-        geometry (Point | LineString | MultiLineString): The geometrical object for which to find the intersecting cells.
+        geometry (Point | LineString | MultiLineString | GeoDataFrame): The geometrical object for which to find the intersecting cells or a GeoDataFrame which contains geometries.
 
     Returns:
         cells (GeoDataFrame): Returns a GeoDataFrame of all intersecting cells containing columns for ``cell_id``,
-            ``cell_area``, and the intersection ``length``. If ``geometry`` is a Point,
-            returns a single row GeoDataFrame for the nearest cell.
+            ``cell_area``, and the intersection ``length``. 
+            If ``geometry`` is a Point, returns a single row GeoDataFrame for the nearest cell.
+            if ``geometry`` is a GeoDataFrame, returns a concatinated GeoDataFrame with all provided geometries.
 
     Raises:
         ValueError: If ``geometry`` is not an instance of Point, LineString, or MultiLineString.
         ValueError: If ``geometry`` is outside of the grid.
     """
-
+    if isinstance(geometry, gpd.GeoDataFrame):
+        if not {'feature_type', 'feature_id'}.issubset(geometry.columns):
+            raise ValueError("the geometry GeoDataFrame must conatain the columns feature_type and feature_id.")
+        res = []
+        for _, row in geometry.iterrows():
+            cells_gdf = cells_on(gdf, row.geometry)
+            cells_gdf["feature_type"] = row["feature_type"]
+            cells_gdf["feature_id"] = row["feature_id"]
+            res.append(cells_gdf)
+        cells = gpd.GeoDataFrame(pd.concat(res, ignore_index=False))
+        return cells
+    
     if not isinstance(geometry, (Point, LineString, MultiLineString, Polygon)):
         raise ValueError("geometry must be a Point, LineString, MultiLineString, or Polygon.")
 

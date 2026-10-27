@@ -83,7 +83,13 @@ def test_cells_on_point_on_shared_edge_returns_both_touching_cells(paired_polygo
 
 def test_cells_on_rejects_unsupported_geometry(paired_polygons):
     with pytest.raises(ValueError, match="Point, LineString, MultiLineString, or Polygon"):
+        cells_on(paired_polygons, [1.0, 2.0, 3.0])
+
+
+def test_cells_on_rejects_missing_columns_geometry(paired_polygons):
+    with pytest.raises(ValueError, match="the geometry GeoDataFrame must conatain the columns feature_type and feature_id."):
         cells_on(paired_polygons, paired_polygons)
+
 
 def test_cells_on_rejects_geometry_outside_grid(paired_polygons):
     with pytest.raises(ValueError, match="the geometry is outside the grid"):

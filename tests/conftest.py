@@ -26,4 +26,4 @@ def strict_barriers(monkeypatch):
     """
     from vorflow import tessellator
 
-    monkeypatch.setattr(tessellator, "STRICT_BARRIERS", True)
+    monkeypatch.setattr(tessellator, "_STRICT_BARRIERS", True)

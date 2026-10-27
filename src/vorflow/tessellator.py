@@ -47,8 +47,8 @@ BARRIER_MIRROR_MERGE_FRACTION = 0.1
 
 # Exact barrier faces (MeshGenerator.barrier_lines) should never need the
 # mirror pass or the cut. When they do, generate() warns; with True it raises
-# BarrierMeshError instead. A test hook: the test suite sets it True.
-STRICT_BARRIERS = False
+# BarrierMeshError instead. A private test hook: the test suite sets it True.
+_STRICT_BARRIERS = False
 
 # Cell vertices closer than this fraction of the grid's coordinate scale are
 # one vertex. Clipping puts a cut point within roundoff of a domain vertex
@@ -935,8 +935,30 @@ class VoronoiTessellator:
             return None
         return np.asarray(circles[0], dtype=float), np.asarray(circles[1], dtype=float)
 
+    def _check_circles_empty(self, generators, all_generators=False):
+        """Raise BarrierMeshError if a generator other than a barrier site lies inside a barrier circle.
+
+        A cheap last check of the empty-circle rule on the generators the
+        Voronoi diagram is built from; ``all_generators`` for extra points
+        (boundary ghosts) that are never sites.
+        """
+        circles = self._barrier_circles()
+        if circles is None:
+            return
+        generators = np.asarray(generators, dtype=float).reshape(-1, 2)
+        inside = _lloyd.inside_circles(generators, *circles)
+        sites = getattr(self.mg, 'node_is_site', None)
+        if not all_generators and sites is not None and len(sites) == len(generators):
+            inside &= ~np.asarray(sites, dtype=bool)
+        if inside.any():
+            x, y = generators[np.flatnonzero(inside)[0]]
+            raise BarrierMeshError(
+                f"{int(inside.sum())} generator(s) lie inside the barrier circles (first at ({x:.2f}, {y:.2f})), "
+                "so the barrier faces there would not be exact. Please report this with the model."
+            )
+
     def _report_barrier_repairs(self):
-        """Warn (or raise, with STRICT_BARRIERS) when the safety net touched an exact barrier."""
+        """Warn (or raise, with _STRICT_BARRIERS) when the safety net touched an exact barrier."""
         mirrors, cuts = self.n_exact_barrier_mirrors, self.n_exact_barrier_cuts
         if mirrors == 0 and cuts == 0:
             return
@@ -945,7 +967,7 @@ class VoronoiTessellator:
             "tessellator's safety net; the barrier sites did not make every barrier segment a face. "
             "Please report this with the model."
         )
-        if STRICT_BARRIERS:
+        if _STRICT_BARRIERS:
             raise BarrierMeshError(message)
         warn_user(message)
 
@@ -1239,7 +1261,10 @@ class VoronoiTessellator:
             lloyd_shift = pd.Series(np.hypot(*(relaxed - nodes).T), index=tags)
             nodes = relaxed
 
+        self._check_circles_empty(nodes)
         nodes, tags, boundary_ghost_nodes, node_metadata = self._prepare_boundary_centered_nodes(nodes, tags)
+        if len(boundary_ghost_nodes):
+            self._check_circles_empty(boundary_ghost_nodes, all_generators=True)
         
         # To create a bounded Voronoi diagram from a finite set of points, a common
         # technique is to add "ghost" nodes far outside the area of interest. The

@@ -374,7 +374,7 @@ def test_safety_net_warns_or_raises_when_a_barrier_face_is_not_exact(monkeypatch
     with pytest.raises(vorflow.BarrierMeshError, match="safety net"):
         VoronoiTessellator(mg, cm).generate()
 
-    monkeypatch.setattr(vorflow.tessellator, "STRICT_BARRIERS", False)
+    monkeypatch.setattr(vorflow.tessellator, "_STRICT_BARRIERS", False)
     vt = VoronoiTessellator(mg, cm)
     with pytest.warns(UserWarning, match="safety net"):
         vt.generate()

@@ -1182,7 +1182,8 @@ class ConceptualMesh:
             _barrier_lines.BarrierLine(
                 self.raw_lines[i].get('line_id'),
                 np.asarray(self.raw_lines[i]['geometry'].coords, dtype=float)[:, :2] - origin,
-                float(positive_number(self.raw_lines[i].get('lc')) or math.inf),
+                float(positive_number(self.raw_lines[i].get('lc'))
+                      or self._zone_resolution(self.raw_lines[i]['geometry'])),
                 float(positive_number(self.raw_lines[i].get('simplify_tolerance')) or 0.0),
                 source=i,
             )
@@ -1203,6 +1204,18 @@ class ConceptualMesh:
                                  barrier_events=self._barrier_events(barrier, origin)))
         self.raw_lines = rows
         return [event for barrier in dropped for event in self._barrier_events(barrier, origin)]
+
+    def _zone_resolution(self, geometry) -> float:
+        """Finest resolution of the clean polygons ``geometry`` meets (inf if none has one).
+
+        Stands in for the resolution of a barrier added without one, so its
+        noise cleaning and simplification still have a length scale.
+        """
+        found = [positive_number(lc) for lc, poly in zip(self.clean_polygons.get('lc', []),
+                                                        self.clean_polygons.geometry)
+                 if poly.intersects(geometry)]
+        found = [lc for lc in found if lc is not None]
+        return float(min(found)) if found else math.inf
 
     @staticmethod
     def _barrier_events(barrier, origin) -> list:

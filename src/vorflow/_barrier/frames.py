@@ -160,9 +160,18 @@ def check_points_off_barriers(points, items: list, face_rows: dict, origin: np.n
                         "away; the faces next to it get shorter the closer it is).")
 
 
-def _obstacle(label: str, geometry, half_width: float, barriers, ends: np.ndarray, end_lc: np.ndarray) -> Obstacle:
-    """An Obstacle crossing ``barriers`` where they intersect, next to the barrier ``ends`` within END_REACH x lc."""
+def _obstacle(label: str, geometry, half_width: float, barriers, ends: np.ndarray, end_lc: np.ndarray,
+              tol: float) -> Obstacle | None:
+    """An Obstacle crossing ``barriers`` where they intersect, next to the barrier ``ends`` within END_REACH x lc.
+
+    The parts of ``geometry`` lying along a barrier are left out (the
+    barrier faces are its faces there); None when nothing is left.
+    """
     crossings = shapely.get_coordinates(shapely.intersection(geometry, barriers))
+    if half_width == 0:
+        geometry = geometry.difference(barriers)
+    if geometry.is_empty or geometry.length <= tol:
+        return None
     near_ends = np.empty((0, 2))
     if len(ends):
         pts = shapely.points(ends)
@@ -185,17 +194,18 @@ def obstacles(polys, lines, domain, items: list, origin: np.ndarray, background_
     for _, row in _embedded_rows(polys):
         edges = _local(row.geometry.boundary, origin).difference(outer)
         if not edges.is_empty:
-            out.append(_obstacle(f"edge of zone {row.get('zone_id')!r}", edges, 0.0, barriers, ends, end_lc))
+            out.append(_obstacle(f"edge of zone {row.get('zone_id')!r}", edges, 0.0, barriers, ends, end_lc, tol))
         if row_bool(row, 'quad_buffer', False):
             out.append(_obstacle(f"quad buffer of zone {row.get('zone_id')!r}", _local(row.geometry.boundary, origin),
-                                 protection_epsilon(row, background_lc), barriers, ends, end_lc))
+                                 protection_epsilon(row, background_lc), barriers, ends, end_lc, tol))
     for _, row in _embedded_rows(lines):
         if is_face_line(row):
             continue
         half = protection_epsilon(row, background_lc) if row_bool(row, 'quad_buffer', False) else 0.0
         for part in line_parts(row.geometry):
-            out.append(_obstacle(f"line {row.get('line_id')!r}", _local(part, origin), half, barriers, ends, end_lc))
-    return out
+            out.append(_obstacle(f"line {row.get('line_id')!r}", _local(part, origin), half, barriers, ends, end_lc,
+                                 tol))
+    return [ob for ob in out if ob is not None]
 
 
 def prepare(polys, lines, points, background_lc: float, feature_fields, gradation: float,

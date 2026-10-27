@@ -65,13 +65,6 @@ def _rot(u: np.ndarray, angle: float) -> np.ndarray:
     return np.array([c * u[0] - s * u[1], s * u[0] + c * u[1]])
 
 
-def _mirror(p: np.ndarray, a: np.ndarray, b: np.ndarray) -> np.ndarray:
-    """Mirror of ``p`` across the line through a and b."""
-    t = (b - a) / np.hypot(*(b - a))
-    q = p - a
-    return a + 2 * (q @ t) * t - q
-
-
 def _positions(field: SizeField, piece: int, lo: float, hi: float, count: int) -> np.ndarray:
     """``count - 1`` interior positions in [lo, hi] at equal steps of the integral of 1/h."""
     sel = field.piece == piece

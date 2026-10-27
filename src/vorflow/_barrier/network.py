@@ -247,20 +247,19 @@ def truncate_spikes(lines: list, standard: list, domain, tol: float, uncovered: 
 def _cut_line(line: BarrierLine, cut: dict) -> list:
     """``line`` split at spike apexes, each new end moved to its truncation point."""
     parts, start = [], 0
-    xy, keep = line.xy, line.keep
+    original, xy, keep = line.xy, line.xy.copy(), line.keep
     for i in range(len(xy)):
-        apex = tuple(xy[i])
+        apex = tuple(original[i])
         if apex not in cut:
             continue
         ends = cut[apex]
         if i > start:  # part ending at the apex: its last vertex becomes the truncation point
             seg = xy[start:i + 1].copy()
-            seg[-1] = ends[tuple(xy[i - 1])]
+            seg[-1] = ends[tuple(original[i - 1])]
             parts.append((seg, keep[start:i + 1].copy()))
         start = i
         if i < len(xy) - 1:  # the next part starts at the truncation point on the following leg
-            xy = xy.copy()
-            xy[i] = ends[tuple(xy[i + 1])]
+            xy[i] = ends[tuple(original[i + 1])]
     if len(xy) - start >= 2:
         parts.append((xy[start:], keep[start:].copy()))
     out = []

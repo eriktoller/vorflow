@@ -17,11 +17,12 @@ the output of the previous one:
    point within ``snap_tol``) are removed: a barrier there separates
    nothing. A barrier with such a segment inside is split in two, one made
    only of them is dropped. Recorded, with the length removed.
-3. **Node.** Crossings and junctions with other barriers and standard lines
-   (and the projections of their ends within the tolerance) are inserted as
-   vertices, and every vertex shared by several barriers gets exactly one
-   coordinate. These vertices, the ends and points on the domain boundary
-   must be kept by the next two steps.
+3. **Node.** Crossings and junctions with other barriers, the line itself
+   and standard lines (and the projections of their ends within the
+   tolerance) are inserted as vertices, and every vertex shared by several
+   barriers (or twice by one) gets exactly one coordinate. These vertices,
+   the ends and points on the domain boundary must be kept by the next two
+   steps.
 4. **Simplify** (only lines with ``simplify_tolerance > 0``): the fewest
    chords between the line's own vertices that keep every dropped vertex
    within SIMPLIFY_MARGIN x the tolerance. A chord of length L costs
@@ -340,8 +341,47 @@ def _unify_vertices(barriers: list, tol: float) -> None:
         start += len(b.xy)
 
 
+def self_crossings(xy: np.ndarray) -> dict:
+    """{segment index: points on it} where the polyline ``xy`` crosses or touches itself (not at its own
+    vertices shared by neighbouring segments)."""
+    segments = shapely.linestrings(np.stack([xy[:-1], xy[1:]], axis=1))
+    closed = len(xy) > 3 and np.array_equal(xy[0], xy[-1])
+    out = {}
+    tree = shapely.STRtree(segments)
+    left, right = tree.query(segments, predicate="intersects")
+    for i, j in zip(left, right):
+        if j <= i + 1 or (closed and i == 0 and j == len(segments) - 1):
+            continue
+        hit = shapely.intersection(segments[i], segments[j])
+        pts = shapely.get_coordinates(hit)
+        for k in (i, j):
+            out.setdefault(int(k), []).extend(pts)
+    return out
+
+
+def node_self(xy: np.ndarray, tol: float) -> np.ndarray:
+    """``xy`` with the points where it crosses or touches itself inserted on both passes."""
+    if len(xy) < 4 or LineString(xy).is_simple:
+        return xy
+    extra = self_crossings(xy)
+    out = [xy[0]]
+    for k in range(len(xy) - 1):
+        a, b = xy[k], xy[k + 1]
+        ab = b - a
+        pts = sorted(extra.get(k, []), key=lambda p: float((p - a) @ ab))
+        for p in pts + [b]:
+            if np.hypot(*(p - out[-1])) > tol:
+                out.append(np.asarray(p, dtype=float))
+            elif p is not b:
+                out[-1] = np.asarray(p, dtype=float)  # a crossing a roundoff from a vertex takes its place
+    return np.array(out)
+
+
 def node_lines(barriers: list, standard: list, domain, tol: float) -> None:
-    """Insert crossings and junctions as vertices, give shared vertices one coordinate, set ``keep`` (step 2)."""
+    """Insert crossings and junctions (also of a line with itself) as vertices, give shared vertices one
+    coordinate, set ``keep`` (step 3)."""
+    for b in barriers:
+        b.xy = node_self(b.xy, tol)
     lines = [LineString(b.xy) for b in barriers]
     inserted = []
     for k, barrier in enumerate(barriers):

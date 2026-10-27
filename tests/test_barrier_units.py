@@ -264,3 +264,18 @@ def test_removed_fixed_line_nodes_are_counted_per_line_and_warned_about():
     report = {"collapsed": [], "tips": [], "stubs": [], "snaps": [], "fixed_nodes": fixed}
     [message] = frames.report_warnings(report, 18.0)
     assert message.startswith("3 mesh node(s) of line 'r', edge of zone 2 lie inside the barrier circles")
+
+
+def test_polish_band_holds_the_free_nodes_near_a_circle_and_their_halo():
+    nodes = np.array([[0.0, 0.0], [5.0, 0.0], [12.0, 0.0], [20.0, 0.0], [5.0, 1.0]])
+    keep = np.array([True, True, True, True, False])
+    is_free = np.array([True, True, True, True, True])
+    circles = (np.array([[0.0, 0.0]]), np.array([1.0]))
+    moving, near = frames.polish_band(nodes, keep, is_free, np.full(5, 2.0), circles, band=3.0, halo=2.0)
+    # gaps to the circle: -1, 4, 11, 19, ~4.1; band 6, band + halo 10
+    assert moving.tolist() == [True, True, False, False, False]
+    assert near.tolist() == [True, True, False, False, False]
+    moving, near = frames.polish_band(nodes, keep, is_free & [True, False, True, True, True], np.full(5, 4.0),
+                                      circles)
+    assert moving.tolist() == [True, False, True, False, False]  # a fixed node never moves
+    assert near.tolist() == [True, True, True, True, False]

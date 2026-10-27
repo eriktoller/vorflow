@@ -1,7 +1,9 @@
 """Lloyd polish of the free mesh nodes around the barrier sites; the sites and every fixed node stay put.
 
 The barrier sites are closed-form and exact, so only the free background
-generators move, with vorflow's density-weighted Lloyd (``_lloyd.relax``;
+generators near them move (``frames`` picks those within POLISH_BAND x
+their size of a circle and passes the nodes within POLISH_HALO more as
+fixed), with vorflow's density-weighted Lloyd (``_lloyd.relax``;
 rho = h^-4, h the Gmsh node sizes smoothed as for ``lloyd_iterations``).
 One iteration:
 

@@ -11,7 +11,9 @@
 3. ``fit_sites`` (after Gmsh): remove the mesh nodes inside the circles or
    crowding a site (never a feature node; a node of a fixed line only inside
    a circle, and reported unless it is next to where the line meets a
-   barrier), polish the free nodes, and append the sites.
+   barrier), polish the free nodes within POLISH_BAND x their size of a
+   circle (every other node keeps its Gmsh position exactly), and append
+   the sites.
 4. ``report``: ``MeshGenerator.barrier_report``; ``report_warnings`` sums
    up what the construction gave up, one warning per kind.
 
@@ -55,6 +57,9 @@ SIZE_SMOOTHING = 5        # passes of node-size smoothing behind the polish dens
 POINT_CLEARANCE = 2 * planning.MIN_H_FRACTION / FEATURE_CAP  # x barrier lc: closer points cannot be meshed
 END_REACH = 1.0           # x barrier lc: a barrier end this close to a fixed line meets it (as a crossing)
 ON_LINE_FRACTION = 1e-7   # x domain extent: a mesh node this close to a fixed line lies on it
+POLISH_BAND = 3.0         # x node size: the polish moves only the free nodes this close to a barrier circle
+POLISH_HALO = 2.0         # x node size beyond the band: the fixed nodes the moving nodes' cells can meet
+GAP_NEIGHBOURS = 16       # circles looked at for a node's distance to the nearest one
 
 
 @dataclasses.dataclass
@@ -290,25 +295,51 @@ def gmsh_frames(plan: planning.BarrierPlan, context: Context, lines, points) -> 
     return _append_rows(lines, fine_rows), _append_rows(points, site_rows)
 
 
+def circle_gap(xy: np.ndarray, centres: np.ndarray, radii: np.ndarray, k: int = GAP_NEIGHBOURS) -> np.ndarray:
+    """Distance from each point to the nearest of the circles (negative inside), over its k nearest centres."""
+    k = min(k, len(centres))
+    d, idx = cKDTree(centres).query(xy, k=k)
+    d, idx = d.reshape(len(xy), k), idx.reshape(len(xy), k)
+    return (d - radii[idx]).min(axis=1)
+
+
+def polish_band(nodes: np.ndarray, keep: np.ndarray, is_free: np.ndarray, sizes: np.ndarray, circles: tuple,
+                band: float = POLISH_BAND, halo: float = POLISH_HALO) -> tuple:
+    """(moving, near): the kept free nodes within ``band`` x their size of a barrier circle, and the kept
+    nodes within (band + halo) x their size (those the moving nodes' cells can meet)."""
+    gap = circle_gap(nodes, *circles)
+    sizes = np.asarray(sizes, dtype=float)
+    near = keep & (gap < (band + halo) * sizes)
+    return near & is_free & (gap < band * sizes), near
+
+
 def _polish(plan, context, nodes, keep, is_free, sizes, edges, footprints, iterations) -> tuple:
-    """(nodes, polish report): the kept free nodes Lloyd-polished around the fixed sites (global)."""
+    """(nodes, polish report): the kept free nodes near the circles Lloyd-polished around the fixed sites (global).
+
+    Only the free nodes within POLISH_BAND x their size of a circle move;
+    every other node is returned bit-identical. The Voronoi cells of the
+    moving nodes are computed among the sites and the nodes within
+    POLISH_HALO more sizes, which is all their cells can meet.
+    """
     nodes = nodes.copy()
     if iterations == 0:
         return nodes, {}
     sites = plan.layout.sites + context.origin
-    pieces = _lloyd.zone_pieces(context.zones, footprints)
-    owners, free = _lloyd.owner_polygons(nodes, is_free & keep, pieces)
-    if not free.any():
-        return nodes, {}
-    density = _lloyd.size_interpolator(nodes, _lloyd.smooth_log_sizes(sizes, is_free, edges, SIZE_SMOOTHING))
     circles = (plan.layout.xy + context.origin, plan.layout.radius)
-    fixed = keep & ~free
-    free_xy, report = polish.lloyd(sites, nodes[free], owners[free], nodes[fixed], circles, density,
+    is_free = np.asarray(is_free, dtype=bool)
+    moving, near = polish_band(nodes, keep, is_free, sizes, circles)
+    pieces = _lloyd.zone_pieces(context.zones, footprints)
+    owners, moving = _lloyd.owner_polygons(nodes, moving, pieces)
+    if not moving.any():
+        return nodes, {"moved": 0}
+    density = _lloyd.size_interpolator(nodes, _lloyd.smooth_log_sizes(sizes, is_free, edges, SIZE_SMOOTHING))
+    fixed = near & ~moving
+    free_xy, report = polish.lloyd(sites, nodes[moving], owners[moving], nodes[fixed], circles, density,
                                    context.domain_global, context.constraint_lines, iterations)
-    free_xy, short = polish.open_short_faces(sites, free_xy, owners[free], nodes[fixed], circles,
+    free_xy, short = polish.open_short_faces(sites, free_xy, owners[moving], nodes[fixed], circles,
                                              context.constraint_lines)
-    nodes[free] = free_xy
-    report.update(short_initial=short["initial"], short_final=short["final"])
+    nodes[moving] = free_xy
+    report.update(short_initial=short["initial"], short_final=short["final"], moved=int(moving.sum()))
     return nodes, report
 
 

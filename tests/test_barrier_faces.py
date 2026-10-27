@@ -796,3 +796,20 @@ def test_self_crossing_barrier_is_noded_where_it_crosses_itself():
     assert (150.0, 150.0) in line.coords  # the crossing is a vertex, so its faces meet there
     for outside in [(150, 120), (150, 180), (60, 150)]:  # the loop closed by the crossing is a compartment
         assert _sealed(mg, grid, (250, 150), outside)
+
+
+def test_polish_moves_only_the_nodes_near_the_barrier():
+    from vorflow._barrier import frames
+
+    cm = _model([([(100, 150), (200, 150)], B)], domain=box(0, 0, 600, 300))
+    fixed, _, _ = _mesh(cm, barrier_polish_iterations=0)
+    polished, vt, grid = _mesh(cm)
+    _assert_exact(polished, vt, grid)
+    assert len(fixed.nodes) == len(polished.nodes)
+    moved = (fixed.nodes != polished.nodes).any(axis=1)
+    gap = frames.circle_gap(fixed.nodes, *fixed.barrier_circles)
+    assert 0 < moved.sum() <= polished.barrier_report["polish"]["moved"]
+    assert (gap[moved] < frames.POLISH_BAND * fixed.node_sizes[moved]).all()
+    far = gap > frames.POLISH_BAND * fixed.node_sizes
+    assert far.sum() > len(fixed.nodes) / 2
+    assert np.array_equal(fixed.nodes[far], polished.nodes[far])  # bit-identical to Gmsh's

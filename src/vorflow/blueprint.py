@@ -1497,3 +1497,36 @@ class ConceptualMesh:
                 return self._densify_geometry(row['geometry'], res) if res is not None else row['geometry']
 
             self.clean_lines['geometry'] = self.clean_lines.apply(_line_densify, axis=1)
+
+    def features(self):
+        """
+        Returns a concatinated GeoDataFrame of all cleaned lines, points and polygons from the ConceptualModel.
+
+        Retruns:
+            features (GeoDataFrame): Returns a GeoDataFrame of all cleaned festures of the ConceptualModel.
+        """
+        lines = gpd.GeoDataFrame()
+        if not self.clean_lines.empty:
+            lines = self.clean_lines[["geometry", "line_id"]].copy()
+            lines = lines.rename(columns={"line_id": "feature_id"})
+            lines["feature_type"] = "line"
+
+        points = gpd.GeoDataFrame()
+        if not self.clean_points.empty:
+            points = self.clean_points[["geometry", "point_id"]].copy()
+            points = points.rename(columns={"point_id": "feature_id"})
+            points["feature_type"] = "point"
+
+        polygons = gpd.GeoDataFrame()
+        if not self.clean_polygons.empty:
+            polygons = self.clean_polygons[["geometry", "zone_id"]].copy()
+            polygons = polygons.rename(columns={"zone_id": "feature_id"})
+            polygons["feature_type"] = "polygon"
+
+        features = gpd.GeoDataFrame(pd.concat([
+            lines,
+            points,
+            polygons
+        ], ignore_index=True))
+
+        return features

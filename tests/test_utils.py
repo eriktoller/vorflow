@@ -1,10 +1,9 @@
 import logging
 
 import geopandas as gpd
-import pandas as pd
 import numpy as np
 import pytest
-from shapely.geometry import LineString, MultiLineString, Point, Polygon, LinearRing
+from shapely.geometry import LineString, MultiLineString, Point, Polygon
 
 from vorflow.utils import (
     build_connectivity,

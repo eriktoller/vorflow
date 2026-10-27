@@ -489,6 +489,51 @@ def test_boundary_inset_mirror_keeps_node_when_ghost_lands_inside_domain():
     assert grid.geometry.area.sum() == pytest.approx(domain.area)
 
 
+def _unshared_interior_edges(grid, domain):
+    """Return cell edges used by one cell only that do not lie on the domain boundary (MF6 disconnected faces)."""
+    counts = {}
+    for geom in grid.geometry:
+        coords = np.round(np.asarray(geom.exterior.coords), 9)
+        for a, b in zip(map(tuple, coords[:-1]), map(tuple, coords[1:])):
+            key = (min(a, b), max(a, b))
+            counts[key] = counts.get(key, 0) + 1
+    boundary = domain.boundary.buffer(1e-9)
+    return [edge for edge, count in counts.items() if count == 1 and not boundary.covers(LineString(edge))]
+
+
+def test_boundary_inset_mirror_covers_domain_around_irregular_hole():
+    """Catches ghost cells that reach into the domain past a concave, unevenly noded hole (issue #71)."""
+    hole = [(3, 3), (7, 3.5), (6, 5), (7.5, 7), (4, 6.5), (4.5, 5)]
+    domain = Polygon([(0, 0), (10, 0), (10, 10), (0, 10)], [hole])
+    cm = ConceptualMesh()
+    cm.add_polygon(domain, zone_id=1, densify=False)
+    clean_polys, _, _ = cm.generate()
+
+    # Hole nodes alternate short and long gaps, so neighbouring insets
+    # differ and some mirror ghosts own a strip of the domain.
+    ring = domain.interiors[0]
+    distances = np.cumsum(np.r_[0.0, np.tile([0.25, 0.25, 1.2, 0.6], 20)])
+    hole_nodes = [ring.interpolate(d).coords[0] for d in distances[distances < ring.length]]
+    outer_nodes = [domain.exterior.interpolate(d).coords[0] for d in np.arange(0.0, 40.0, 1.0)]
+    lattice = np.mgrid[0.5:10:1.0, 0.5:10:1.0].reshape(2, -1).T
+    inner = domain.buffer(-0.3)
+    interior_nodes = lattice[shapely.contains_xy(inner, lattice[:, 0], lattice[:, 1])]
+    nodes = np.vstack([hole_nodes, outer_nodes, interior_nodes])
+    tags = np.arange(1, len(nodes) + 1)
+    mesh_gen = DummyMeshGenerator(nodes=nodes, tags=tags, zones_gdf=clean_polys)
+
+    grid = VoronoiTessellator(mesh_gen, cm, boundary_centering="inset_mirror").generate()
+
+    covered = unary_union(list(grid.geometry))
+    assert domain.difference(covered).area < 1e-9
+    assert grid.geometry.area.sum() == pytest.approx(domain.area, rel=1e-12)
+    assert _unshared_interior_edges(grid, domain) == []
+    # Only the leaking ghosts fall back to clipping; most nodes stay centred.
+    hole_rows = grid["source_x"].round(9).isin(np.round(np.asarray(hole_nodes)[:, 0], 9))
+    assert grid.loc[hole_rows, "boundary_centered"].mean() > 0.5
+    assert not grid.loc[hole_rows, "boundary_centered"].all()
+
+
 def _staggered_lattice_nodes():
     """Unit-box lattice with boundary nodes on the edges and staggered interior rows."""
     nodes = []

@@ -19,7 +19,9 @@
    x the local face length there and steps 2-4 repeat, at most
    REPAIR_ROUNDS times. If a defect is left, the site count exceeds
    SITE_GROWTH_CAP x the first round's, or the face length would drop below
-   MIN_H_FRACTION x lc, ``BarrierMeshError`` names the place.
+   MIN_H_FRACTION x lc, ``BarrierMeshError`` names the place, what set the
+   face length there (the cap, or a junction; ``sizing.CAUSES``) and what
+   helps for that cause (``advice``).
 
 Gmsh gets a fine field along the barrier faces that are finer than the
 size field (FINE_RATIO), at a size between the two (FINE_BLEND), or at the
@@ -49,7 +51,7 @@ from .._features import HEX_RING_CLEARANCE
 from .lines import BarrierLine, must_keep
 from .network import SHARP_ANGLE, Network, build_network, replan_chord_nodes
 from .sites import Layout, construct
-from .sizing import GRADATION, SizeField, capped_field, grade_field
+from .sizing import CAUSES, GRADATION, SizeField, capped_field, grade_field
 from .validate import all_finite, defects
 
 REPAIR_ROUNDS = 8
@@ -98,11 +100,36 @@ def where(points: np.ndarray, origin: np.ndarray, limit: int = 3) -> str:
     return ", ".join(f"({x:.2f}, {y:.2f})" for x, y in pts)
 
 
+QUAD_BUFFER_ADVICE = ("quad_buffer=True on the barrier meshes it with a structured strip of cells instead (its "
+                      "faces are then not exact)")
+
+
+def advice(cause: str, h: float) -> str:
+    """What makes the faces there possible, for a face length ``h`` set by ``cause`` (``sizing.CAUSES``)."""
+    finer = f"a barrier resolution of {h / MIN_H_FRACTION:.3g} or finer there"
+    return {
+        "barrier": "two barrier parts come that close without meeting (a near-miss end, or two barriers side by "
+                   "side). If one should end on the other, set simplify_tolerance on it to at least the gap, which "
+                   f"snaps the end onto the other; otherwise move them apart, or use {finer}",
+        "boundary": "the barrier comes that close to the domain boundary or a hole without ending on it. End it on "
+                    "the boundary or move it away: simplify_tolerance of at least the gap snaps a near-miss end "
+                    f"onto the boundary and drops a part that runs along it. Or use {finer}",
+        "feature": "a well, hex-ring seed or embedded point lies that close to the barrier. Move the point away "
+                   f"from the barrier, or use {finer}",
+        "fixed line": "an embedded line, a zone edge or a quad-buffer strip runs that close to the barrier "
+                      f"without crossing it. Move it away from the barrier, or use {finer}",
+        "short piece": "the barrier has vertices that close together (a densely digitised line or a short "
+                       "zigzag). Set simplify_tolerance on the barrier, at least that distance, to remove them",
+        "size field": "the size field is that fine there (a finer zone, line or point next to the barrier). Use a "
+                      "barrier resolution closer to it",
+    }.get(cause, "barrier legs meet or fold back there at angles too narrow for cells between them (a narrow "
+                 "spike or zigzag, or many legs at one point). If that is digitising noise, simplify_tolerance of "
+                 f"about resolution / 8 removes it; otherwise {QUAD_BUFFER_ADVICE}")
+
+
 def _fail(reason: str, points: np.ndarray, origin: np.ndarray) -> None:
-    """Raise BarrierMeshError with the place and what to do about it."""
-    raise BarrierMeshError(
-        f"barrier faces cannot be made exact near {where(points, origin)}: {reason}. Set simplify_tolerance on "
-        "the barrier (it snaps near-miss ends and removes short wiggles) or use a finer barrier resolution.")
+    """Raise BarrierMeshError with the place, the cause and what to do about it."""
+    raise BarrierMeshError(f"barrier faces cannot be made exact near {where(points, origin)}: {reason}.")
 
 
 def touch_tolerance(domain) -> float:
@@ -128,15 +155,34 @@ def barrier_lines(items: list, standard: list, domain) -> list:
     return out
 
 
+def floor_cause(net: Network, field: SizeField, k: int, lc: float, gradation: float = GRADATION) -> str:
+    """What set the face length of sample k (``sizing.CAUSES``): a corridor (its sides), the cap of the sample
+    its grading came from, else (a junction or ladder size) the tightest cap within ``lc`` of it, else
+    "junction"."""
+    point = shapely.Point(field.xy[k])
+    for c in net.corridors:
+        if c.region.distance(point) <= 0.5 * lc:
+            return "boundary" if len(c.sides) == 1 else "barrier"
+    if field.cause is None or len(field.capped) != len(field.h):
+        return "junction"
+    d = np.hypot(*(field.xy - field.xy[k]).T)
+    j = int(np.argmin(field.capped + gradation * d))
+    if field.capped[j] + gradation * d[j] <= field.h[k] * (1 + 1e-6):
+        return CAUSES[int(field.cause[j])]
+    near = np.flatnonzero((d <= lc) & (field.cause != CAUSES.index("size field")))
+    if len(near) == 0:
+        return "junction"
+    return CAUSES[int(field.cause[near[np.argmin(field.capped[near])]])]
+
+
 def check_floor(net: Network, field: SizeField, origin: np.ndarray) -> None:
     """Fail when the target face length is below MIN_H_FRACTION x lc somewhere."""
     lc = net.piece_lc[field.piece]
     tiny = field.h < MIN_H_FRACTION * lc
     if tiny.any():
         k = int(np.argmin(field.h / lc))
-        _fail(f"the faces would have to be {field.h[k]:.3g} long ({field.h[k] / lc[k]:.2g} x lc); two barrier "
-              "parts, a barrier and the boundary, or a barrier and a well, an embedded line or a zone edge are "
-              "that close", field.xy[tiny], origin)
+        _fail(f"the faces would have to be {field.h[k]:.3g} long ({field.h[k] / lc[k]:.2g} x lc), because "
+              f"{advice(floor_cause(net, field, k, lc[k]), field.h[k])}", field.xy[tiny], origin)
 
 
 def repair_bounds(field: SizeField, layout: Layout, bad: list, refine: np.ndarray | None) -> np.ndarray:
@@ -219,8 +265,8 @@ def _repair_loop(lines: list, standard: list, domain, features: np.ndarray, size
         first = first or len(layout.sites)
         if rounds == REPAIR_ROUNDS or len(layout.sites) > SITE_GROWTH_CAP * first:
             kinds = sorted({k for k, _ in bad})
-            _fail(f"{len(bad)} defects ({', '.join(kinds)}) left after {rounds} local refinements",
-                  np.array([p for _, p in bad]), origin)
+            _fail(f"{len(bad)} defects ({', '.join(kinds)}) are left after {rounds} local refinements, because "
+                  f"{advice('repair', 0.0)}", np.array([p for _, p in bad]), origin)
         refine = repair_bounds(field, layout, bad, refine)
         rounds += 1
 

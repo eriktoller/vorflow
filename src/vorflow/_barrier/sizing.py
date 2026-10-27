@@ -72,6 +72,7 @@ PAIR_CHUNK = 20000       # samples per neighbour query in ``near_pairs``
 SOURCE_CHUNK = 256       # hard nodes per Dijkstra call in ``node_distances``
 SHORT_BLEND = 0.5
 JUNCTION_PASSES = 3
+CAUSES = ("size field", "barrier", "boundary", "feature", "fixed line", "short piece", "repair")
 
 
 # ---------------------------------------------------------------------------
@@ -127,6 +128,8 @@ class SizeField:
     radius: dict = dataclasses.field(default_factory=dict)   # node -> R forced by a ladder
     corridors: list = dataclasses.field(default_factory=list)  # CorridorLayout per network corridor
     failed: list = dataclasses.field(default_factory=list)     # keys of corridors that could not be laid out
+    capped: np.ndarray | None = None  # h after the caps, before grading
+    cause: np.ndarray | None = None   # index into CAUSES of what set ``capped``
 
 
 def piece_lengths(net: Network) -> np.ndarray:
@@ -506,14 +509,18 @@ def capped_field(net: Network, size_fn, domain, features: np.ndarray, obstacles:
     for rung, extent in zip(net.rungs, extents):
         for n in rung.nodes:
             rho[n] = max(rho[n], extent)
-    h = np.minimum.reduce([h0, barrier_cap(net, field, h0, rho, extents), boundary_cap(net, field, domain, rho),
-                           feature_cap(field, features), obstacle_cap(field, obstacles, h0, tol)])
+    caps = np.vstack([h0, barrier_cap(net, field, h0, rho, extents), boundary_cap(net, field, domain, rho),
+                      feature_cap(field, features), obstacle_cap(field, obstacles, h0, tol)])
+    h, cause = caps.min(axis=0), caps.argmin(axis=0)
     lengths = piece_lengths(net)[field.piece]
     short = lengths < h
-    h = np.where(short, lengths ** (1 - SHORT_BLEND) * h ** SHORT_BLEND, h)
+    h_short = np.where(short, lengths ** (1 - SHORT_BLEND) * h ** SHORT_BLEND, h)
+    cause = np.where(h_short < h, CAUSES.index("short piece"), cause)
+    h = h_short
     if refine is not None:
+        cause = np.where(refine < h, CAUSES.index("repair"), cause)
         h = np.minimum(h, refine)
-    field.h = h
+    field.h, field.capped, field.cause = h, h.copy(), cause
     return field
 
 

@@ -30,6 +30,10 @@
    of every other leg of a prescribing node is set to 2 R_v cos(phi)
    (ccvt's junction sizes), R_v being the smallest radius any leg allows
    (or the ladder's sigma_0, or the value a single-segment piece forces).
+7. Corridors (``corridor``) are laid out last. Inside a corridor the two
+   sides do not cap each other (and a boundary run is not capped by its
+   edge); h along them is the strip length, so the gradation carries it to
+   the pieces beyond.
 """
 from __future__ import annotations
 
@@ -42,6 +46,7 @@ from scipy.sparse import coo_matrix
 from scipy.sparse.csgraph import dijkstra
 from scipy.spatial import cKDTree
 
+from . import corridor as corridors
 from .network import Network
 from .rung import LADDER_LEG_FRACTION, ladder
 
@@ -99,6 +104,8 @@ class SizeField:
     decoupled: set
     ladders: list = dataclasses.field(default_factory=list)  # (y, sigma) per network rung
     radius: dict = dataclasses.field(default_factory=dict)   # node -> R forced by a ladder
+    corridors: list = dataclasses.field(default_factory=list)  # CorridorLayout per network corridor
+    failed: list = dataclasses.field(default_factory=list)     # keys of corridors that could not be laid out
 
 
 def piece_lengths(net: Network) -> np.ndarray:
@@ -181,6 +188,13 @@ def barrier_cap(net: Network, field: SizeField, h0: np.ndarray, rho: np.ndarray,
         near = on_legs & (np.hypot(*(field.xy[i] - rung.apex).T) < extent) & \
             (np.hypot(*(field.xy[j] - rung.apex).T) < extent)
         geo[near] = 0.0
+    for c in net.corridors:
+        inside = np.zeros(len(field.s), dtype=bool)
+        for side in c.sides:
+            for sp in side:
+                sel = np.flatnonzero(field.piece == sp.piece)
+                inside[sel] = corridors.contains(c, sp.piece, field.xy[sel])
+        geo[inside[i] & inside[j]] = 0.0
     far = (geo > GEODESIC_RATIO * e) & (e > 0)
     np.minimum.at(cap, i[far], BARRIER_CAP * e[far])
     np.minimum.at(cap, j[far], BARRIER_CAP * e[far])
@@ -196,6 +210,11 @@ def boundary_cap(net: Network, field: SizeField, domain, rho: np.ndarray) -> np.
         on = np.array([net.plans[v].on_boundary for v in node])
         near = on & (np.hypot(*(field.xy - net.hard_xy[node]).T) < rho[node])
         cap[near] = np.inf
+    for c in net.corridors:
+        if len(c.sides) == 1:
+            for sp in c.sides[0]:
+                sel = np.flatnonzero(field.piece == sp.piece)
+                cap[sel[corridors.contains(c, sp.piece, field.xy[sel])]] = np.inf
     return cap
 
 
@@ -342,6 +361,22 @@ def lay_ladders(net: Network, field: SizeField, gradation: float = GRADATION) ->
             field.h[idx[beyond]] = np.minimum(field.h[idx[beyond]], last + gradation * (a[beyond] - t_end))
 
 
+def lay_corridors(net: Network, field: SizeField) -> None:
+    """Corridor layouts from the current h; h along their runs becomes the segment length."""
+    field.corridors, field.failed = [], []
+    for c in net.corridors:
+        lay = corridors.lay_out(c, net, field)
+        if lay is None:
+            field.failed.append(c.key)
+            continue
+        field.corridors.append(lay)
+        for p, t, _ in lay.runs:
+            sel = np.flatnonzero(field.piece == p)
+            k = np.searchsorted(t, field.s[sel], side="right") - 1
+            inside = (k >= 0) & (k < len(t) - 1)
+            field.h[sel[inside]] = np.diff(t)[k[inside]]
+
+
 def build_field(net: Network, size_fn, domain, features: np.ndarray, refine: np.ndarray | None = None,
                 gradation: float = GRADATION) -> SizeField:
     """The target spacing along the network (module docstring), with ``refine`` (per-sample upper bounds) applied."""
@@ -363,9 +398,11 @@ def build_field(net: Network, size_fn, domain, features: np.ndarray, refine: np.
         h = np.minimum(h, refine)
     field.h = lipschitz(field, h, gradation)
     lay_ladders(net, field, gradation)
+    lay_corridors(net, field)
     field.h = lipschitz(field, field.h, gradation)
     for _ in range(JUNCTION_PASSES):
         junction_sizes(net, field)
         field.h = lipschitz(field, field.h, gradation)
     lay_ladders(net, field, gradation)
+    lay_corridors(net, field)
     return field

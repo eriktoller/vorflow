@@ -876,8 +876,12 @@ class MeshGenerator:
             junction, dropped), ``snaps`` (barrier ends moved or trimmed
             onto another barrier or the boundary, and simplifications),
             ``noise`` (digitising-noise vertices dropped, with the largest
-            move), ``rings`` (hex rings dropped next to a barrier), plus
-            ``repair_rounds``, ``sites``, ``removed_nodes`` and ``polish``.
+            move), ``rings`` (hex rings dropped next to a barrier),
+            ``corridors`` (narrow gaps given one shared row of cells:
+            ``kind`` "barriers" between two close parallel barriers or
+            "boundary" along a boundary edge, ``line_ids``, ``length``),
+            plus ``repair_rounds``, ``sites``, ``removed_nodes`` and
+            ``polish``.
         barrier_lines (GeoDataFrame): The lines the barrier faces follow
             (after stubs and sharp tips are removed), with ``feature_id``
             (the clean-line index), ``line_id`` and ``is_barrier``.

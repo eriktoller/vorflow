@@ -267,6 +267,18 @@ def barrier_lines_frame(plan, context, crs) -> gpd.GeoDataFrame:
     return gpd.GeoDataFrame(rows, geometry='geometry', crs=crs)
 
 
+def _corridor_entry(c, plan, context) -> dict:
+    """A corridor for ``barrier_report``: kind, the barriers on its sides, where it is and how long."""
+    mid = c.origin + 0.5 * (c.x0 + c.x1) * c.m + context.origin
+    line_ids = []
+    for side in c.sides:
+        piece = side[0].piece
+        xy = 0.5 * (plan.net.hard_xy[plan.net.pieces[piece][0]] + plan.net.hard_xy[plan.net.pieces[piece][1]])
+        line_ids.append(context.face_rows[_nearest_line(xy, plan)][0])
+    return {'kind': 'boundary' if len(c.sides) == 1 else 'barriers', 'line_ids': line_ids,
+            'location': (float(mid[0]), float(mid[1])), 'length': float(c.x1 - c.x0)}
+
+
 def report(plan, context, fitted: dict) -> dict:
     """``MeshGenerator.barrier_report`` (see its docstring)."""
     origin = context.origin
@@ -279,6 +291,7 @@ def report(plan, context, fitted: dict) -> dict:
         return {'line_id': e.get('line_id'), 'kind': e['kind'], 'distance': float(e['distance']),
                 'location': (float(e['location'][0]), float(e['location'][1])), 'note': e['note']}
     return {
+        'corridors': [_corridor_entry(c, plan, context) for c in plan.net.corridors],
         'tips': tips,
         'stubs': stubs,
         'snaps': [clean(e) for e in context.events if e['kind'] in ('snap', 'trim', 'simplify')],

@@ -1,23 +1,26 @@
 """Barrier sites in closed form from the 1D layout, and the validity check.
 
-Layout. Every piece is cut into segments by 1D nodes: ladder chords at a
-rung end, then equal steps of the integral of 1/h. Every 1D node has a
-circle; every segment gets a *pair* of sites, mirror images across it, on
-both end circles:
+Layout. Every piece is cut into segments by 1D nodes: *fixed runs* (ladder
+chords at a rung end, corridor chords anywhere along the piece), and equal
+steps of the integral of 1/h in the stretches between them. Every 1D node
+has a circle; every segment gets a *pair* of sites, mirror images across
+it, on both end circles:
 
 - regular segment: the two intersections of its end circles;
 - first segment at a prescribing node v: ``v + R_v rot(leg, +-phi)``, and
   the far node's radius is derived through it (UPR's shrink);
 - single-segment piece between two prescribing nodes: where the two
   prescribed rays meet; both radii derived;
-- ladder segment: the ladder site and its mirror; chord radii derived.
+- ladder or corridor segment: the explicit site and its mirror; the
+  chord nodes' radii are derived.
 
 Free radii start at F x the mean adjacent segment length and are made
 consistent on Q = R^2 (ccvt): each regular pair's foot lies in the middle
 (1 - 2 FOOT) of its segment and its half-offset is at least OFFSET x d.
 Tips (free ends) and fills (wide empty arcs at prescribing nodes) get a
 site on the node circle; a truncated spike's tip site is the mirror of its
-first ladder site across the truncation chord.
+first ladder site across the truncation chord, a corridor's that of its
+last site across the end chord.
 
 The validity check of the result is in ``validate``.
 """
@@ -100,11 +103,41 @@ def _ladder_prefix(net: Network, field: SizeField) -> dict:
     return out
 
 
-def _end_kind(net: Network, prefix: dict, piece: int, node: int) -> str:
-    """"rung", "single" or "free": what fixes the first segment(s) of ``piece`` at ``node``."""
-    if (piece, node) in prefix:
+def fixed_runs(net: Network, field: SizeField) -> tuple:
+    """({piece: [(t ascending from the piece's first node, explicit sites of the segments between)]}, extra sites).
+
+    Ladders give a run at one end of each leg (and a truncated spike's tip
+    site); corridors give runs anywhere along a piece (and tip sites).
+    Extra sites are (point, node whose circle it is on, -1 for none).
+    """
+    lengths = piece_lengths(net)
+    runs, extra = {}, []
+    for (p, node), (t, pts, rung) in _ladder_prefix(net, field).items():
+        k0 = 0 if rung.t0 == 0 else 1
+        sites = [pts[j + k0] for j in range(len(t) - 1)]
+        if node == net.pieces[p][0]:
+            runs.setdefault(p, []).append((np.asarray(t, dtype=float), sites))
+        else:
+            runs.setdefault(p, []).append((lengths[p] - np.asarray(t, dtype=float)[::-1], sites[::-1]))
+        if rung.t0 > 0 and node == rung.nodes[0]:
+            extra.append((pts[0], -1))
+    for lay in field.corridors:
+        for p, t, sites in lay.runs:
+            runs.setdefault(p, []).append((np.asarray(t, dtype=float), list(sites)))
+        extra += lay.extra
+    for p, items in runs.items():
+        items.sort(key=lambda r: r[0][0])
+        for (ta, _), (tb, _) in zip(items[:-1], items[1:]):
+            assert ta[-1] <= tb[0] + 1e-9 * lengths[p], f"two fixed runs overlap on piece {p}"
+    return runs, extra
+
+
+def _end_kind(net: Network, piece: int, node: int) -> str:
+    """"rung", "single" or "free": what fixes the first segment of ``piece`` at hard ``node`` (no run there)."""
+    plan = net.plans[node]
+    if plan.rung_end:
         return "rung"
-    return "single" if net.plans[node].prescribes else "free"
+    return "single" if plan.prescribes else "free"
 
 
 def _middle_count(raw: int, kind_a: str, kind_b: str) -> int:
@@ -116,24 +149,47 @@ def _middle_count(raw: int, kind_a: str, kind_b: str) -> int:
     return raw
 
 
+def _piece_arc(net: Network, field: SizeField, p: int, runs: list, single_ends: list) -> tuple:
+    """(positions along piece p, explicit site or None per segment); records the single ends (segment offsets)."""
+    a, b = net.pieces[p]
+    length = piece_lengths(net)[p]
+    tol = 1e-9 * max(1.0, length)
+    arc, sites = [0.0], []
+    cursor, kind = 0.0, _end_kind(net, p, a)
+
+    def stretch(lo: float, hi: float, kind_lo: str, kind_hi: str) -> None:
+        whole = kind_lo != "rung" and kind_hi != "rung" and lo <= tol and hi >= length - tol
+        raw = raw_count(field, p) if whole else _count(field, p, lo, hi)
+        count = _middle_count(raw, kind_lo, kind_hi)
+        first = len(sites)
+        arc.extend(list(_positions(field, p, lo, hi, count)) + [hi])
+        sites.extend([None] * count)
+        if kind_lo == "single" and lo <= tol:
+            single_ends.append((first, a, p, 1))
+        if kind_hi == "single" and hi >= length - tol:
+            single_ends.append((len(sites) - 1, b, p, -1))
+
+    for t, run_sites in runs:
+        if t[0] > cursor + tol:
+            stretch(cursor, float(t[0]), kind, "rung")
+        arc.extend(float(x) for x in t[1:])
+        sites.extend(run_sites)
+        cursor, kind = float(t[-1]), "rung"
+    if cursor < length - tol:
+        stretch(cursor, length, kind, _end_kind(net, p, b))
+    return arc, sites
+
+
 def build_layout(net: Network, field: SizeField) -> tuple:
-    """(node xy, segments, seg_piece, explicit sites {segment: site}, single ends, truncated tip sites)."""
+    """(node xy, segments, seg_piece, explicit sites {segment: site}, single ends, extra sites)."""
     lengths = piece_lengths(net)
-    prefix = _ladder_prefix(net, field)
+    runs, extra = fixed_runs(net, field)
     xy = [p for p in net.hard_xy]
-    segments, seg_piece, explicit, extra = [], [], {}, []
+    segments, seg_piece, explicit = [], [], {}
     single_ends = []
     for p, (a, b) in enumerate(net.pieces):
-        kind_a, kind_b = _end_kind(net, prefix, p, a), _end_kind(net, prefix, p, b)
-        pos_a = list(prefix[(p, a)][0]) if kind_a == "rung" else [0.0]
-        pos_b = [lengths[p] - t for t in prefix[(p, b)][0]] if kind_b == "rung" else [lengths[p]]
-        lo, hi = pos_a[-1], pos_b[-1]
-        if hi <= lo:  # two ladders overlap on a short piece: keep the first one only
-            raise AssertionError(f"two ladders overlap on piece {p}")
-        raw = raw_count(field, p) if kind_a != "rung" and kind_b != "rung" else _count(field, p, lo, hi)
-        count = _middle_count(raw, kind_a, kind_b)
-        middle = list(_positions(field, p, lo, hi, count))
-        arc = pos_a + middle + pos_b[::-1]
+        local = []
+        arc, sites = _piece_arc(net, field, p, runs.get(p, []), local)
         start, u = net.hard_xy[a], (net.hard_xy[b] - net.hard_xy[a]) / lengths[p]
         ids = [a]
         for t in arc[1:-1]:
@@ -143,19 +199,10 @@ def build_layout(net: Network, field: SizeField) -> tuple:
         first = len(segments)
         segments += list(zip(ids[:-1], ids[1:]))
         seg_piece += [p] * (len(ids) - 1)
-        n_seg = len(ids) - 1
-        for kind, node, step, segs in ((kind_a, a, 1, range(first, first + n_seg)),
-                                       (kind_b, b, -1, range(first + n_seg - 1, first - 1, -1))):
-            segs = list(segs)
-            if kind == "rung":
-                t, pts, rung = prefix[(p, node)]
-                k0 = 0 if rung.t0 == 0 else 1
-                for j, seg in enumerate(segs[:len(t) - 1]):
-                    explicit[seg] = pts[j + k0]
-                if rung.t0 > 0 and node == rung.nodes[0]:
-                    extra.append(pts[0])
-            elif kind == "single":
-                single_ends.append((segs[0], node, p, step))
+        for k, site in enumerate(sites):
+            if site is not None:
+                explicit[first + k] = np.asarray(site, dtype=float)
+        single_ends += [(first + k, node, piece, step) for k, node, piece, step in local]
     return np.array(xy), np.array(segments, dtype=int), np.array(seg_piece, dtype=int), explicit, single_ends, extra
 
 
@@ -289,16 +336,16 @@ def _pairs(xy: np.ndarray, radius: np.ndarray, segments: np.ndarray, d: np.ndarr
 
 
 def _tip_sites(net: Network, xy: np.ndarray, radius: np.ndarray, field: SizeField, extra: list) -> tuple:
-    """(points, node) of tip and fill sites on hard-node circles, plus truncated tip sites (node -1)."""
+    """(points, node) of tip and fill sites on hard-node circles, plus the ladder and corridor extra sites."""
     pts, nodes = [], []
     for v, plan in enumerate(net.plans):
         dirs = ([plan.tip_direction] if plan.tip_direction is not None else []) + list(plan.fill_directions)
         for d in dirs:
             pts.append(xy[v] + radius[v] * d)
             nodes.append(v)
-    for p in extra:
+    for p, v in extra:
         pts.append(p)
-        nodes.append(-1)
+        nodes.append(v)
     return np.array(pts).reshape(-1, 2), np.array(nodes, dtype=int)
 
 

@@ -123,6 +123,7 @@ class Network:
     rungs: list
     lines: list          # the barrier polylines the faces follow (after stubs and spike tips)
     uncovered: list      # (kind, length, xy) of barrier parts left without faces
+    corridors: list = dataclasses.field(default_factory=list)  # see ``corridor``
 
 
 # ---------------------------------------------------------------------------
@@ -509,6 +510,12 @@ def node_plan(node: int, hard: np.ndarray, pieces: np.ndarray, domain, standard:
         all_shared = shared + rung_sectors
         fills = _fill_directions(legs, [s for s in sectors if s not in all_shared])
     return NodePlan(legs, sectors, shared + rung_sectors, prescribes, on_boundary, tip, fills, rung_end, violation)
+
+
+def replan_chord_nodes(net: Network, nodes: set, domain, standard: list, tol: float) -> None:
+    """Re-plan ``nodes`` as chord nodes of a corridor: no own sites, radius derived from the corridor's sites."""
+    for v in sorted(nodes):
+        net.plans[v] = node_plan(v, net.hard_xy, net.pieces, domain, standard, tol, True, set(), [])
 
 
 def build_network(lines: list, standard: list, domain, tol: float, sharp_angle: float = SHARP_ANGLE) -> Network:

@@ -3,16 +3,25 @@
 ``plan`` runs before Gmsh:
 
 1. ``network.build_network``: drop stubs, truncate sharp spike tips, hard
-   nodes and pieces, the sector plan of every node (rungs, shared, split).
+   nodes and pieces, the sector plan of every node (rungs, shared, split);
+   ``corridor.find_corridors``: narrow gaps that get one shared row of
+   sites (their chord nodes are re-planned to take their radii from it).
 2. ``sizing.build_field``: target face length along the network from
    vorflow's size field, capped by the distance to other barrier parts, the
-   boundary and feature nodes; Lipschitz; ladders; junction sizes.
+   boundary and feature nodes; Lipschitz; ladders; junction sizes;
+   corridors.
 3. ``sites.construct``: 1D nodes, radii, closed-form sites.
-4. ``validate.defects``. Where the gate fails, the face length is set to
-   REPAIR_FACTOR x the local face length there and steps 2-4 repeat, at
-   most REPAIR_ROUNDS times. If a defect is left, the site count exceeds
+4. ``validate.defects``. A corridor that cannot be laid out, or has a
+   defect in its region, is dropped and the plan starts again without it.
+   Elsewhere, where the gate fails, the face length is set to REPAIR_FACTOR
+   x the local face length there and steps 2-4 repeat, at most
+   REPAIR_ROUNDS times. If a defect is left, the site count exceeds
    SITE_GROWTH_CAP x the first round's, or the face length would drop below
    MIN_H_FRACTION x lc, ``BarrierMeshError`` names the place.
+
+Gmsh gets a fine field along the barrier faces that are finer than the
+size field (FINE_RATIO), at a size between the two (FINE_BLEND), or at the
+face length along a corridor (CORRIDOR_BLEND), grouped in size classes.
 
 After Gmsh (see ``MeshGenerator``): Gmsh nodes inside a circle (by
 CIRCLE_MARGIN) or within CLEAR_FRACTION x the local spacing of a site are
@@ -31,8 +40,9 @@ import shapely
 from scipy.spatial import cKDTree
 from shapely.geometry import LineString, MultiLineString
 
+from . import corridor as corridors
 from .lines import BarrierLine, must_keep
-from .network import SHARP_ANGLE, Network, build_network
+from .network import SHARP_ANGLE, Network, build_network, replan_chord_nodes
 from .sites import Layout, construct
 from .sizing import GRADATION, SizeField, build_field
 from .validate import all_finite, defects
@@ -46,6 +56,7 @@ FINE_RATIO = 0.87        # faces finer than this x the size field get a fine fie
 CLASS_RATIO = 1.25       # fine fields are grouped in size classes of this ratio
 FINE_GROWTH = 1.3        # growth_factor of the fine fields
 FINE_BLEND = 0.5         # fine field size = face^(1 - FINE_BLEND) x target^FINE_BLEND
+CORRIDOR_BLEND = 0.0     # ... along a corridor, whose outer cells should match its row
 EMBED_GAP = 0.05         # x spacing: sites this close to an edge, line or feature are not Gmsh points
 CIRCLE_MARGIN = 0.02     # Gmsh nodes within R (1 + CIRCLE_MARGIN) of a circle centre are removed
 CLEAR_FRACTION = 0.5     # ... and those within this x the local spacing of a site
@@ -127,36 +138,73 @@ def repair_bounds(field: SizeField, layout: Layout, bad: list, refine: np.ndarra
     return out
 
 
+def network_with_corridors(lines: list, standard: list, domain, features: np.ndarray, size_fn,
+                           sharp_angle: float, skip: set) -> Network:
+    """The barrier network with its corridors (except those in ``skip``) and their chord nodes re-planned."""
+    tol = touch_tolerance(domain)
+    net = build_network(lines, standard, domain, tol, sharp_angle)
+    net.corridors = corridors.find_corridors(net, size_fn, domain, standard, features, skip)
+    replan_chord_nodes(net, set().union(*[corridors.chord_nodes(c) for c in net.corridors]), domain, standard, tol)
+    return net
+
+
+def _troubled(net: Network, field: SizeField, bad: list) -> set:
+    """Keys of the corridors that failed to lay out or have a defect in their region."""
+    out = set(field.failed)
+    for c in net.corridors:
+        reach = c.region.buffer(0.5 * math.sqrt(max(c.region.area, 0.0)) + 1e-9)
+        if any(reach.covers(shapely.Point(p)) for _, p in bad):
+            out.add(c.key)
+    return out
+
+
 def plan(lines: list, standard: list, domain, features: np.ndarray, size_fn, origin: np.ndarray,
          gradation: float = GRADATION, sharp_angle: float = SHARP_ANGLE) -> BarrierPlan:
     """A barrier construction that passes the validity gate (module docstring), or BarrierMeshError."""
-    net = build_network(lines, standard, domain, touch_tolerance(domain), sharp_angle)
-    refine, first = None, None
-    for rounds in range(REPAIR_ROUNDS + 1):
+    skip = set()
+    net = network_with_corridors(lines, standard, domain, features, size_fn, sharp_angle, skip)
+    refine, first, rounds = None, None, 0
+    while True:
         field = build_field(net, size_fn, domain, features, refine, gradation)
+        if field.failed:
+            skip |= set(field.failed)
+            net = network_with_corridors(lines, standard, domain, features, size_fn, sharp_angle, skip)
+            refine = None
+            continue
         check_floor(net, field, origin)
         layout = construct(net, field)
         assert all_finite(layout), "barrier construction produced non-finite radii or sites"
-        first = first or len(layout.sites)
         bad = defects(layout, features, domain)
         if not bad:
             return BarrierPlan(origin, net, field, layout, rounds)
+        troubled = _troubled(net, field, bad)
+        if troubled:
+            skip |= troubled
+            net = network_with_corridors(lines, standard, domain, features, size_fn, sharp_angle, skip)
+            refine = None
+            continue
+        first = first or len(layout.sites)
         if rounds == REPAIR_ROUNDS or len(layout.sites) > SITE_GROWTH_CAP * first:
             kinds = sorted({k for k, _ in bad})
             _fail(f"{len(bad)} defects ({', '.join(kinds)}) left after {rounds} local refinements",
                   np.array([p for _, p in bad]), origin)
         refine = repair_bounds(field, layout, bad, refine)
-    raise AssertionError("unreachable")
+        rounds += 1
 
 
 # ---------------------------------------------------------------------------
 # Handing the plan to Gmsh, and taking the mesh back
 # ---------------------------------------------------------------------------
-def fine_lines(layout: Layout, net: Network, size_fn, blend: float = FINE_BLEND) -> list:
+def fine_lines(layout: Layout, net: Network, size_fn, blend: float = FINE_BLEND,
+               corridor_blend: float = CORRIDOR_BLEND) -> list:
     """(lines, resolution) of field-only lines where the barrier faces are finer than the size field."""
     mids = 0.5 * (layout.xy[layout.segments[:, 0]] + layout.xy[layout.segments[:, 1]])
     target = np.minimum(net.piece_lc[layout.seg_piece], size_fn(mids))
-    size = layout.seg_size ** (1 - blend) * target ** blend
+    in_corridor = np.zeros(len(mids), dtype=bool)
+    for c in net.corridors:
+        in_corridor |= shapely.covers(c.region.buffer(1e-9 * c.region.length), shapely.points(mids))
+    power = np.where(in_corridor, corridor_blend, blend)
+    size = layout.seg_size ** (1 - power) * target ** power
     classes = {}
     for k in np.flatnonzero(size < FINE_RATIO * target):
         d = float(size[k])

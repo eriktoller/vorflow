@@ -686,15 +686,21 @@ class ConceptualMesh:
             dist_max (float, optional): Distance from the line over which the mesh
                 transitions to the background resolution. See dist_min.
             straddle_width (float, optional): Deprecated, with a FutureWarning; its value is
-                ignored. It set the width of the node pairs that made cell faces follow the
-                line; the faces are now placed exactly and automatically. A non-barrier line
-                that sets it still gets exact cell faces along it, as before.
+                ignored (it no longer sets any offset or trimming width). It set the width of the
+                node pairs that made cell faces follow the line; the faces are now placed exactly
+                and automatically along every barrier. On a line that is not a barrier, any
+                positive value still makes the cell faces follow the line exactly: that is the
+                only switch for exact faces without ``is_barrier=True`` (which gives the same
+                faces and lists the line with ``is_barrier`` True in
+                ``MeshGenerator.barrier_lines``).
         """
         if straddle_width is not None:
             warn_user(
-                "straddle_width is deprecated and its value is ignored: cell faces along a barrier are now "
-                "placed exactly and automatically, and a non-barrier line that sets it still gets exact faces "
-                "along it. Remove it from add_line() (use is_barrier=True for a flow barrier).",
+                "straddle_width is deprecated and its value is ignored. Along a barrier (is_barrier=True) the "
+                "cell faces follow the line exactly and automatically, so remove it there. On a line that is not "
+                "a barrier, any positive straddle_width still makes the faces follow the line exactly; it is the "
+                "only way to get that without is_barrier=True, which gives the same faces and marks the line "
+                "as a barrier in MeshGenerator.barrier_lines.",
                 FutureWarning,
             )
         if not geometry.is_valid:

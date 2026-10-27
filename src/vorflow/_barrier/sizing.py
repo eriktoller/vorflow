@@ -69,9 +69,9 @@ GEODESIC_RATIO = 2.0
 PROTECT_FRACTION = 1.5   # x h at the node: protection radius of a hard node
 CAP_REACH = 1.5          # x h: caps are only looked for this far
 PAIR_CHUNK = 20000       # samples per neighbour query in ``near_pairs``
+SOURCE_CHUNK = 256       # hard nodes per Dijkstra call in ``node_distances``
 SHORT_BLEND = 0.5
 JUNCTION_PASSES = 3
-DEFAULT_GROWTH = 1.2
 
 
 # ---------------------------------------------------------------------------
@@ -168,24 +168,39 @@ def rung_extent(theta: float, spacing: float) -> float:
     return 0.85 * spacing / max(math.sin(theta / 2), 1e-3) + spacing
 
 
-def node_distances(net: Network, limit: float) -> np.ndarray:
-    """Shortest network distance between hard nodes (inf beyond ``limit``)."""
+def node_graph(net: Network):
+    """The network as a sparse graph of the hard nodes, weighted by piece length."""
     n = len(net.hard_xy)
-    lengths = piece_lengths(net)
-    graph = coo_matrix((lengths, (net.pieces[:, 0], net.pieces[:, 1])), shape=(n, n)).tocsr()
-    return dijkstra(graph, directed=False, limit=limit)
+    return coo_matrix((piece_lengths(net), (net.pieces[:, 0], net.pieces[:, 1])), shape=(n, n)).tocsr()
 
 
-def near_pairs(field: SizeField, h0: np.ndarray, chunk: int = PAIR_CHUNK) -> tuple:
-    """(i, j), i < j, of samples on different pieces closer than CAP_REACH x the larger of their h0.
+def node_distances(graph, limit: float, src: np.ndarray, dst: np.ndarray, chunk: int = SOURCE_CHUNK) -> np.ndarray:
+    """Shortest distance in ``graph`` (``node_graph``) from node ``src[k]`` to ``dst[k]`` (inf beyond ``limit``).
+
+    Only the sources asked for are searched, ``chunk`` at a time, so the
+    memory is chunk x hard nodes rather than hard nodes squared.
+    """
+    out = np.full(len(src), np.inf)
+    sources, which = np.unique(np.asarray(src, dtype=np.int64), return_inverse=True)
+    order = np.argsort(which, kind="stable")
+    bounds = np.searchsorted(which[order], np.arange(0, len(sources) + chunk, chunk))
+    for c, start in enumerate(range(0, len(sources), chunk)):
+        block = dijkstra(graph, directed=False, indices=sources[start:start + chunk], limit=limit)
+        sel = order[bounds[c]:bounds[c + 1]]
+        out[sel] = block[which[sel] - start, dst[sel]]
+    return out
+
+
+def near_pair_chunks(field: SizeField, h0: np.ndarray, chunk: int = PAIR_CHUNK):
+    """Per ``chunk`` samples i: (i, j) of the samples j on another piece within CAP_REACH x h0[i] of i.
 
     Each sample looks only as far as its own reach, so the memory grows
-    with the number of close pairs, not with the coarsest h0 over the finest
-    sample spacing (a single global radius did).
+    with the number of close pairs in a chunk, not with the coarsest h0
+    over the finest sample spacing (a single global radius did). A pair
+    within reach of both samples comes once from each.
     """
     tree = cKDTree(field.xy)
     radius = CAP_REACH * h0
-    rows, cols = [], []
     for start in range(0, len(h0), chunk):
         stop = min(start + chunk, len(h0))
         hits = tree.query_ball_point(field.xy[start:stop], radius[start:stop], return_sorted=False)
@@ -193,52 +208,85 @@ def near_pairs(field: SizeField, h0: np.ndarray, chunk: int = PAIR_CHUNK) -> tup
         j = np.fromiter(itertools.chain.from_iterable(hits), dtype=np.int64, count=int(counts.sum()))
         i = np.repeat(np.arange(start, stop), counts)
         keep = field.piece[i] != field.piece[j]
-        rows.append(np.minimum(i[keep], j[keep]))
-        cols.append(np.maximum(i[keep], j[keep]))
-    key = np.unique(np.concatenate(rows) * len(h0) + np.concatenate(cols))
+        yield i[keep], j[keep]
+
+
+def near_pairs(field: SizeField, h0: np.ndarray, chunk: int = PAIR_CHUNK) -> tuple:
+    """(i, j), i < j, of samples on different pieces closer than CAP_REACH x the larger of their h0."""
+    rows, cols = [], []
+    for i, j in near_pair_chunks(field, h0, chunk):
+        rows.append(np.minimum(i, j))
+        cols.append(np.maximum(i, j))
+    key = np.unique(np.concatenate(rows) * len(h0) + np.concatenate(cols)) if rows else np.empty(0, dtype=np.int64)
     return key // len(h0), key % len(h0)
 
 
-def barrier_cap(net: Network, field: SizeField, h0: np.ndarray, rho: np.ndarray, extents: list) -> np.ndarray:
-    """Per sample: BARRIER_CAP x distance to the nearest network point that is far along the network."""
+def _geodesic(net: Network, field: SizeField, graph, limit: float, i: np.ndarray, j: np.ndarray,
+              rho: np.ndarray, extents: list, inside: np.ndarray) -> np.ndarray:
+    """Network distance between samples i and j (0 where a node's plan, a ladder or a corridor handles them)."""
     lengths = piece_lengths(net)
-    reach = CAP_REACH * float(h0.max())
-    graph = node_distances(net, GEODESIC_RATIO * reach + 2 * float(lengths.max()))
-    i, j = near_pairs(field, h0)
-    cap = np.full(len(h0), np.inf)
-    if len(i) == 0:
-        return cap
     pi, pj = field.piece[i], field.piece[j]
-    e = np.hypot(*(field.xy[i] - field.xy[j]).T)
-    keep = e < CAP_REACH * np.maximum(h0[i], h0[j])
-    i, j, pi, pj, e = i[keep], j[keep], pi[keep], pj[keep], e[keep]
     geo = np.full(len(i), np.inf)
-    for ei in (0, 1):
-        ui = net.pieces[pi, ei]
+    ends = [(ei, ej) for ei in (0, 1) for ej in (0, 1)]
+    n_pieces = len(net.pieces)
+    piece_pairs, which = np.unique(pi * n_pieces + pj, return_inverse=True)
+    qi, qj = piece_pairs // n_pieces, piece_pairs % n_pieces
+    between = node_distances(graph, limit, np.concatenate([net.pieces[qi, ei] for ei, _ in ends]),
+                             np.concatenate([net.pieces[qj, ej] for _, ej in ends])).reshape(len(ends), -1)
+    for (ei, ej), piece_d in zip(ends, between):
+        ui, uj = net.pieces[pi, ei], net.pieces[pj, ej]
+        graph_d = piece_d[which]
         di = field.s[i] if ei == 0 else lengths[pi] - field.s[i]
-        for ej in (0, 1):
-            uj = net.pieces[pj, ej]
-            dj = field.s[j] if ej == 0 else lengths[pj] - field.s[j]
-            geo = np.minimum(geo, di + graph[ui, uj] + dj)
-            shared = ui == uj  # both within the protection radius of a common node: the plan's business
-            near = shared & (np.hypot(*(field.xy[i] - net.hard_xy[ui]).T) < rho[ui]) & \
-                (np.hypot(*(field.xy[j] - net.hard_xy[ui]).T) < rho[ui])
-            geo[near] = 0.0
+        dj = field.s[j] if ej == 0 else lengths[pj] - field.s[j]
+        geo = np.minimum(geo, di + graph_d + dj)
+        shared = ui == uj  # both within the protection radius of a common node: the plan's business
+        near = shared & (np.hypot(*(field.xy[i] - net.hard_xy[ui]).T) < rho[ui]) & \
+            (np.hypot(*(field.xy[j] - net.hard_xy[ui]).T) < rho[ui])
+        geo[near] = 0.0
     for rung, extent in zip(net.rungs, extents):
         on_legs = np.isin(pi, rung.pieces) & np.isin(pj, rung.pieces)
         near = on_legs & (np.hypot(*(field.xy[i] - rung.apex).T) < extent) & \
             (np.hypot(*(field.xy[j] - rung.apex).T) < extent)
         geo[near] = 0.0
+    for mask in inside:
+        geo[mask[i] & mask[j]] = 0.0
+    return geo
+
+
+def _corridor_masks(net: Network, field: SizeField) -> list:
+    """Per corridor, the mask of the samples in its stretch."""
+    out = []
     for c in net.corridors:
         inside = np.zeros(len(field.s), dtype=bool)
         for side in c.sides:
             for sp in side:
                 sel = np.flatnonzero(field.piece == sp.piece)
                 inside[sel] = corridors.contains(c, sp.piece, field.xy[sel])
-        geo[inside[i] & inside[j]] = 0.0
-    far = (geo > GEODESIC_RATIO * e) & (e > 0)
-    np.minimum.at(cap, i[far], BARRIER_CAP * e[far])
-    np.minimum.at(cap, j[far], BARRIER_CAP * e[far])
+        out.append(inside)
+    return out
+
+
+def barrier_cap(net: Network, field: SizeField, h0: np.ndarray, rho: np.ndarray, extents: list) -> np.ndarray:
+    """Per sample: BARRIER_CAP x distance to the nearest network point that is far along the network.
+
+    The close sample pairs are taken a chunk at a time (``near_pair_chunks``);
+    a pair seen twice caps both samples by the same value.
+    """
+    reach = CAP_REACH * float(h0.max())
+    limit = GEODESIC_RATIO * reach + 2 * float(piece_lengths(net).max())
+    graph = node_graph(net)
+    inside = _corridor_masks(net, field)
+    cap = np.full(len(h0), np.inf)
+    for i, j in near_pair_chunks(field, h0):
+        e = np.hypot(*(field.xy[i] - field.xy[j]).T)
+        keep = e < CAP_REACH * np.maximum(h0[i], h0[j])
+        i, j, e = i[keep], j[keep], e[keep]
+        if len(i) == 0:
+            continue
+        geo = _geodesic(net, field, graph, limit, i, j, rho, extents, inside)
+        far = (geo > GEODESIC_RATIO * e) & (e > 0)
+        np.minimum.at(cap, i[far], BARRIER_CAP * e[far])
+        np.minimum.at(cap, j[far], BARRIER_CAP * e[far])
     return cap
 
 

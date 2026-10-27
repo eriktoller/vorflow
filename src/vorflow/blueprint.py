@@ -19,6 +19,7 @@ from ._features import line_parts as _line_parts
 from ._features import HEX_RING_CLEARANCE, is_face_line, positive_number, row_bool
 from ._plot import features_frame, get_ax, plot_features
 from ._barrier import lines as _barrier_lines
+from ._barrier import pipeline as _barrier_pipeline
 from .fields import DEFAULT_GROWTH_FACTOR, GeometricGrowthField, MeshField, ThresholdField
 from shapely.strtree import STRtree
 
@@ -1182,7 +1183,10 @@ class ConceptualMesh:
             for i in members
         ]
         tolerance = self._resolve_connectivity_tolerance(connectivity_tolerance)
-        kept, dropped = _barrier_lines.clean_barrier_lines(barriers, standard, domain, tolerance)
+        try:
+            kept, dropped = _barrier_lines.clean_barrier_lines(barriers, standard, domain, tolerance)
+        except _barrier_pipeline.GEOMETRY_ERRORS as err:
+            raise _barrier_pipeline.internal_failure("line cleaning", err) from err
         rows = []
         for i, line in enumerate(self.raw_lines):
             if i not in members:

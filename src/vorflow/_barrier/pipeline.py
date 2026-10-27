@@ -67,8 +67,19 @@ CIRCLE_MARGIN = 0.02     # Gmsh nodes within R (1 + CIRCLE_MARGIN) of a circle c
 CLEAR_FRACTION = 0.5     # ... and those within this x the local spacing of a site
 
 
+GEOMETRY_ERRORS = (shapely.errors.GEOSException, ArithmeticError)  # degenerate geometry inside the construction
+
+
 class BarrierMeshError(ValueError):
     """The barrier faces cannot be made exact at this resolution and tolerance."""
+
+
+def internal_failure(step: str, err: Exception) -> BarrierMeshError:
+    """A BarrierMeshError for a geometric failure inside ``step`` that the construction does not foresee."""
+    return BarrierMeshError(
+        f"the barrier {step} failed on a degenerate geometry ({type(err).__name__}: {err}). This is a bug in "
+        "vorflow; please report it with the barrier lines. Until then, quad_buffer=True on the barrier meshes it "
+        "with a structured strip of cells instead of exact faces.")
 
 
 @dataclasses.dataclass
@@ -168,7 +179,17 @@ def plan(lines: list, standard: list, domain, features: np.ndarray, size_fn, ori
     """A barrier construction that passes the validity gate (module docstring), or BarrierMeshError.
 
     ``obstacles`` are the fixed lines (``sizing.Obstacle``) whose nodes the circles must not reach.
+    A geometric failure inside the construction is raised as BarrierMeshError too.
     """
+    try:
+        return _repair_loop(lines, standard, domain, features, size_fn, origin, gradation, sharp_angle, obstacles)
+    except GEOMETRY_ERRORS as err:
+        raise internal_failure("construction", err) from err
+
+
+def _repair_loop(lines: list, standard: list, domain, features: np.ndarray, size_fn, origin: np.ndarray,
+                 gradation: float, sharp_angle: float, obstacles: list) -> BarrierPlan:
+    """``plan``'s steps 1-4 with corridor drops and local repair rounds (module docstring)."""
     skip = set()
     tol = touch_tolerance(domain)
     net = network_with_corridors(lines, standard, domain, features, size_fn, sharp_angle, skip)
@@ -184,7 +205,8 @@ def plan(lines: list, standard: list, domain, features: np.ndarray, size_fn, ori
             continue
         check_floor(net, field, origin)
         layout = construct(net, field)
-        assert all_finite(layout), "barrier construction produced non-finite radii or sites"
+        if not all_finite(layout):
+            raise internal_failure("construction", FloatingPointError("non-finite radii or sites"))
         bad = defects(layout, features, domain)
         if not bad:
             return BarrierPlan(origin, net, field, layout, rounds)

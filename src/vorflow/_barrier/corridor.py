@@ -75,6 +75,7 @@ MIN_OVERLAP = 2.0        # x h0: shorter facing stretches get no corridor
 ALIGN_FRACTION = 0.25    # x L: two free ends this close along M end the corridor together
 STAGGER_TILT = math.radians(10.0)
 EDGE_MARGIN = 1.0        # x h0: a boundary run keeps this far from the ends of its edge
+COLLINEAR_FRACTION = 1e-9  # x piece length: pieces this close to one line are collinear, not a corridor
 
 
 @dataclasses.dataclass
@@ -182,7 +183,8 @@ def _bisector(a0: np.ndarray, a1: np.ndarray, b0: np.ndarray, b1: np.ndarray) ->
     """(origin, m): the line midway between the lines through pieces a0-a1 and b0-b1, m oriented like a1 - a0.
 
     The normals are oriented towards the other piece's midpoint, so pieces
-    that meet (a ladder's legs) work too.
+    that meet (a ladder's legs) work too. Collinear pieces have no
+    bisector; their common line is returned (callers reject such pairs).
     """
     ua, ub = _unit(a1 - a0), _unit(b1 - b0)
     na = _rot90(ua)
@@ -190,10 +192,19 @@ def _bisector(a0: np.ndarray, a1: np.ndarray, b0: np.ndarray, b1: np.ndarray) ->
     nb = _rot90(ub)
     nb = nb if nb @ (0.5 * (a0 + a1) - b0) > 0 else -nb
     k = na - nb
+    if k @ k <= COLLINEAR_FRACTION ** 2:
+        return a0.copy(), ua
     m = _unit(_rot90(k))
     m = m if m @ ua > 0 else -m
     origin = k * (na @ a0 - nb @ b0) / (k @ k)
     return origin + ((a0 - origin) @ m) * m, m
+
+
+def collinear(a0: np.ndarray, a1: np.ndarray, b0: np.ndarray, b1: np.ndarray) -> bool:
+    """True when piece b lies on the line through piece a (to COLLINEAR_FRACTION of the longer piece)."""
+    scale = max(float(np.hypot(*(a1 - a0))), float(np.hypot(*(b1 - b0))))
+    offsets = (np.array([b0, b1]) - a0) @ _rot90(_unit(a1 - a0))
+    return bool(np.abs(offsets).max() <= COLLINEAR_FRACTION * scale)
 
 
 def _oriented(net, p: int, m: np.ndarray) -> SidePiece:
@@ -248,7 +259,7 @@ def _pair_corridor(net, pa: int, pb: int, size_fn, domain, obstacles: Obstacles,
         ub, B0, B1 = -ub, B1, B0
     if math.acos(float(np.clip(ua @ ub, -1.0, 1.0))) >= CORRIDOR_ANGLE:
         return None
-    if LineString([A0, A1]).intersects(LineString([B0, B1])):
+    if LineString([A0, A1]).intersects(LineString([B0, B1])) or collinear(A0, A1, B0, B1):
         return None
     origin, m = _bisector(A0, A1, B0, B1)
     sa, sb = _oriented(net, pa, m), _oriented(net, pb, m)

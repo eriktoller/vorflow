@@ -502,15 +502,16 @@ def _unshared_interior_edges(grid, domain):
 
 
 def test_boundary_inset_mirror_covers_domain_around_irregular_hole():
-    """Catches ghost cells that reach into the domain past a concave, unevenly noded hole (issue #71)."""
+    """Catches ghost cells that reach into the domain at the reflex vertices of an irregular hole (issue #71)."""
     hole = [(3, 3), (7, 3.5), (6, 5), (7.5, 7), (4, 6.5), (4.5, 5)]
     domain = Polygon([(0, 0), (10, 0), (10, 10), (0, 10)], [hole])
     cm = ConceptualMesh()
     cm.add_polygon(domain, zone_id=1, densify=False)
     clean_polys, _, _ = cm.generate()
 
-    # Hole nodes alternate short and long gaps, so neighbouring insets
-    # differ and some mirror ghosts own a strip of the domain.
+    # Every hole vertex is reflex seen from the domain; there a mirror
+    # ghost's face cuts into the domain. Hole nodes alternate short and
+    # long gaps, so neighbouring insets differ and those strips are wide.
     ring = domain.interiors[0]
     distances = np.cumsum(np.r_[0.0, np.tile([0.25, 0.25, 1.2, 0.6], 20)])
     hole_nodes = [ring.interpolate(d).coords[0] for d in distances[distances < ring.length]]
@@ -528,10 +529,15 @@ def test_boundary_inset_mirror_covers_domain_around_irregular_hole():
     assert domain.difference(covered).area < 1e-9
     assert grid.geometry.area.sum() == pytest.approx(domain.area, rel=1e-12)
     assert _unshared_interior_edges(grid, domain) == []
-    # Only the leaking ghosts fall back to clipping; most nodes stay centred.
+    # Nodes whose ghost leaked stay inset with a clipped cell; the rest
+    # keep their mirror ghost.
     hole_rows = grid["source_x"].round(9).isin(np.round(np.asarray(hole_nodes)[:, 0], 9))
-    assert grid.loc[hole_rows, "boundary_centered"].mean() > 0.5
-    assert not grid.loc[hole_rows, "boundary_centered"].all()
+    hole_modes = grid.loc[hole_rows, "boundary_centering"]
+    assert (hole_modes == "inset").any()
+    assert (hole_modes == "inset_mirror").mean() > 0.5
+    inset_rows = grid["boundary_centering"] == "inset"
+    assert grid.loc[inset_rows, "boundary_centered"].all()
+    assert (grid.loc[inset_rows, "boundary_inset"] > 0).all()
 
 
 def _staggered_lattice_nodes():

@@ -17,11 +17,12 @@ and the project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 ### Fixed
 
 - `boundary_centering="inset_mirror"` no longer leaves uncovered strips (and
-  MODFLOW 6 disconnected faces) along irregular or unevenly noded boundaries
-  ([#71](https://github.com/rhugman/vorflow/issues/71)). A mirror ghost
-  outside the domain could still own part of it where the node spacing jumps
-  or the boundary bends, and ghost cells are discarded before clipping. Such
-  ghosts are now dropped and their nodes clipped instead.
+  MODFLOW 6 disconnected faces) along irregular boundaries
+  ([#71](https://github.com/rhugman/vorflow/issues/71)). At a reflex boundary
+  vertex (one bending into the domain) a mirror ghost outside the domain still
+  owned part of it, and ghost cells are discarded before clipping. Such ghosts
+  are now dropped: the node stays inset and its cell is clipped
+  (`boundary_centering` is `"inset"` in its row).
 
 ## [0.3.0] - 2026-10-15
 

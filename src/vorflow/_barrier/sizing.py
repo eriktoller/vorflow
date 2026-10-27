@@ -1,0 +1,371 @@
+"""Target spacing h along the barrier network (the length of the barrier faces).
+
+1. ``size_function``: vorflow's own size field evaluated in Python (no
+   probe Gmsh run): the background lc, every finer polygon (its lc inside,
+   growing by growth_factor - 1 per unit distance outside), finer standard
+   lines and points (lc + gradient x distance). Barriers are not part of it.
+2. Samples every lc / SAMPLES_PER_LC along each piece get
+   ``h0 = min(barrier lc, size field)``.
+3. Caps (the local feature size the empty-circle condition needs; no
+   prototype had them):
+   - other barrier parts: ``h <= BARRIER_CAP x e``, e the distance to a
+     network point that is far along the network (geodesic distance at
+     least GEODESIC_RATIO x e). With BARRIER_CAP = 0.49 sqrt 2 the circles of
+     two such parts (radius h / sqrt 2) cannot overlap. Pairs that both lie
+     within the protection radius of a common hard node (or of a ladder's
+     apex) are skipped: the node's own plan handles them;
+   - domain boundary: ``h <= BOUNDARY_CAP x e`` (pair sites, h/2 off the
+     line, stay inside), except within the protection radius of a node on
+     the boundary;
+   - feature nodes (wells, hex-ring seeds, embedded points): ``h <=
+     FEATURE_CAP x e`` (they stay outside every circle, sites keep 0.4 e
+     away).
+4. A piece shorter than h is a source of ``L^(1 - SHORT_BLEND) h^SHORT_BLEND``
+   (between its own length and h; upr's size_blend), so one short
+   digitised piece does not shrink everything around it.
+5. Lipschitz bound (GRADATION) over the network by a multi-source Dijkstra.
+   Prescribing nodes are not linked across their legs.
+6. Ladders are laid out from this spacing; along their legs h is held to
+   the last strip height plus GRADATION x distance, and the first segment
+   of every other leg of a prescribing node is set to 2 R_v cos(phi)
+   (ccvt's junction sizes), R_v being the smallest radius any leg allows
+   (or the ladder's sigma_0, or the value a single-segment piece forces).
+"""
+from __future__ import annotations
+
+import dataclasses
+import math
+
+import numpy as np
+import shapely
+from scipy.sparse import coo_matrix
+from scipy.sparse.csgraph import dijkstra
+from scipy.spatial import cKDTree
+
+from .network import Network
+from .rung import LADDER_LEG_FRACTION, ladder
+
+SAMPLES_PER_LC = 16
+GRADATION = 0.3
+BARRIER_CAP = 0.49 * math.sqrt(2.0)
+BOUNDARY_CAP = 1.6
+FEATURE_CAP = 0.85
+GEODESIC_RATIO = 2.0
+PROTECT_FRACTION = 1.5   # x h at the node: protection radius of a hard node
+CAP_REACH = 1.5          # x h: caps are only looked for this far
+SHORT_BLEND = 0.5
+JUNCTION_PASSES = 3
+DEFAULT_GROWTH = 1.2
+
+
+# ---------------------------------------------------------------------------
+# vorflow's size field
+# ---------------------------------------------------------------------------
+def size_function(sources: list, background_lc: float):
+    """``size(xy)``: vorflow's target mesh size at local points, evaluated in Python.
+
+    ``sources`` holds ``(geometry, is_area, ramp)`` per sizing feature, in
+    local coordinates; ``ramp(distance)`` is the size the feature's fields
+    ask for at that distance (see ``fields.MeshField.python_size``). An area
+    holds its size at distance 0 inside. The background lc caps everything.
+    """
+    for geom, _, _ in sources:
+        shapely.prepare(geom)
+
+    def size(xy: np.ndarray) -> np.ndarray:
+        pts = shapely.points(np.asarray(xy, dtype=float).reshape(-1, 2))
+        out = np.full(len(pts), float(background_lc))
+        for geom, is_area, ramp in sources:
+            d = shapely.distance(geom, pts)
+            if is_area:
+                d = np.where(shapely.covers(geom, pts), 0.0, d)
+            out = np.minimum(out, ramp(d))
+        return out
+
+    return size
+
+
+# ---------------------------------------------------------------------------
+# Samples
+# ---------------------------------------------------------------------------
+@dataclasses.dataclass
+class SizeField:
+    """Target spacing h at samples along every piece, plus the ladders laid out from it."""
+    piece: np.ndarray
+    s: np.ndarray
+    h: np.ndarray
+    xy: np.ndarray
+    hard_of: np.ndarray      # hard node of a sample at a piece end, else -1
+    decoupled: set
+    ladders: list = dataclasses.field(default_factory=list)  # (y, sigma) per network rung
+    radius: dict = dataclasses.field(default_factory=dict)   # node -> R forced by a ladder
+
+
+def piece_lengths(net: Network) -> np.ndarray:
+    """Length of every piece."""
+    return np.hypot(*(net.hard_xy[net.pieces[:, 1]] - net.hard_xy[net.pieces[:, 0]]).T)
+
+
+def samples(net: Network) -> SizeField:
+    """Evenly spaced samples along every piece (h not set)."""
+    lengths = piece_lengths(net)
+    piece, s, xy, hard_of = [], [], [], []
+    for p, (a, b) in enumerate(net.pieces):
+        m = max(2, int(math.ceil(lengths[p] / (net.piece_lc[p] / SAMPLES_PER_LC))) + 1)
+        sp = np.linspace(0.0, lengths[p], m)
+        piece.append(np.full(m, p))
+        s.append(sp)
+        xy.append(net.hard_xy[a] + np.outer(sp / lengths[p], net.hard_xy[b] - net.hard_xy[a]))
+        tag = np.full(m, -1)
+        tag[0], tag[-1] = a, b
+        hard_of.append(tag)
+    decoupled = {v for v, plan in enumerate(net.plans) if plan.prescribes}
+    return SizeField(np.concatenate(piece), np.concatenate(s), np.zeros(sum(map(len, s))), np.vstack(xy),
+                     np.concatenate(hard_of), decoupled)
+
+
+# ---------------------------------------------------------------------------
+# Caps
+# ---------------------------------------------------------------------------
+def protection_radii(net: Network, field: SizeField, h: np.ndarray) -> np.ndarray:
+    """Protection radius per hard node: PROTECT_FRACTION x the spacing there."""
+    rho = np.zeros(len(net.hard_xy))
+    ends = field.hard_of >= 0
+    np.maximum.at(rho, field.hard_of[ends], PROTECT_FRACTION * h[ends])
+    return rho
+
+
+def rung_extent(theta: float, spacing: float) -> float:
+    """Distance from the apex where a ladder of opening ``theta`` usually ends."""
+    return 0.85 * spacing / max(math.sin(theta / 2), 1e-3) + spacing
+
+
+def node_distances(net: Network, limit: float) -> np.ndarray:
+    """Shortest network distance between hard nodes (inf beyond ``limit``)."""
+    n = len(net.hard_xy)
+    lengths = piece_lengths(net)
+    graph = coo_matrix((lengths, (net.pieces[:, 0], net.pieces[:, 1])), shape=(n, n)).tocsr()
+    return dijkstra(graph, directed=False, limit=limit)
+
+
+def barrier_cap(net: Network, field: SizeField, h0: np.ndarray, rho: np.ndarray, extents: list) -> np.ndarray:
+    """Per sample: BARRIER_CAP x distance to the nearest network point that is far along the network."""
+    lengths = piece_lengths(net)
+    reach = CAP_REACH * float(h0.max())
+    graph = node_distances(net, GEODESIC_RATIO * reach + 2 * float(lengths.max()))
+    pairs = cKDTree(field.xy).query_pairs(reach, output_type="ndarray")
+    cap = np.full(len(h0), np.inf)
+    if len(pairs) == 0:
+        return cap
+    i, j = pairs[:, 0], pairs[:, 1]
+    pi, pj = field.piece[i], field.piece[j]
+    keep = pi != pj
+    i, j, pi, pj = i[keep], j[keep], pi[keep], pj[keep]
+    e = np.hypot(*(field.xy[i] - field.xy[j]).T)
+    keep = e < CAP_REACH * np.maximum(h0[i], h0[j])
+    i, j, pi, pj, e = i[keep], j[keep], pi[keep], pj[keep], e[keep]
+    geo = np.full(len(i), np.inf)
+    for ei in (0, 1):
+        ui = net.pieces[pi, ei]
+        di = field.s[i] if ei == 0 else lengths[pi] - field.s[i]
+        for ej in (0, 1):
+            uj = net.pieces[pj, ej]
+            dj = field.s[j] if ej == 0 else lengths[pj] - field.s[j]
+            geo = np.minimum(geo, di + graph[ui, uj] + dj)
+            shared = ui == uj  # both within the protection radius of a common node: the plan's business
+            near = shared & (np.hypot(*(field.xy[i] - net.hard_xy[ui]).T) < rho[ui]) & \
+                (np.hypot(*(field.xy[j] - net.hard_xy[ui]).T) < rho[ui])
+            geo[near] = 0.0
+    for rung, extent in zip(net.rungs, extents):
+        on_legs = np.isin(pi, rung.pieces) & np.isin(pj, rung.pieces)
+        near = on_legs & (np.hypot(*(field.xy[i] - rung.apex).T) < extent) & \
+            (np.hypot(*(field.xy[j] - rung.apex).T) < extent)
+        geo[near] = 0.0
+    far = (geo > GEODESIC_RATIO * e) & (e > 0)
+    np.minimum.at(cap, i[far], BARRIER_CAP * e[far])
+    np.minimum.at(cap, j[far], BARRIER_CAP * e[far])
+    return cap
+
+
+def boundary_cap(net: Network, field: SizeField, domain, rho: np.ndarray) -> np.ndarray:
+    """Per sample: BOUNDARY_CAP x distance to the domain boundary, away from the piece's boundary nodes."""
+    e = shapely.distance(domain.boundary, shapely.points(field.xy))
+    cap = BOUNDARY_CAP * e
+    for end in (0, 1):
+        node = net.pieces[field.piece, end]
+        on = np.array([net.plans[v].on_boundary for v in node])
+        near = on & (np.hypot(*(field.xy - net.hard_xy[node]).T) < rho[node])
+        cap[near] = np.inf
+    return cap
+
+
+def feature_cap(field: SizeField, features: np.ndarray) -> np.ndarray:
+    """Per sample: FEATURE_CAP x distance to the nearest feature node."""
+    if len(features) == 0:
+        return np.full(len(field.s), np.inf)
+    d, _ = cKDTree(features).query(field.xy)
+    return FEATURE_CAP * d
+
+
+# ---------------------------------------------------------------------------
+# Lipschitz and junction sizes
+# ---------------------------------------------------------------------------
+def _sample_graph(field: SizeField):
+    """Graph of the samples: neighbours along a piece, and samples on the same (non-prescribing) hard node."""
+    n = len(field.s)
+    same = field.piece[1:] == field.piece[:-1]
+    k = np.flatnonzero(same)
+    rows, cols, w = list(k), list(k + 1), list(np.abs(field.s[k + 1] - field.s[k]))
+    hard = np.flatnonzero(field.hard_of >= 0)
+    for node in np.unique(field.hard_of[hard]):
+        if node in field.decoupled:
+            continue
+        members = hard[field.hard_of[hard] == node]
+        rows += [members[0]] * (len(members) - 1)
+        cols += list(members[1:])
+        w += [1e-12] * (len(members) - 1)
+    return coo_matrix((w, (rows, cols)), shape=(n, n))
+
+
+def lipschitz(field: SizeField, h: np.ndarray, gradation: float = GRADATION) -> np.ndarray:
+    """min over samples y of h(y) + gradation x network distance (Dijkstra from a virtual source)."""
+    n = len(h)
+    graph = _sample_graph(field)
+    rows = np.concatenate([graph.row, np.full(n, n)])
+    cols = np.concatenate([graph.col, np.arange(n)])
+    w = np.concatenate([graph.data, h / gradation])
+    full = coo_matrix((w, (rows, cols)), shape=(n + 1, n + 1)).tocsr()
+    return np.minimum(h, gradation * dijkstra(full, directed=False, indices=n)[:n])
+
+
+def _leg_phi(net: Network, node: int, piece: int) -> float:
+    """phi of ``piece`` at hard ``node``."""
+    return next(leg.phi for leg in net.plans[node].legs if leg.kind == "piece" and leg.piece == piece)
+
+
+def integral(y: np.ndarray, x: np.ndarray) -> float:
+    """Trapezoidal integral of y over x (np.trapezoid needs NumPy 2)."""
+    return float(np.sum(0.5 * (y[1:] + y[:-1]) * np.diff(x)))
+
+
+def raw_count(field: SizeField, piece: int) -> int:
+    """Segments of ``piece`` from h alone: round of the integral of 1/h, at least 1."""
+    sel = field.piece == piece
+    return max(1, int(round(integral(1.0 / field.h[sel], field.s[sel]))))
+
+
+def _other(net: Network, piece: int, node: int) -> int:
+    """The far end of ``piece`` from ``node``."""
+    a, b = net.pieces[piece]
+    return b if a == node else a
+
+
+def junction_radius(net: Network, field: SizeField, v: int, lengths: np.ndarray) -> tuple:
+    """(R_v, {piece: forced}) at a prescribing node: the ladder's sigma_0, a forced value, or the smallest allowed."""
+    plan = net.plans[v]
+    rung_pieces = {p for r in net.rungs for p in r.pieces if v in r.nodes}
+    forced, limits = {}, []
+    for leg in plan.legs:
+        if leg.kind != "piece" or leg.piece in rung_pieces:
+            continue
+        p = leg.piece
+        other = _other(net, p, v)
+        if net.plans[other].prescribes and not net.plans[other].rung_end and raw_count(field, p) <= 1 \
+                and p not in {q for r in net.rungs for q in r.pieces}:
+            phi_o = _leg_phi(net, other, p)
+            forced[p] = lengths[p] * math.sin(phi_o) / math.sin(leg.phi + phi_o)
+        else:
+            h0 = field.h[(field.piece == p) & (field.hard_of == v)][0]
+            limits.append(h0 / (2 * math.cos(leg.phi)))
+    if v in field.radius:
+        return field.radius[v], forced
+    if forced:
+        return min(forced.values()), forced
+    return (min(limits) if limits else None), forced
+
+
+def junction_sizes(net: Network, field: SizeField) -> None:
+    """Lower h at the start of every leg of a prescribing node so its first segment is 2 R_v cos(phi)."""
+    lengths = piece_lengths(net)
+    for v, plan in enumerate(net.plans):
+        if not plan.prescribes or plan.rung_end:
+            continue
+        r_v, forced = junction_radius(net, field, v, lengths)
+        if r_v is None:
+            continue
+        rung_pieces = {p for r in net.rungs for p in r.pieces if v in r.nodes}
+        for leg in plan.legs:
+            if leg.kind != "piece" or leg.piece in forced or leg.piece in rung_pieces:
+                continue
+            p = leg.piece
+            d = 2 * r_v * math.cos(leg.phi)
+            sel = field.piece == p
+            along = field.s[sel] if net.pieces[p][0] == v else lengths[p] - field.s[sel]
+            idx = np.flatnonzero(sel)[along <= d]
+            field.h[idx] = np.minimum(field.h[idx], d)
+
+
+# ---------------------------------------------------------------------------
+# Ladders
+# ---------------------------------------------------------------------------
+def _leg_along(net: Network, field: SizeField, piece: int, node: int) -> np.ndarray:
+    """Distance of each sample of ``piece`` from ``node`` (one of its ends)."""
+    sel = field.piece == piece
+    return field.s[sel] if net.pieces[piece][0] == node else piece_lengths(net)[piece] - field.s[sel]
+
+
+def lay_ladders(net: Network, field: SizeField, gradation: float = GRADATION) -> None:
+    """Ladder positions of every rung from the current h; h along its legs follows the last strip."""
+    lengths = piece_lengths(net)
+    field.ladders, field.radius = [], {}
+    sigma0 = {}
+    for rung in net.rungs:
+        legs = [(p, n) for p, n in zip(rung.pieces, rung.nodes)]
+        along = [_leg_along(net, field, p, n) + rung.t0 for p, n in legs]
+        hs = [field.h[field.piece == p] for p, _ in legs]
+
+        def spacing(t, along=along, hs=hs):
+            return float(min(np.interp(t, a[np.argsort(a)], h[np.argsort(a)]) for a, h in zip(along, hs)))
+
+        t_limit = rung.t0 + LADDER_LEG_FRACTION * min(lengths[p] for p, _ in legs)
+        apex = rung.nodes[0] if rung.t0 == 0 else None
+        y, sigma = ladder(rung.theta, rung.t0, sigma0.get(apex), spacing, t_limit)
+        if apex is not None:
+            sigma0.setdefault(apex, float(sigma[0]))
+            field.radius[apex] = sigma0[apex]
+        field.ladders.append((y, sigma))
+        t_end = y[-1] / math.cos(rung.theta / 2)
+        last = float(np.diff(y)[-1]) if len(y) > 1 else float(y[-1])
+        for (p, n), a in zip(legs, along):
+            idx = np.flatnonzero(field.piece == p)
+            beyond = a >= t_end
+            field.h[idx[beyond]] = np.minimum(field.h[idx[beyond]], last + gradation * (a[beyond] - t_end))
+
+
+def build_field(net: Network, size_fn, domain, features: np.ndarray, refine: np.ndarray | None = None,
+                gradation: float = GRADATION) -> SizeField:
+    """The target spacing along the network (module docstring), with ``refine`` (per-sample upper bounds) applied."""
+    field = samples(net)
+    lc = net.piece_lc[field.piece]
+    h0 = np.minimum(lc, size_fn(field.xy))
+    rho = protection_radii(net, field, h0)
+    extents = [rung.t0 + rung_extent(rung.theta, float(h0[np.isin(field.hard_of, rung.nodes)].max()))
+               for rung in net.rungs]
+    for rung, extent in zip(net.rungs, extents):
+        for n in rung.nodes:
+            rho[n] = max(rho[n], extent)
+    h = np.minimum.reduce([h0, barrier_cap(net, field, h0, rho, extents), boundary_cap(net, field, domain, rho),
+                           feature_cap(field, features)])
+    lengths = piece_lengths(net)[field.piece]
+    short = lengths < h
+    h = np.where(short, lengths ** (1 - SHORT_BLEND) * h ** SHORT_BLEND, h)
+    if refine is not None:
+        h = np.minimum(h, refine)
+    field.h = lipschitz(field, h, gradation)
+    lay_ladders(net, field, gradation)
+    field.h = lipschitz(field, field.h, gradation)
+    for _ in range(JUNCTION_PASSES):
+        junction_sizes(net, field)
+        field.h = lipschitz(field, field.h, gradation)
+    lay_ladders(net, field, gradation)
+    return field

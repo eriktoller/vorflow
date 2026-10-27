@@ -4,6 +4,7 @@ import logging
 import math
 import operator
 
+import numpy as np
 import shapely
 
 logger = logging.getLogger(__name__)
@@ -84,6 +85,16 @@ class MeshField:
             feature_lc (float, optional): The target resolution of the specific feature group.
         """
         raise NotImplementedError("Subclasses must implement create()")
+
+    def python_size(self, distance, background_lc, feature_lc=None):
+        """The size this field asks for at ``distance`` from its feature, evaluated in NumPy, or None.
+
+        Barrier planning uses it to read the mesh size along a barrier
+        before Gmsh runs. The default None means "not known": the field is
+        then left out of that estimate (Gmsh still applies it), so a custom
+        field that should shape barrier faces can override this.
+        """
+        return None
 
     def __eq__(self, other):
         """Equality check for grouping."""
@@ -362,6 +373,13 @@ class ThresholdField(MeshField):
             gmsh_api, f_thresh, tags_dict, self.size_min, background_lc
         )
 
+    def python_size(self, distance, background_lc, feature_lc=None):
+        """Size at ``distance``: size_min up to dist_min, linear to size_max at dist_max."""
+        size_max = self.size_max if self.size_max else float(background_lc)
+        span = max(self.dist_max - self.dist_min, 1e-300)
+        t = np.clip((np.asarray(distance, dtype=float) - self.dist_min) / span, 0.0, 1.0)
+        return self.size_min + t * (size_max - self.size_min)
+
 class ExponentialField(MeshField):
     """Exponential transition controlled by a physical decay length.
 
@@ -401,6 +419,11 @@ class ExponentialField(MeshField):
         return _combine_with_polygon_interior(
             gmsh_api, f_math, tags_dict, self.size_min, background_lc
         )
+
+    def python_size(self, distance, background_lc, feature_lc=None):
+        """Size at ``distance``: s_max - (s_max - size_min) exp(-distance / decay_length)."""
+        s_max = self.size_max if self.size_max is not None else float(background_lc)
+        return s_max - (s_max - self.size_min) * np.exp(-np.asarray(distance, dtype=float) / self.decay_length)
 
 # --- Growth fields ---
 
@@ -524,3 +547,7 @@ class _BorderGradingField(MeshField):
         f_min = field.add("Min")
         field.setNumbers(f_min, "FieldsList", [float(f_inside), float(f_outside)])
         return f_min
+
+    def python_size(self, distance, background_lc, feature_lc=None):
+        """Size at ``distance`` outside the polygon (the border size inside, a conservative estimate)."""
+        return self.border_size + (DEFAULT_GROWTH_FACTOR - 1.0) * np.asarray(distance, dtype=float)

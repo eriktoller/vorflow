@@ -9,7 +9,7 @@ Methodology
 not its centroid. Lloyd's algorithm moves each generator to the centroid of
 its cell and repeats; the fixed point is a centroidal Voronoi tessellation
 (CVT). Only free nodes move (interior surface nodes); boundary nodes, nodes
-of embedded points and lines, and barrier straddle pairs stay where they are.
+of embedded points and lines, and barrier sites stay where they are.
 
 *Density.* Plain (unweighted) centroids equalise cell sizes and so destroy
 the mesh grading. In a 2D CVT with density rho the local generator spacing
@@ -42,6 +42,13 @@ the node's owner polygon (its original zone) and the segment from the old to
 the new point does not cross a constraint line (embedded or barrier lines).
 A rejected node stays where it is for that iteration.
 
+*Barrier circles.* Exact barrier faces (``vorflow._barrier``) need every
+generator other than the barrier sites to stay outside a set of circles
+(the empty-circle condition). With ``circles`` given, an accepted move that
+lands inside a circle is pushed radially out to CIRCLE_PUSH_MARGIN beyond
+it; a move that cannot be pushed clear, or that the push takes out of the
+owner polygon, is rejected.
+
 *Convergence.* Each step is damped (x + damping * (c - x)), but the stopping
 test uses the undamped residual |c - x| / h(x) of the accepted nodes, so a
 given tolerance means the same distance from the centroids for any damping.
@@ -52,6 +59,9 @@ import numpy as np
 import shapely
 from scipy.interpolate import LinearNDInterpolator
 from scipy.spatial import Delaunay, Voronoi, cKDTree
+from shapely.validation import make_valid
+
+from ._features import polygon_parts
 
 # Far ghost generators sit this many bbox extents outside the nodes, as in
 # VoronoiTessellator.generate(), so every real node has a finite region.
@@ -68,6 +78,11 @@ FAN_QUADRATURE_POINTS = np.array([
     [1.0 / 6.0, 1.0 / 6.0, 2.0 / 3.0],
 ])
 FAN_QUADRATURE_WEIGHTS = np.array([1.0, 1.0, 1.0]) / 3.0
+# A generator pushed out of a barrier circle lands this fraction of the
+# radius beyond it, so roundoff cannot put it back inside.
+CIRCLE_PUSH_MARGIN = 0.05
+CIRCLE_PUSH_PASSES = 6
+CIRCLE_INSIDE_EPS = 1e-9
 
 
 def size_interpolator(nodes, sizes):
@@ -299,6 +314,70 @@ def accept_moves(old, new, owner_polys, constraint_lines):
     return ok
 
 
+def inside_circles(points, centres, radii, margin=0.0):
+    """Mask of ``points`` closer than R (1 + margin) (1 - CIRCLE_INSIDE_EPS) to some circle centre."""
+    points = np.asarray(points, dtype=float).reshape(-1, 2)
+    inside = np.zeros(len(points), dtype=bool)
+    if len(points) == 0 or len(centres) == 0:
+        return inside
+    limit = np.asarray(radii, dtype=float) * (1 + margin) * (1 - CIRCLE_INSIDE_EPS)
+    for idx in cKDTree(points).query_ball_point(np.asarray(centres, dtype=float), limit):
+        inside[idx] = True
+    return inside
+
+
+def push_out_of_circles(points, centres, radii, margin=CIRCLE_PUSH_MARGIN, passes=CIRCLE_PUSH_PASSES):
+    """``points`` pushed radially out of the deepest circle each is in, to R (1 + margin); a copy."""
+    pts = np.asarray(points, dtype=float).reshape(-1, 2).copy()
+    centres = np.asarray(centres, dtype=float).reshape(-1, 2)
+    limit = np.asarray(radii, dtype=float) * (1 + margin)
+    if len(pts) == 0 or len(centres) == 0:
+        return pts
+    for _ in range(passes):
+        hits = cKDTree(pts).query_ball_point(centres, limit)
+        pairs = [(c, k) for c, idx in enumerate(hits) for k in idx]
+        if not pairs:
+            break
+        circ, pnt = np.array(pairs).T
+        vec = pts[pnt] - centres[circ]
+        dist = np.hypot(*vec.T)
+        # Per point, the circle it is deepest in (relative to the radius).
+        order = np.lexsort((-(limit[circ] - dist) / limit[circ], pnt))
+        first = order[np.r_[True, pnt[order][1:] != pnt[order][:-1]]]
+        c, k, v = circ[first], pnt[first], vec[first]
+        length = np.hypot(*v.T)
+        unit = np.where(length[:, None] > 0, v / np.where(length > 0, length, 1.0)[:, None], [1.0, 0.0])
+        pts[k] = centres[c] + unit * limit[c][:, None] * (1 + 1e-9)
+    return pts
+
+
+def keep_out_of_circles(old, new, ok, owner_polys, circles):
+    """(new, ok) with accepted moves pushed out of ``circles``; moves that stay inside or leave their owner rejected.
+
+    ``circles`` is ``(centres (k, 2), radii (k,))`` or None (no change).
+    """
+    if circles is None or len(circles[0]) == 0:
+        return new, ok
+    centres, radii = circles
+    new = new.copy()
+    ok = ok.copy()
+    moved = np.flatnonzero(ok & np.any(old != new, axis=1))
+    if len(moved) == 0:
+        return new, ok
+    pushed = push_out_of_circles(new[moved], centres, radii)
+    owners = _object_array(owner_polys)[moved]
+    has_owner = np.array([g is not None for g in owners], dtype=bool)
+    stays = np.ones(len(moved), dtype=bool)
+    if has_owner.any():
+        stays[has_owner] = shapely.contains_xy(owners[has_owner], pushed[has_owner, 0], pushed[has_owner, 1])
+    clear = ~inside_circles(pushed, centres, radii)
+    good = stays & clear
+    new[moved[good]] = pushed[good]
+    new[moved[~good]] = old[moved[~good]]
+    ok[moved[~good]] = False
+    return new, ok
+
+
 def _is_real_number(value) -> bool:
     """True for an int, float or NumPy number that is not a bool and not NaN."""
     if isinstance(value, (bool, np.bool_)) or not isinstance(value, (int, float, np.integer, np.floating)):
@@ -348,7 +427,7 @@ def _validate_relax_args(nodes, free, owner_polys, iterations, damping, toleranc
 
 
 def relax(nodes, free, size_fn, domain, owner_polys, constraint_lines,
-          iterations, damping=1.0, tolerance=1e-3):
+          iterations, damping=1.0, tolerance=1e-3, circles=None):
     """Damped, density-weighted Lloyd relaxation of the free nodes; fixed nodes are returned bit-identical.
 
     Each iteration moves every free node ``x`` towards its weighted centroid
@@ -363,6 +442,9 @@ def relax(nodes, free, size_fn, domain, owner_polys, constraint_lines,
     stops after the iteration in which the largest such residual drops below
     ``tolerance`` (if every move is rejected the residual is 0 and it stops,
     since the next iteration would be identical).
+
+    ``circles`` (``(centres, radii)`` or None): barrier circles every free
+    node must stay out of (see ``keep_out_of_circles``).
 
     Returns (new_nodes, report) with report keys ``iterations`` (run),
     ``max_rel_shift`` (largest residual |c - x| / h(x) over the accepted
@@ -385,6 +467,7 @@ def relax(nodes, free, size_fn, domain, owner_polys, constraint_lines,
         centroids = weighted_centroids(current, free_idx, size_fn, domain)
         proposal = before + damping * (centroids - before)
         ok = accept_moves(before, proposal, owners, constraint_lines)
+        proposal, ok = keep_out_of_circles(before, proposal, ok, owners, circles)
         current[free_idx[ok]] = proposal[ok]
         residual = np.where(ok, np.hypot(*(centroids - before).T), 0.0)
         max_rel_shift = float(np.max(residual / size_fn(before)))
@@ -486,7 +569,7 @@ def _quad_displacements(nodes, free, quads, face, connector, target_fraction):
 
 
 def remove_short_faces(nodes, free, owner_polys, constraint_lines, min_face_fraction,
-                       passes=20, overshoot=1.5, max_step_fraction=0.25):
+                       passes=20, overshoot=1.5, max_step_fraction=0.25, circles=None):
     """Nudge free generators apart until no Voronoi face is shorter than ``min_face_fraction`` x its connector.
 
     Short faces come from near-cocircular quads of generators (four nodes on
@@ -495,7 +578,8 @@ def remove_short_faces(nodes, free, owner_polys, constraint_lines, min_face_frac
     the free nodes of each quad by ``_quad_displacements`` towards a face of
     ``overshoot * min_face_fraction`` x connector, caps each node's move at
     ``max_step_fraction`` x its shortest connector in a short quad, and keeps
-    only moves ``accept_moves`` allows. Fixed nodes are returned bit-identical.
+    only moves ``accept_moves`` allows (and, with ``circles``, that stay out
+    of the barrier circles). Fixed nodes are returned bit-identical.
 
     Returns (new_nodes, report) with ``initial`` and ``final`` short-face
     counts, ``passes`` run and ``rejected`` moves.
@@ -525,6 +609,8 @@ def remove_short_faces(nodes, free, owner_polys, constraint_lines, min_face_frac
         moved = np.flatnonzero(length > 0)
         proposal = current[moved] + shift[moved] * scale[moved, None]
         ok = accept_moves(current[moved], proposal, owners[moved], constraint_lines)
+        if circles is not None and len(circles[0]):
+            ok &= ~inside_circles(proposal, *circles)
         current[moved[ok]] = proposal[ok]
         quads, face, connector = short_faces(current, min_face_fraction)
         report = {"initial": report["initial"], "final": len(quads), "passes": step + 1,
@@ -532,3 +618,40 @@ def remove_short_faces(nodes, free, owner_polys, constraint_lines, min_face_frac
         if len(quads) == 0:
             break
     return current, report
+
+
+def zone_pieces(polygons, footprints):
+    """Polygon parts of ``polygons`` (zones) with the quad-buffer ``footprints`` (or None) cut out."""
+    pieces = []
+    for geom in polygons:
+        if geom is None or geom.is_empty:
+            continue
+        if footprints is not None and geom.intersects(footprints):
+            geom = make_valid(geom.difference(footprints))
+        pieces.extend(polygon_parts(geom))
+    return [piece for piece in pieces if piece.area > 0]
+
+
+def owner_polygons(nodes, free, pieces):
+    """Owner polygon of each free node (the zone piece containing it) and the free mask of nodes that have one.
+
+    Returns (owners (len(nodes),) object array, None for fixed nodes; free).
+    A free node in no piece (or on a piece boundary) is made fixed.
+    """
+    owners = np.full(len(nodes), None, dtype=object)
+    free = np.asarray(free, dtype=bool).copy()
+    free_idx = np.flatnonzero(free)
+    if len(free_idx) == 0 or not pieces:
+        free[:] = False
+        return owners, free
+    piece_array = np.empty(len(pieces), dtype=object)
+    piece_array[:] = pieces
+    point_pos, piece_pos = shapely.STRtree(piece_array).query(
+        shapely.points(nodes[free_idx]), predicate='within'
+    )
+    # Clean polygons do not overlap; keep the first piece should two touch.
+    point_pos, first = np.unique(point_pos, return_index=True)
+    owners[free_idx[point_pos]] = piece_array[piece_pos[first]]
+    free[free_idx] = False
+    free[free_idx[point_pos]] = True
+    return owners, free

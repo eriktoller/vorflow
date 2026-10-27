@@ -62,6 +62,29 @@ last 0.45 x `resolution` of each leg, or 0.3 of the leg if that is shorter. The
 tip then lies inside regular cells instead of between long thin ones, and it
 is reported.
 
+**Merges** (`parallel.py`, `wedge.py`). Two inputs leave slivers that no
+choice of face lengths can fill with regular cells, so the lines are moved a
+bounded distance instead, and each move is reported:
+
+- Two barriers closer than 0.25 x `resolution` over a stretch of at least
+  one `resolution` are moved onto their midline there. One line of faces
+  carries both barriers, and `barrier_lines` lists it under both `line_id`s,
+  so the user gives the HFB there the combined properties of both. Where the
+  lines part, each leaves the midline at 0.75 x `sharp_angle`. A line moves
+  at most half the local gap (`barrier_report["merged"]`).
+- Two barrier legs that meet at a junction (a splay, a T-branch, a crossing)
+  at less than `sharp_angle` share a stem along their bisector, as long as it
+  keeps every point within 0.1 x `resolution` of the lines as drawn, and
+  part at 1.5 x `sharp_angle` at its end. A barrier leaving the domain
+  boundary or a hole edge that narrowly slides along the boundary instead,
+  so it still ends on it. Fans and stars are merged pair by pair, narrowest
+  first; two adjacent sectors below 29 degrees are merged too, because the
+  sector plan cannot place sites in both. Two legs that run to the same next
+  vertex become its chord (`barrier_report["collapsed"]`).
+
+A stretch or a junction where the move would exceed its bound, or would
+reach another line, is left as it is.
+
 **Face lengths** (`sizing.py`). The face length along the barrier follows
 vorflow's size field, read before Gmsh runs through `MeshField.python_size()`.
 It is capped by the distance to other barrier parts, to the domain boundary,
@@ -74,15 +97,24 @@ by default), across junctions. A point feature on or next to a barrier
 point and the barrier, since a cell centre cannot sit on a barrier face.
 
 **Narrow gaps** (`corridor.py`). Two nearly parallel barriers closer than
-1.2 x the face length share one row of cells, with sites on the midline. A
-barrier closer than 0.6 x the face length to the domain boundary gets one row
-of cells too, with sites on the boundary. Without this, the face lengths would
-be capped by the gap and the cells there would be small and thin.
+1.2 x the face length, but not close enough to be merged, share one row of
+cells, with sites on the midline. A barrier closer than 0.6 x the face length
+to the domain boundary gets one row of cells too, with sites on the boundary.
+Without this, the face lengths would be capped by the gap and the cells there
+would be small and thin. The row's cells are at most 1.5 x the gap long, so a
+narrow gap still adds cells: at 0.25 x `resolution` a 220 m pair of barriers
+at `resolution` 8 has about twice the cells of one barrier. A row of cells
+shorter than 0.5 x `resolution` raises a warning with its cell count.
 
 **Repair and error** (`pipeline.py`). Where the check fails, the faces are
-halved locally. If the construction is still invalid after a few rounds, the
-plan raises `BarrierMeshError`, a `ValueError` naming the place and suggesting
-`simplify_tolerance` or a finer `resolution`.
+halved locally. If the construction is still invalid after a few rounds, or
+the faces would have to be shorter than 0.02 x `resolution`, the plan raises
+`BarrierMeshError`, a `ValueError` naming the place, what made the faces that
+short there (the size caps record which one bound each face length: another
+barrier part, the boundary, a point, a fixed line, closely spaced vertices,
+a corridor, or a junction or fold) and what helps for that cause. A
+geometric failure inside the construction is raised as `BarrierMeshError`
+too, as a bug to report.
 
 **Meshing** (`frames.py`, `polish.py`, `engine.py`). Gmsh meshes a copy of the
 clean frames in which each barrier is a size field only, and the sites are
@@ -92,14 +124,18 @@ quad-buffer strip away from where it crosses a barrier is reported in
 `barrier_report["fixed_nodes"]`, with a warning. The free nodes are then moved
 by Lloyd steps around the fixed sites, kept out of the circles
 (`barrier_polish_iterations`, 20 by default); a step pushed out of a circle is
-checked again against the embedded lines. The sites join
-`MeshGenerator.nodes`.
+checked again against the embedded lines. Only the free nodes within 3 x their
+size of a circle move; every other node keeps its Gmsh position bit for bit.
+On a 118k-node model this cut the polish from 60 s to 10 s and moved 18k
+instead of 110k nodes, with the same barrier-cell compactness. The sites join
+`MeshGenerator.nodes`. `get_element_grid()` and `get_triangular_quality()`
+describe Gmsh's mesh before this step.
 
 **Tessellation.** The tessellator's barrier mirror generators and cell cutting
 stay as a safety net. They found nothing to do on any of the 73 cases. If they
-are ever needed on an exact barrier, `generate()` warns. With
-`vorflow.tessellator.STRICT_BARRIERS = True`, as in the test suite, it raises
-instead. Quad buffers on barriers still go through this path.
+are ever needed on an exact barrier, `generate()` warns. The test suite sets
+a private hook so that it raises instead. Quad buffers on barriers still go
+through this path.
 
 ## Line cleaning
 
@@ -110,12 +146,15 @@ like small ones:
 1. An end within `max(connectivity_tolerance, simplify_tolerance)` of another
    barrier, a barrier vertex or the domain boundary is snapped onto it. A
    short overshoot past another barrier is trimmed back. A branch that
-   collapses onto the barrier it starts on is dropped as a stub.
+   collapses onto the barrier it starts on is dropped as a stub. An end is
+   not snapped onto a barrier it runs alongside, so a close parallel barrier
+   is not folded onto its neighbour.
 2. A part lying on the domain boundary (within the same distance) is dropped
-   with a warning: a barrier there separates nothing. A barrier lying wholly
-   on the boundary leaves no row in `clean_lines`.
+   with a warning: a barrier there separates nothing. The end left behind is
+   moved onto the boundary, so a barrier that ended on it still does. A
+   barrier lying wholly on the boundary leaves no row in `clean_lines`.
 3. Junctions and crossings with other barriers and with standard lines become
-   shared vertices.
+   shared vertices, and so do points where a line crosses or touches itself.
 4. With `simplify_tolerance` above 0, the line is replaced by the fewest
    straight pieces between its own vertices that stay within the tolerance.
    Junctions, crossings and ends are kept. The old per-line Douglas-Peucker
@@ -125,7 +164,10 @@ like small ones:
    digitising noise, with a warning, even when `simplify_tolerance` is 0.
 
 Barrier lines are no longer densified. Each change is recorded and passed on
-to `MeshGenerator.barrier_report`.
+to `MeshGenerator.barrier_report`. Steps 4 and 5 take time linear in the
+vertex count: a 3000-vertex trace took 16-79 s to simplify and 35 s to clean
+of noise, and now takes 0.3 s and 0.05 s; a 20 000-vertex trace takes 2.2 s
+and 0.35 s.
 
 ## Public API
 
@@ -135,11 +177,12 @@ to `MeshGenerator.barrier_report`.
 - `ConceptualMesh(keep_close_rings=False)`: keep a `hex_ring` next to a
   barrier by making the barrier faces there shorter.
 - After `generate()`: `MeshGenerator.barrier_report` (`snaps`, `noise`,
-  `stubs`, `tips`, `on_boundary`, `rings`, `fixed_nodes`, `corridors`, each
-  entry with its place, plus `repair_rounds`, `sites`, `removed_nodes` and
-  `polish`), `barrier_lines`, `barrier_circles` and `node_is_site`. Spike
-  tips, stubs, snapped ends and removed fixed-line nodes each raise one
-  `UserWarning` with their count.
+  `stubs`, `tips`, `on_boundary`, `rings`, `fixed_nodes`, `corridors`,
+  `merged`, `collapsed`, each entry with its place, plus `repair_rounds`,
+  `sites`, `removed_nodes` and `polish`), `barrier_lines`, `barrier_circles`
+  and `node_is_site`. Spike tips, stubs, snapped ends, removed fixed-line
+  nodes, merged stretches, merged junctions and dense corridors each raise
+  one `UserWarning` with their count.
 - `vorflow.BarrierMeshError(ValueError)`.
 - `add_line(straddle_width=...)` is deprecated with a `FutureWarning`, and
   its value is ignored. The internal `vorflow._straddle` module was removed.
@@ -171,17 +214,23 @@ barrier.
   generators and the cut, so they can leave cut cells and faces of several
   edges. Two strict `xfail` tests in `tests/test_engine_regressions.py` record
   this.
-- **Narrow splays next to a digitised vertex.** A splay leaving a fault at
-  about 10 degrees, with a fault vertex about 0.2 x `resolution` past the
-  junction, raises `BarrierMeshError` at `simplify_tolerance=0`, because the
-  faces would be about 0.01 x `resolution` long. A tolerance of
-  `resolution / 8` removes the vertex. The same cause leaves clusters of small
-  cells at splay junctions on digitised networks that do mesh. A row of cells
-  that follows a slightly bent leg would fix both.
+- **Merges move the lines.** A merged stretch moves each barrier by up to
+  half the gap (at most 0.125 x `resolution`), a merged junction by up to
+  0.1 x `resolution`, and the faces there carry both barriers. Both are
+  reported, but a model where two close barriers must stay separate needs a
+  finer `resolution` there (the merge gap scales with it).
+- **Inputs that still raise.** Two barriers that end together at a few
+  degrees (a narrow V of two lines, which the spike rule leaves alone), a
+  line folding back on itself over a fraction of `resolution`, 16 legs at
+  one point at a fine `resolution`, and dense digitising noise at
+  `simplify_tolerance=0` still raise `BarrierMeshError`. The message names
+  the fold and gives `simplify_tolerance` of about `resolution / 8` for
+  noise and `quad_buffer=True` otherwise, which meshes such a barrier with a
+  structured strip (not exact faces).
 - **Near-miss ends at tolerance 0.** An end that stops just short of another
   barrier, but further away than the snap distance, meshes exactly but with a
-  cluster of small faces. The error message, and
-  the docs, point to `simplify_tolerance`.
+  cluster of small faces, or raises; the error then gives the
+  `simplify_tolerance` that snaps it.
 - The safety-net code in `tessellator.py` (`_straddled_pieces`,
   `_merge_barrier_fragments`) stays for quad buffers and is to be retired
   once those use exact faces too.
@@ -204,6 +253,16 @@ barrier.
   warnings that point at the caller. A `slow` regression set holds the
   held-out and adversarial shapes and a digitised relay-ramp fault network.
   `tests/test_barrier_units.py` checks the helpers without Gmsh.
-- When this note was written the full suite gave 664 passed and 2 xfailed.
+- `tests/test_barrier_faces.py` also meshes splays, crossings, T-branches and
+  fans at 3, 5, 8 and 12 degrees, boundary and hole-edge exits at 5 and 10
+  degrees and a self-crossing line, checking exactness, sealing and that no
+  line moved more than 0.1 x `resolution`; and close parallel pairs at 0.5,
+  1, 2 and 4 m at `resolution` 8, merged below 2 m. `tests/test_barrier_internals.py`
+  checks the planning steps (validity gate, network, ladders, sites,
+  corridors, repair loop, errors, merges, sizing, cleaning) without Gmsh.
+- On the 73 benchmark cases the merges change nothing: the barrier sites are
+  bit-identical with and without them.
+- When this note was written the full suite gave 664 passed and 2 xfailed;
+  after the review fixes it gives 769 passed and 2 xfailed.
 - `examples/barrier_meshing.ipynb` shows the cases that used to be cut, the
   report and the remaining limits.

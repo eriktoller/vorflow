@@ -207,24 +207,42 @@ Before meshing, `ConceptualMesh.generate()` cleans the barrier lines:
 - an end within `max(connectivity_tolerance, simplify_tolerance)` of another
   barrier or of the domain boundary is snapped onto it, and a short
   overshoot is trimmed back. A branch no longer than that distance, which
-  snaps onto the barrier it starts on, is dropped as a stub;
+  snaps onto the barrier it starts on, is dropped as a stub. An end is not
+  snapped onto a barrier it runs alongside;
 - a part of a barrier that lies on the domain boundary (within the same
   distance) is dropped with a warning, because a barrier there separates
-  nothing;
-- junctions and crossings become vertices shared by both lines;
+  nothing. The end left behind is moved onto the boundary, so a barrier that
+  ended on the boundary still does;
+- junctions and crossings become vertices shared by both lines, and so does
+  a point where a line crosses or touches itself;
 - with `simplify_tolerance` above 0, the line is simplified after the
   junctions are joined, so a splay stays on the fault it starts on;
 - a vertex closer than 0.1 x `resolution` to its neighbour is dropped as
   digitising noise, with a warning, even when `simplify_tolerance` is 0.
 
 `MeshGenerator.barrier_report` lists each of these changes with its place.
-It also lists what the construction gave up, such as the tip of a spike
-sharper than `sharp_angle` (18 degrees by default), which is left inside a
-few cells without faces. Spike tips, dropped stubs and snapped ends each
-raise one `UserWarning` with their count. Two nearly parallel barriers
-closer than about 1.2 x `resolution` share one row of cells, and so do a
-barrier and the domain boundary when they are closer than about
-0.6 x `resolution`. Check the report before you build HFB input.
+It also lists what the construction changed or gave up while placing the
+faces. Each kind raises one `UserWarning` with its count:
+
+- the tip of a spike sharper than `sharp_angle` (18 degrees by default) is
+  left inside a few cells without faces (`tips`);
+- barrier legs that meet at a junction, or leave the domain boundary or a
+  hole, at less than `sharp_angle` share a short stem instead of bounding a
+  sliver, and so do fans of legs closer than 29 degrees (`collapsed`). No
+  point of a line moves more than 0.1 x `resolution`;
+- two barriers closer than 0.25 x `resolution` over a stretch are moved onto
+  their midline there (`merged`), which moves each by at most half the gap.
+  One line of faces then carries both barriers, and `barrier_lines` lists
+  it under both `line_id`s. Give the HFB on those faces the combined
+  properties of both barriers;
+- two nearly parallel barriers further apart, up to about
+  1.2 x `resolution`, share one row of cells between them, and so does a
+  barrier within about 0.6 x `resolution` of the domain boundary
+  (`corridors`). The cells of the row are at most 1.5 x the gap long, so a
+  narrow gap adds cells; a row of cells shorter than 0.5 x `resolution`
+  raises a warning with the cell count.
+
+Check the report before you build HFB input.
 
 Standard lines, zone edges and quad-buffer strips next to a barrier keep
 their nodes: the barrier faces are made shorter there, so the circles do not
@@ -239,22 +257,31 @@ mesher.generate()
 print(mesher.barrier_report["snaps"], mesher.barrier_report["tips"])
 ```
 
-When the faces would have to be far shorter than `resolution`, for example
-where two barrier parts nearly touch, `generate()` raises
-`vorflow.BarrierMeshError` with the place. Set `simplify_tolerance` on the
-barrier, or use a finer `resolution`. A point feature, such as a well, on a
-barrier also raises it, naming the point and the barrier: a cell centre
-cannot sit on a barrier face, so move the point off the line. On the digitised fault networks we
-tested, `simplify_tolerance` of `resolution / 8` was enough. For example, a
-splay that leaves a fault at about 10 degrees raises at
-`simplify_tolerance=0` when the fault has a digitised vertex just past the
-junction.
+When the faces would have to be far shorter than `resolution`, `generate()`
+raises `vorflow.BarrierMeshError`. The message gives the place, what makes
+the faces that short there and what helps for that cause. For example: an
+end that nearly meets another barrier is snapped onto it by a
+`simplify_tolerance` of at least the gap; a barrier running close to the
+boundary is dropped there by the same tolerance; next to the boundary, a
+point or a fixed line, the message gives the barrier `resolution` at which
+the faces would fit. Where barrier legs meet or fold back at angles too
+narrow for cells between them (a narrow spike or zigzag, or many legs at one
+point), `simplify_tolerance` of about `resolution / 8` removes digitising
+noise, and otherwise `quad_buffer=True` on the barrier meshes it with a
+structured strip of cells instead, whose faces are not exact.
+
+**Breaking:** a point feature, such as a well, on a barrier or at its end
+(closer than about 0.05 x `resolution`) now raises `BarrierMeshError`,
+naming the point and the barrier. In 0.3.0 it meshed, with mirrored
+generators and cut cells around the point. A cell centre cannot sit on a
+barrier face, so move the point off the line, or, where it marks the
+barrier's end, end the barrier that far short of it.
 
 Quad buffers on barriers (`quad_buffer=True`) do not use the exact faces
 yet. They still rely on mirrored generators and on cutting cells, so they
 can leave cut cells and bent faces. `straddle_width` is deprecated, with a
-`FutureWarning`, and its value is ignored. A non-barrier line that sets it
-still gets exact faces along it.
+`FutureWarning`, and its value is ignored, so remove it from barriers. A
+non-barrier line that sets it still gets exact faces along it.
 
 [examples/barrier_meshing.ipynb](https://github.com/rhugman/vorflow/blob/main/examples/barrier_meshing.ipynb)
 shows each case, the report and these limits.

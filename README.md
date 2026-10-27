@@ -31,7 +31,7 @@ The library is built around three main classes that work in sequence:
 
 2.  **`MeshGenerator`**: This is the engine that generates a triangular mesh based on the blueprint from `ConceptualMesh`. It uses `Gmsh` as its backend to create a quality-conforming Delaunay triangulation.
 
-3.  **`VoronoiTessellator`**: This class takes the triangular mesh from `MeshGenerator` and computes its dual: the Voronoi diagram. The result is a grid of polygonal cells. It includes logic to clip the grid to the domain boundary and enforce barrier features by cutting through cells.
+3.  **`VoronoiTessellator`**: This class takes the triangular mesh from `MeshGenerator` and computes its dual: the Voronoi diagram. The result is a grid of polygonal cells. It clips the grid to the domain boundary. Barrier lines are already made of whole cell faces at this stage, because `MeshGenerator` placed the cell generators on either side of them.
 
 ## Workflow
 
@@ -188,6 +188,63 @@ plt.show()
        width="60%">
 </p>
 
+### Barriers
+
+A line added with `is_barrier=True`, such as a fault, becomes a line of cell
+faces, so that a horizontal flow barrier (HFB) can be placed on them. vorflow
+places a pair of cell generators across each barrier segment, on circles
+drawn around the segment ends. When no other generator lies inside any
+circle, each segment is exactly the face between its pair. This is the
+empty-circle rule of the UPR method
+([Berge et al., 2019](https://doi.org/10.1007/s10596-018-9790-0)).
+`MeshGenerator.generate()` places these generators and checks the rule
+before Gmsh runs. As a result, each barrier segment is one straight face with
+an orthogonality error of 0. No cell has to be cut, also at corners,
+junctions, crossings and on finely drawn curves.
+
+Before meshing, `ConceptualMesh.generate()` cleans the barrier lines:
+
+- an end within `max(connectivity_tolerance, simplify_tolerance)` of another
+  barrier or of the domain boundary is snapped onto it, and a short
+  overshoot is trimmed back;
+- junctions and crossings become vertices shared by both lines;
+- with `simplify_tolerance` above 0, the line is simplified after the
+  junctions are joined, so a splay stays on the fault it starts on;
+- a vertex closer than 0.1 x `resolution` to its neighbour is dropped as
+  digitising noise, with a warning, even when `simplify_tolerance` is 0.
+
+`MeshGenerator.barrier_report` lists each of these changes with its place.
+It also lists what the construction gave up, such as the tip of a spike
+sharper than `sharp_angle` (18 degrees by default), which is left inside a
+few cells without faces. Two nearly parallel barriers closer than about
+1.2 x `resolution` share one row of cells, and so do a barrier and the
+domain boundary when they are closer than about 0.6 x `resolution`. Check
+the report before you build HFB input.
+
+```python
+mesher = MeshGenerator(background_lc=100, conceptual_mesh=blueprint,
+                       sharp_angle=18, barrier_gradation=0.3)
+mesher.generate()
+print(mesher.barrier_report["snaps"], mesher.barrier_report["tips"])
+```
+
+When the faces would have to be far shorter than `resolution`, for example
+where two barrier parts nearly touch, `generate()` raises
+`vorflow.BarrierMeshError` with the place. Set `simplify_tolerance` on the
+barrier, or use a finer `resolution`. On the digitised fault networks we
+tested, `simplify_tolerance` of `resolution / 8` was enough. For example, a
+splay that leaves a fault at about 10 degrees raises at
+`simplify_tolerance=0` when the fault has a digitised vertex just past the
+junction.
+
+Quad buffers on barriers (`quad_buffer=True`) do not use the exact faces
+yet. They still rely on mirrored generators and on cutting cells, so they
+can leave cut cells and bent faces. `straddle_width` is deprecated and
+ignored on barriers.
+
+[examples/barrier_meshing.ipynb](https://github.com/rhugman/vorflow/blob/main/examples/barrier_meshing.ipynb)
+shows each case, the report and these limits.
+
 ### MODFLOW 6 export
 
 `to_disv()` returns the grid as MODFLOW 6 DISV arrays (`ncpl`, `nvert`,
@@ -313,6 +370,9 @@ buffers, active-domain workflows, and triangular element-grid export.
 [examples/point_centring_demo.ipynb](https://github.com/rhugman/vorflow/blob/main/examples/point_centring_demo.ipynb)
 compares Gmsh smoothing, `hex_ring` and `lloyd_iterations` for centring cells
 around wells.
+[examples/barrier_meshing.ipynb](https://github.com/rhugman/vorflow/blob/main/examples/barrier_meshing.ipynb)
+shows how barrier faces are placed, what `barrier_report` lists and the
+remaining limits.
 
 ## Contributing
 

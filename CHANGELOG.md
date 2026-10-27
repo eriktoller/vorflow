@@ -13,6 +13,111 @@ and the project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   is on PyPI, with notes from the tag's changelog section and the wheel and
   sdist attached (`scripts/release_notes.py`). A tag without a changelog
   section now fails the build before anything is uploaded.
+- `vorflow.BarrierMeshError`, a `ValueError`. `MeshGenerator.generate()`
+  raises it, before Gmsh runs, when it cannot make every barrier segment a
+  cell face, for example where the faces would have to be far shorter than
+  the barrier's `resolution`. The message gives the place (x, y) and
+  suggests setting `simplify_tolerance` on the barrier or a finer
+  `resolution`.
+- `MeshGenerator.barrier_report`: a dict that lists, each with its place,
+  what the barrier construction changed or gave up. The entries are ends
+  snapped or trimmed onto another barrier or the boundary (`snaps`),
+  vertices dropped as digitising noise (`noise`), short pieces dropped past
+  a junction (`stubs`), sharp spike tips left without faces (`tips`), hex
+  rings dropped next to a barrier (`rings`) and narrow gaps given one shared
+  row of cells (`corridors`). `MeshGenerator.barrier_lines` holds the lines
+  the faces follow, `barrier_circles` the empty circles and `node_is_site`
+  marks the nodes placed on them.
+- `MeshGenerator(barrier_gradation=0.3, sharp_angle=18,
+  barrier_polish_iterations=20)`. `barrier_gradation` limits how fast the
+  barrier face length changes along the barrier network. `sharp_angle` is
+  the angle, in degrees, below which a spike's tip is left without faces.
+  `barrier_polish_iterations` sets the Lloyd steps that move the free mesh
+  nodes around the fixed barrier generators.
+- `ConceptualMesh(keep_close_rings=False)`. With True, a point's `hex_ring`
+  is kept next to a barrier, and the barrier faces there are made shorter
+  so the ring stays clear of them. By default the ring is dropped with a
+  warning, as next to any other embedded line.
+- `MeshField.python_size()`: the size a field asks for at a distance from
+  its feature, evaluated before Gmsh runs. The barrier construction reads
+  it to size the barrier faces. The built-in fields implement it. A custom
+  field without it is left out of that estimate, though Gmsh still applies
+  it.
+- `VoronoiTessellator.strict_barriers` (class attribute, default False):
+  with True, the tessellator raises `BarrierMeshError` instead of warning
+  when it has to mirror or cut a cell on a barrier (see Changed).
+- The notebook `examples/barrier_meshing.ipynb` shows how barrier faces are
+  placed, what `barrier_report` lists and the remaining limits. The README
+  has a new "Barriers" section.
+
+### Changed
+
+- Barriers (`add_line(..., is_barrier=True)`) are now meshed so that every
+  barrier segment is exactly one Voronoi cell face. vorflow cuts each
+  barrier into segments and draws a circle around each segment end. It
+  places a pair of cell generators where the circles of a segment cross,
+  one on each side of the line. If no other generator lies inside a circle,
+  the segment is the face between that pair (the empty-circle rule of the
+  UPR method; Berge, Klemetsdal and Lie, 2019, *Computational Geosciences*
+  23:169-188, <https://doi.org/10.1007/s10596-018-9790-0>). These
+  generators are placed and checked before Gmsh runs. Gmsh then meshes the
+  rest of the domain, and the mesh nodes inside the circles are removed.
+  Every barrier face is one straight edge with an orthogonality error of 0.
+  On the 19 barrier benchmark cases, cut cells fell from 48 to 0 and faces
+  of several edges from 529 to 0. The mean worst compactness of the cells
+  next to a barrier rose from 0.59 to 0.76, with about 20% fewer cells near
+  the barriers. Meshes of models with barriers change: the node positions
+  and counts near every barrier differ from 0.3.0.
+- Two nearly parallel barriers closer than about 1.2 x their resolution now
+  share one row of cells, with generators on the midline between them. A
+  barrier closer than about 0.6 x its resolution to the domain boundary
+  gets the same treatment, with the generators on the boundary. Before,
+  such gaps were filled with thin cells or cut cells.
+- `ConceptualMesh.generate()` cleans barrier lines before meshing. An end
+  within `max(connectivity_tolerance, simplify_tolerance)` of another
+  barrier, a barrier vertex or the domain boundary is snapped onto it, and
+  a short overshoot past another barrier is trimmed back. Junctions and
+  crossings become shared vertices. A vertex closer than 0.1 x
+  `resolution` to its neighbour is dropped as digitising noise, with a
+  `UserWarning` giving the largest move, even when `simplify_tolerance` is
+  0. Barrier lines are no longer densified.
+- `simplify_tolerance` on a barrier now simplifies after the junctions are
+  joined, keeping junctions, crossings and ends, and uses the fewest
+  straight pieces within the tolerance. Before, a per-line Douglas-Peucker
+  pass ran first and could pull a splay off the fault it starts on.
+- A spike sharper than `sharp_angle` (18 degrees) leaves the last
+  0.45 x `resolution` of each leg without faces, so the cells at the tip
+  stay regular. vorflow logs a warning and lists the tip in
+  `barrier_report["tips"]`.
+- The tessellator's barrier mirror generators and cell cutting are now a
+  safety net for barriers. They found nothing to do on any of the 73
+  barrier benchmark cases. If they are ever needed on a barrier,
+  `VoronoiTessellator.generate()` warns. Quad buffers on barriers
+  (`quad_buffer=True`) still use the mirror generators and the cut, so they
+  can still leave cut cells and faces of several edges.
+
+### Deprecated
+
+- `add_line(straddle_width=...)` emits a `DeprecationWarning` and is
+  ignored on barriers: the barrier faces are now placed automatically. A
+  non-barrier line that sets it still gets cell faces along it, as before.
+
+### Removed
+
+- The internal straddle-pair code (`vorflow._straddle`: straddle pairs,
+  crossing plans and their spacing), replaced by `vorflow._barrier`.
+
+### Fixed
+
+- Barriers no longer leave cut cells or faces of several edges at corners
+  ([#67](https://github.com/rhugman/vorflow/issues/67)), short legs between
+  corners, finely drawn curves, T-junctions and crossings of barriers, or
+  standard lines crossing a barrier next to a corner. A cut cell had no
+  mesh node of its own, so its connections were not at right angles to its
+  faces. A face of several edges is a bent face shared by two cells.
+  MODFLOW 6 DISV takes the connection width from its first edge only, so on
+  two benchmark cases the flow through an HFB on these faces was 40-60%
+  lower than on a finer reference grid.
 
 ## [0.3.0] - 2026-10-15
 

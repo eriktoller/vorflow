@@ -110,7 +110,7 @@ def advice(cause: str, h: float) -> str:
     return {
         "barrier": "two barrier parts come that close without meeting (a near-miss end, or two barriers side by "
                    "side). If one should end on the other, set simplify_tolerance on it to at least the gap, which "
-                   f"snaps the end onto the other; otherwise move them apart, or use {finer}",
+                   "snaps the end onto the other; otherwise move them apart",
         "boundary": "the barrier comes that close to the domain boundary or a hole without ending on it. End it on "
                     "the boundary or move it away: simplify_tolerance of at least the gap snaps a near-miss end "
                     f"onto the boundary and drops a part that runs along it. Or use {finer}",

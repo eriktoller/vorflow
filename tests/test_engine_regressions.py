@@ -9,7 +9,7 @@ from pathlib import Path
 
 import numpy as np
 import pytest
-from shapely.geometry import LineString, Point, Polygon, box
+from shapely.geometry import LineString, MultiPoint, Point, Polygon, box
 
 import vorflow
 from vorflow.blueprint import ConceptualMesh
@@ -81,6 +81,7 @@ def _barrier_model(with_point):
 def test_point_field_does_not_leak_onto_barrier_with_same_feature_id():
     # Line 0's straddle points and point feature 0 used to share
     # gmsh_map['points'][0], so the point's fine field also refined the barrier.
+    # Barrier sites are now point rows of their own, with fresh ids.
     def nodes_near_barrier(with_point):
         mg = MeshGenerator(background_lc=10, verbosity=0)
         assert mg.generate(*_barrier_model(with_point))
@@ -89,7 +90,9 @@ def test_point_field_does_not_leak_onto_barrier_with_same_feature_id():
     assert nodes_near_barrier(True) == nodes_near_barrier(False)
 
 
-def test_barrier_straddle_points_are_mapped_separately_from_point_features():
+def test_barrier_curves_are_mapped_separately_from_point_features():
+    # A barrier is a field-only curve under its own line id; point feature 0
+    # keeps its single OCC point.
     polys, lines, points = _barrier_model(with_point=True)
     mg = MeshGenerator(background_lc=10, verbosity=0)
     mg._initialize_gmsh()
@@ -98,7 +101,7 @@ def test_barrier_straddle_points_are_mapped_separately_from_point_features():
     finally:
         mg._finalize_gmsh()
     assert len(gmsh_map["points"][0]) == 1
-    assert len(gmsh_map["straddle_points"][0]) > 2
+    assert [dim for dim, _ in gmsh_map["lines"][0]] == [1]
 
 
 def test_element_grid_is_built_lazily_and_cached():
@@ -305,17 +308,22 @@ def test_features_in_a_holed_domain_are_embedded_as_triangle_vertices():
     # With the domain face inverted, 154 river, fault-straddle and well
     # entities matched no surface and were never embedded. Gmsh still meshed
     # them as free entities, so their nodes were in mg.nodes without being
-    # triangle vertices and made sliver Voronoi cells along the lines.
+    # triangle vertices and made sliver Voronoi cells along the lines. (The
+    # fault is now a field-only line with embedded site points, so fewer
+    # entities are embedded.)
     mg = MeshGenerator(background_lc=20.0, verbosity=0)
     assert mg.generate(*_holed_domain_model())
     embedding = mg.diagnostics["embedding"]
     assert embedding["skip_no_match"] == 0
     assert embedding["skip_no_cand"] == 0
-    assert embedding["ok"] > 250
+    assert embedding["ok"] > 100
     vertices = {tuple(xy) for geom in mg.get_element_grid().geometry
                 for xy in np.round(geom.exterior.coords, 9)}
-    free_nodes = [xy for xy in np.round(mg.nodes, 9) if tuple(xy) not in vertices]
-    assert free_nodes == []
+    # Barrier sites are added and free nodes polished after Gmsh, so only
+    # the fixed (feature and boundary) nodes are checked.
+    fixed = mg.nodes[~mg.node_is_free & ~mg.node_is_site]
+    loose = [xy for xy in np.round(fixed, 9) if tuple(xy) not in vertices]
+    assert loose == []
 
 
 def test_dedup_keeps_renumbered_curves_in_the_feature_map():
@@ -343,11 +351,10 @@ def test_dedup_keeps_renumbered_curves_in_the_feature_map():
     clean_river = lines.geometry.iloc[0]
     crossing = clean_river.intersection(lines.geometry.iloc[1])
     off_river = [c for c in centres if clean_river.distance(c) > 1e-6]
-    # Only the two segments bent onto the fault's straddle pair leave the river.
-    assert len(off_river) == 2
-    assert all(crossing.distance(c) < 2.0 for c in off_river)
-    # Only the trim either side of the barrier is missing.
-    assert total_length == pytest.approx(clean_river.length, abs=2.0)
+    # The barrier is a field-only line, so the river crosses it unbent and untrimmed.
+    assert crossing.geom_type == "Point"
+    assert off_river == []
+    assert total_length == pytest.approx(clean_river.length, abs=1e-6)
 
 
 def test_unembedded_entities_are_reported_with_a_warning(monkeypatch, caplog):
@@ -405,10 +412,11 @@ OBLIQUE_BARRIER_DOMAINS = {
 
 
 @pytest.mark.parametrize("domain_key", OBLIQUE_BARRIER_DOMAINS)
-def test_oblique_barrier_end_pairs_stay_inside_the_domain(domain_key):
+def test_oblique_barrier_end_sites_stay_inside_the_domain(domain_key):
     # A barrier meeting a boundary obliquely put one straddle point of each
     # end pair outside the domain: no surface embedded it, its node was not a
     # triangle vertex, and the boundary cell around the end straddled the line.
+    # The boundary end now shares a site onto the boundary.
     from vorflow import VoronoiTessellator
     from vorflow.utils import build_connectivity
 
@@ -420,11 +428,8 @@ def test_oblique_barrier_end_pairs_stay_inside_the_domain(domain_key):
     mg = MeshGenerator(background_lc=10.0, verbosity=0)
     assert mg.generate(polys, lines, points)
     assert mg.diagnostics["embedding"]["unmatched_tags"] == []
-
-    vertices = {tuple(xy) for geom in mg.get_element_grid().geometry
-                for xy in np.round(geom.exterior.coords, 9)}
-    free_nodes = [xy for xy in np.round(mg.nodes, 9) if tuple(xy) not in vertices]
-    assert free_nodes == []
+    sites = mg.nodes[mg.node_is_site]
+    assert domain.buffer(1e-9).covers(MultiPoint(sites))
 
     vt = VoronoiTessellator(mg, cm)
     grid = vt.generate()
@@ -454,14 +459,13 @@ def _crossing_model(angle, offset):
 
 
 @pytest.mark.parametrize("angle, offset", [(90, 1.0), (30, 0.5)])
-def test_line_crossing_a_barrier_ends_on_its_straddle_pair(angle, offset):
+def test_line_crossing_a_barrier_shares_sites_with_it(angle, offset):
     # A line crossing a barrier was trimmed back by the barrier corridor, so
     # its end nodes sat at an arbitrary offset from the nearest straddle pair,
     # squeezed the cells there and needed 0-4 tessellator mirror cells. The
-    # crossing now carries a straddle pair and the line ends on it. Over
-    # 20-90 degree crossings and four vertex offsets of this model, the worst
-    # cell within 4 m of the crossing has compactness 0.69-0.79 (before
-    # 0.47-0.76; 0.47 for the 30 degree case here), so 0.65 leaves margin.
+    # crossing is now a node of the barrier network: its circle holds no
+    # mesh node (the line's nodes inside it are dropped) and the sites
+    # around it make both the barrier and the line cell faces.
     from vorflow import VoronoiTessellator
     from vorflow.utils import build_connectivity
 
@@ -469,9 +473,13 @@ def test_line_crossing_a_barrier_ends_on_its_straddle_pair(angle, offset):
     mg = MeshGenerator(background_lc=10.0, verbosity=0)
     assert mg.generate(*cm.generate())
     assert mg.diagnostics["embedding"]["unmatched_tags"] == []
-    # The pair at the crossing is also the line's last node on each side.
-    for x in (49.6, 50.4):
-        assert np.hypot(mg.nodes[:, 0] - x, mg.nodes[:, 1] - 50.7).min() < 1e-9
+    crossing = np.array([50.0, 50.7])
+    assert any(np.allclose(xy, crossing) for xy in mg.barrier_lines.geometry.iloc[0].coords)
+    centres, radii = mg.barrier_circles
+    k = int(np.argmin(np.hypot(*(centres - crossing).T)))
+    assert np.allclose(centres[k], crossing)
+    others = mg.nodes[~mg.node_is_site]
+    assert np.hypot(*(others - crossing).T).min() > radii[k]
 
     vt = VoronoiTessellator(mg, cm)
     grid = vt.generate()
@@ -521,3 +529,118 @@ def test_curved_barrier_leaves_no_sliver_cells(amplitude, wavelength, lc):
 
     faces = build_connectivity(grid, center="generator").geometry
     assert not any(_face_crosses(face, barrier) for face in faces)
+
+
+@pytest.mark.parametrize("coords", [
+    [(30, 40), (140, 170), (160, 150), (270, 260)],
+    [(20, 150), (80, 210), (100, 190), (160, 250), (175, 235), (280, 280)],
+    [(40, 60), (150, 250), (180, 60)],  # 34 degree spike
+], ids=["single-kink", "zigzag", "spike"])
+def test_kinked_barrier_cells_need_no_cut(coords):
+    # A barrier vertex fell between two evenly spaced straddle pairs, so the
+    # cell at the corner reached across the line. The tessellator then cut
+    # it and merged the small piece into a neighbour, leaving cells that met
+    # along two edges and faces up to 50 degrees off orthogonal. Each kink
+    # is now a node of the barrier network with its own circle and sites.
+    from vorflow import VoronoiTessellator
+    from vorflow.utils import build_connectivity
+
+    cm = ConceptualMesh()
+    cm.add_polygon(box(0, 0, 300, 300), zone_id=1, resolution=20)
+    cm.add_line(LineString(coords), line_id="barrier", resolution=8, is_barrier=True)
+    polys, lines, points = cm.generate()
+    mg = MeshGenerator(background_lc=20, verbosity=0)
+    assert mg.generate(polys, lines, points)
+    vt = VoronoiTessellator(mg, cm)
+    grid = vt.generate()
+
+    assert vt.n_barrier_mirrors == 0
+    # Every cell is a whole Voronoi cell: none was cut off by the barrier.
+    assert len(grid) == len(mg.nodes)
+    barrier = lines.geometry.iloc[0]
+    connectivity = build_connectivity(grid, center="generator")
+    assert not any(_face_crosses(face, barrier) for face in connectivity.geometry)
+    near = connectivity.geometry.distance(barrier) < 16
+    assert connectivity.loc[near, "ortho_error"].max() < 1e-6
+
+
+def _multi_edge_pairs(grid, connectivity):
+    """Neighbouring cell pairs whose shared boundary has more than one edge.
+
+    A barrier cut whose small piece was merged into a neighbour leaves such a
+    pair (a bent face), as does a straight face split by an extra vertex.
+    """
+    from shapely import MultiLineString, line_merge
+
+    pairs = []
+    for a, b in zip(connectivity["cell_id_1"], connectivity["cell_id_2"]):
+        shared = grid.geometry.iloc[a].boundary.intersection(grid.geometry.iloc[b].boundary)
+        segments = [part for part in getattr(shared, "geoms", [shared]) if part.geom_type == "LineString"]
+        merged = line_merge(MultiLineString(segments))
+        if sum(len(part.coords) - 1 for part in getattr(merged, "geoms", [merged])) > 1:
+            pairs.append((a, b))
+    return pairs
+
+
+K67_BARRIER = [(30, 40), (140, 170), (160, 150), (270, 260)]
+_SINE_X = np.linspace(40, 260, 61)
+
+
+def _residual_grid(lines):
+    """Mesh the 300 m square with ``lines`` (lc 8) and return (grid, mesh generator, tessellator)."""
+    from vorflow import VoronoiTessellator
+
+    cm = ConceptualMesh()
+    cm.add_polygon(box(0, 0, 300, 300), zone_id=1, resolution=20)
+    for k, line in enumerate(lines):
+        kwargs = {key: value for key, value in line.items() if key != "coords"}
+        cm.add_line(LineString(line["coords"]), line_id=f"line{k}", resolution=8, **kwargs)
+    polys, clean_lines, points = cm.generate()
+    mg = MeshGenerator(background_lc=20, verbosity=0)
+    assert mg.generate(polys, clean_lines, points)
+    vt = VoronoiTessellator(mg, cm)
+    return vt.generate(), mg, vt
+
+
+@pytest.mark.filterwarnings("ignore:straddle_width is deprecated:DeprecationWarning")
+@pytest.mark.parametrize("lines", [
+    # Legs shorter than KINK_MIN_LEG * resolution kept the even spacing.
+    [dict(coords=list(zip(_SINE_X, 150 + 40 * np.sin((_SINE_X - 40) / 220 * 2 * np.pi))),
+          is_barrier=True)],
+    # Pairs further apart than the resolution let mesh nodes in between
+    # (straddle_width is now ignored).
+    [dict(coords=K67_BARRIER, is_barrier=True, straddle_width=10.0)],
+    # One barrier ending on another.
+    [dict(coords=[(40, 150), (260, 150)], is_barrier=True),
+     dict(coords=[(150, 150), (150, 270)], is_barrier=True)],
+    # A standard line crossing the barrier next to a kink.
+    [dict(coords=K67_BARRIER, is_barrier=True), dict(coords=[(100, 250), (180, 100)])],
+], ids=["fine-curve", "wide-straddle", "t-junction", "crossing-near-kink"])
+def test_barrier_residuals_need_no_cut(lines):
+    # Layouts where the tessellator had to cut cells along a barrier with
+    # straddle pairs, leaving cells without a generator or pairs of cells
+    # that met along several edges.
+    from vorflow.utils import build_connectivity
+
+    grid, mg, vt = _residual_grid(lines)
+    assert vt.n_barrier_mirrors == 0
+    assert len(grid) == len(mg.nodes)
+    assert _multi_edge_pairs(grid, build_connectivity(grid, center="generator")) == []
+
+
+@pytest.mark.slow
+@pytest.mark.xfail(strict=True, reason="quad buffers on barriers keep the mirror pass and cut (out of scope)")
+@pytest.mark.parametrize("lines", [
+    # Transfinite points are spread per side, so the two node rows drift apart after a kink.
+    [dict(coords=K67_BARRIER, is_barrier=True, quad_buffer=True)],
+    # An even thickness puts a node row on the barrier itself.
+    [dict(coords=[(40, 40), (260, 200)], is_barrier=True, quad_buffer=True, quad_buffer_thickness=2)],
+], ids=["quad-kink", "quad-thickness-2"])
+def test_quad_buffer_barrier_residuals_need_no_cut(lines):
+    # Quad buffers on barriers still use the mirror pass and the post-hoc
+    # cut, which leave cells without a generator or bent faces.
+    from vorflow.utils import build_connectivity
+
+    grid, mg, vt = _residual_grid(lines)
+    assert len(grid) == len(mg.nodes) + vt.n_barrier_mirrors
+    assert _multi_edge_pairs(grid, build_connectivity(grid, center="generator")) == []

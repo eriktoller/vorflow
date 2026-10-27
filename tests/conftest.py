@@ -15,3 +15,15 @@ def ensure_gmsh_finalized():
     yield
     if gmsh.is_initialized():
         gmsh.finalize()
+
+
+@pytest.fixture(autouse=True)
+def strict_barriers(monkeypatch):
+    """Make the tessellator raise instead of warn when exact barrier faces need its mirror pass or cut.
+
+    The barrier construction should never leave work for that safety net,
+    so in tests any such repair is a failure.
+    """
+    from vorflow import VoronoiTessellator
+
+    monkeypatch.setattr(VoronoiTessellator, "strict_barriers", True)

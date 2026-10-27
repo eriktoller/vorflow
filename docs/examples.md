@@ -14,5 +14,6 @@ examples/comprehensive_demo
 examples/point_centring_demo
 examples/plotting_demo
 examples/cleaning_limitations_demo
+examples/barrier_meshing
 examples/basic_example_modflow
 ```

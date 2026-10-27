@@ -242,12 +242,15 @@ excludes metadata automatically:
 import flopy
 
 model = flopy.mfusg.MfUsg(modelname="model", model_ws="model", structured=False)
-disu = tessellator.to_mfusgdisu(model, top=10.0, botm=[0.0, -10.0], nlay=2)
+disu = tessellator.to_mfusgdisu(
+    model, top=10.0, botm=[0.0, -10.0], nlay=2, gsf_path="model/model.gsf"
+)
 disu.write_file()  # Or model.write_input() after adding the other packages.
-tessellator.to_gsf("model/model.gsf", top=10.0, botm=[0.0, -10.0], nlay=2)
 ```
 
-Use the same elevations for both exports. GSF stores original 3D cell
+`gsf_path` (also accepted by `to_mfusg_disu()`) writes the matching GSF from
+the same validated grid. `to_gsf()` writes the GSF on its own; use the same
+elevations as for DISU. GSF stores original 3D cell
 geometry with one-based IDs and XYZ vertices; it is not a solver input or
 the particle-tracking-specific GSF variant. FloPy can read it using
 `UnstructuredGrid.from_gridspec()`. The DISU/GSF pair is intended for external

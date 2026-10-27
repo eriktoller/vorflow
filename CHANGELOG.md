@@ -21,8 +21,9 @@ and the project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   at clipped boundary centres and overlapping boundary slivers is accepted
   without moving the input centres or polygons.
 - Original 3D GSF geometry export with `to_gsf()` / `grid_to_gsf()`, using
-  the same centres, elevations and node numbering as USG DISU. FloPy and
-  MFUSG executables remain optional.
+  the same centres, elevations and node numbering as USG DISU. Pass
+  `gsf_path` to the DISU exports to write both from one validation pass.
+  FloPy and MFUSG executables remain optional.
 - A simple executed MODFLOW-USG notebook: one confined layer, two fixed-head
   sides, paired DISU/GSF export, head plot and water-budget checks.
 - The Conda development environment includes FloPy and installs both the

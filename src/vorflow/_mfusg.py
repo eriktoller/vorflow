@@ -15,6 +15,10 @@ import shapely
 
 logger = logging.getLogger(__name__)
 METADATA_KEYS = {"node_id", "cell_map", "connectivity"}
+PACKAGE_KEYS = {
+    "nodes", "nlay", "njag", "ivsd", "idsymrd", "nodelay",
+    "top", "bot", "area", "iac", "ja", "cl12", "fahl",
+}
 
 
 @dataclass

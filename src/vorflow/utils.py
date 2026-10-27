@@ -833,7 +833,7 @@ def _insert_hanging_vertices(cell_vertices, vertex_xy, tolerance):
     return out
 
 
-def grid_to_mfusg_disu(gdf: gpd.GeoDataFrame, top, botm, nlay: int = 1) -> dict:
+def grid_to_mfusg_disu(gdf: gpd.GeoDataFrame, top, botm, nlay: int = 1, gsf_path=None) -> dict:
     """Build **MODFLOW-USG**, not MODFLOW 6, DISU input from a polygon grid.
 
     Uses the same horizontal mesh in every layer, with the grid's ``x``/``y``
@@ -841,11 +841,14 @@ def grid_to_mfusg_disu(gdf: gpd.GeoDataFrame, top, botm, nlay: int = 1) -> dict:
     ``(nlay,)`` or ``(nlay, ncpl)``. The upper surface of each lower layer is
     the preceding layer's bottom. All thicknesses must be positive.
 
+    If ``gsf_path`` is given, the matching GSF file (see :func:`grid_to_gsf`)
+    is written from the same validated grid, so the checks run only once.
+
     Centre containment and overlap checks allow coordinate roundoff (32
     machine epsilons times the coordinate scale), preserving input centres
     and polygons. Roundoff-sized overlap faces are resolved at that precision.
-    Shared faces must be contiguous and straight; a kinked barrier can create
-    a bent face that is rejected. Disconnected shared faces are also rejected.
+    Shared faces must be contiguous and straight; bent faces, such as a
+    barrier corner cut inside a cell, and disconnected faces are rejected.
 
     Returns:
         dict: Inputs for ``flopy.mfusg.MfUsgDisU``: ``nodes``, ``nlay``,
@@ -876,9 +879,13 @@ def grid_to_mfusg_disu(gdf: gpd.GeoDataFrame, top, botm, nlay: int = 1) -> dict:
     barrier properties are generated. Inspect ``connectivity`` to assess
     nonorthogonal faces before using the mesh in a simulation.
     """
-    from ._mfusg import _disu_arrays, _prepare_grid
+    from ._mfusg import _disu_arrays, _prepare_grid, _write_gsf
 
-    return _disu_arrays(_prepare_grid(gdf, top, botm, nlay))
+    grid = _prepare_grid(gdf, top, botm, nlay)
+    arrays = _disu_arrays(grid)
+    if gsf_path is not None:
+        _write_gsf(grid, gsf_path)
+    return arrays
 
 
 def grid_to_gsf(gdf: gpd.GeoDataFrame, filepath, top, botm, nlay: int = 1):
@@ -889,8 +896,8 @@ def grid_to_gsf(gdf: gpd.GeoDataFrame, filepath, top, botm, nlay: int = 1):
     lists clockwise top and bottom rings, without repeated closing vertices.
     Node/vertex/layer numbers in the file are one-based. Flat cell surfaces
     reproduce the supplied cell elevations; no vertex interpolation is done.
-    The shared validation rejects bent/disconnected faces, including faces
-    created where a barrier changes direction inside a cell.
+    The shared validation rejects bent and disconnected faces. To write DISU
+    and GSF together, pass ``gsf_path`` to :func:`grid_to_mfusg_disu`.
 
     GSF is a geometry companion, not a DISU package or a particle-tracking
     GSF variant. It does not store hydraulic properties, CRS metadata or

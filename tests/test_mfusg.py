@@ -264,6 +264,24 @@ def test_original_3d_gsf_round_trip_and_large_coordinates(tmp_path, width):
     assert grid.equals(before)
 
 
+def test_disu_export_with_gsf_path_matches_separate_exports(tmp_path):
+    grid = _grid()
+    top, botm = [10, 12], [[4, 5], [-1, -4]]
+    combined = grid_to_mfusg_disu(grid, top, botm, nlay=2, gsf_path=tmp_path / "combined.gsf")
+    separate = grid_to_mfusg_disu(grid, top, botm, nlay=2)
+    grid_to_gsf(grid, tmp_path / "separate.gsf", top, botm, nlay=2)
+    assert (tmp_path / "combined.gsf").read_text() == (tmp_path / "separate.gsf").read_text()
+    assert combined.keys() == separate.keys()
+    for key in ("iac", "ja", "cl12", "fahl", "top", "bot"):
+        np.testing.assert_array_equal(combined[key], separate[key])
+
+
+def test_rejected_disu_export_writes_no_gsf(tmp_path):
+    with pytest.raises(ValueError, match="thickness"):
+        grid_to_mfusg_disu(_grid(), 10, 10, gsf_path=tmp_path / "model.gsf")
+    assert not (tmp_path / "model.gsf").exists()
+
+
 def _tessellator(generate=True):
     cm = ConceptualMesh()
     cm.add_polygon(box(0, 0, 4, 3), zone_id=1, densify=.5)
@@ -285,8 +303,9 @@ def test_exports_before_generate_raise(method, args):
 def test_plain_exports_work_without_flopy(tmp_path, monkeypatch):
     monkeypatch.setitem(sys.modules, "flopy", None)
     vt = _tessellator()
-    disu = vt.to_mfusg_disu(10, 0)
+    disu = vt.to_mfusg_disu(10, 0, gsf_path=tmp_path / "combined.gsf")
     assert disu["nodes"] == len(vt.grid)
+    assert (tmp_path / "combined.gsf").is_file()
     assert vt.to_gsf(tmp_path / "model.gsf", 10, 0).is_file()
     with pytest.raises(ImportError, match="to_mfusg_disu"):
         vt.to_mfusgdisu(None, 10, 0)
@@ -320,10 +339,14 @@ def test_wrapper_rejects_mf6_and_grid_overrides(tmp_path):
     with pytest.raises(ValueError, match="not an MF6"):
         vt.to_mfusgdisu(mf6, 10, 0)
     model = flopy.mfusg.MfUsg(structured=False, model_ws=tmp_path)
+    gsf = tmp_path / "model.gsf"
     with pytest.raises(ValueError, match="override"):
-        vt.to_mfusgdisu(model, 10, 0, ivsd=1)
+        vt.to_mfusgdisu(model, 10, 0, gsf_path=gsf, ivsd=1)
     with pytest.raises(ValueError, match="Confining beds"):
-        vt.to_mfusgdisu(model, 10, 0, laycbd=1)
+        vt.to_mfusgdisu(model, 10, 0, gsf_path=gsf, laycbd=1)
+    assert not gsf.exists()
+    disu = vt.to_mfusgdisu(model, 10, 0, gsf_path=gsf)
+    assert disu.nodes == len(vt.grid) and gsf.is_file()
 
 
 def _run_linear_model(tmp_path, props, ibound, exact):

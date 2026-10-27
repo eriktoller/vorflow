@@ -860,13 +860,19 @@ class MeshGenerator:
             cells, so the cells there stay regular instead of becoming
             slivers. The uncovered length and place are in
             ``barrier_report``. Default 18 (an 18 degree apex cell has a
-            compactness of 0.36). It acts wherever two barrier legs meet,
-            also between different lines, so it is a mesh-wide option.
+            compactness of 0.36). Where two barrier legs of a junction (or a
+            barrier and the domain boundary) meet at less than this angle,
+            they share a short stem instead, moving them at most 0.1 x
+            resolution (``barrier_report['collapsed']``). It acts wherever
+            two barrier legs meet, also between different lines, so it is a
+            mesh-wide option.
         barrier_polish_iterations (int): Lloyd steps that move the free mesh
-            nodes towards their cell centroids around the fixed barrier
-            sites, kept out of the barrier circles (0 turns it off). Default
-            20. Independent of ``VoronoiTessellator(lloyd_iterations=...)``,
-            which also respects the circles.
+            nodes within 3 x their local size of a barrier circle towards
+            their cell centroids around the fixed barrier sites, kept out of
+            the circles (0 turns it off). Nodes further away keep their Gmsh
+            positions exactly. Default 20. Independent of
+            ``VoronoiTessellator(lloyd_iterations=...)``, which also respects
+            the circles.
 
     Barrier results:
         barrier_report (dict): Set by ``generate()``, like the three
@@ -885,14 +891,22 @@ class MeshGenerator:
             be removed inside the circles), ``corridors`` (narrow gaps given
             one shared row of cells: ``kind`` "barriers" between two close
             parallel barriers or "boundary" along a boundary edge,
-            ``line_ids``, ``length``), plus ``repair_rounds``, ``sites``,
-            ``removed_nodes`` (Gmsh nodes removed for the sites, not counting
-            Gmsh's copies of the sites) and ``polish``. Tips, stubs, snapped
-            ends and fixed-line nodes each raise one UserWarning with their
-            count. When the cleaning dropped every barrier, the report holds
+            ``line_ids``, ``length``), ``collapsed`` (barrier legs meeting
+            at less than ``sharp_angle``, or fans of legs closer than 29
+            degrees, merged over a short reach: ``kind`` "junction" or
+            "boundary", ``line_ids``, ``angle``, ``reach``, ``deviation``,
+            the largest move of a line, at most 0.1 x its resolution), plus
+            ``repair_rounds``, ``sites``, ``removed_nodes`` (Gmsh nodes
+            removed for the sites, not counting Gmsh's copies of the sites)
+            and ``polish`` (``iterations``, ``residual``, ``rejected``,
+            short faces before and after, and ``moved``, the nodes it
+            moved). Merges, tips, stubs, snapped ends and fixed-line nodes
+            each raise one UserWarning with their count. When the cleaning dropped every barrier, the report holds
             only what it dropped.
         barrier_lines (GeoDataFrame): The lines the barrier faces follow
-            (after stubs and sharp tips are removed), with ``feature_id``
+            (after stubs and sharp tips are removed and narrow junctions
+            merged; a stretch the faces of several lines share is part of
+            each of their rows), with ``feature_id``
             (the clean-line index), ``line_id`` and ``is_barrier``.
         barrier_circles (tuple): ``(centres (k, 2), radii (k,))`` of the
             empty circles; no generator other than the barrier sites may
@@ -1138,6 +1152,10 @@ class MeshGenerator:
         so this method can be called after the normal mesh-generation lifecycle.
         The report includes all 2D element types and marks triangle elements in
         ``is_triangle`` so mixed tri/quad meshes are explicit.
+
+        With barriers these are Gmsh's elements before the barrier sites are
+        fitted, as in ``get_element_grid``: they describe the mesh away from
+        the barriers, not the cells next to them.
         """
         if self.triangular_quality is None:
             raise RuntimeError(
@@ -1277,8 +1295,10 @@ class MeshGenerator:
 
         With barriers this is Gmsh's mesh before the barrier sites are fitted:
         the sites are not element vertices, and the nodes later removed from
-        the barrier circles or moved by the polish are still at their Gmsh
-        positions.
+        the barrier circles or moved by the polish (within 3 x their local
+        size of a circle) are still at their Gmsh positions. Every other
+        element vertex is a node of ``nodes`` at the same position. A
+        triangulation of the fitted nodes would need another Gmsh run.
         """
         if self.element_grid is None and self._element_data is None:
             raise RuntimeError(

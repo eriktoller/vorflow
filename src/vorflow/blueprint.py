@@ -16,7 +16,7 @@ from shapely.validation import make_valid
 from . import _junctions
 from ._log import warn_user
 from ._features import line_parts as _line_parts
-from ._features import is_face_line, positive_number, row_bool
+from ._features import HEX_RING_CLEARANCE, is_face_line, positive_number, row_bool
 from ._plot import features_frame, get_ax, plot_features
 from ._barrier import lines as _barrier_lines
 from .fields import DEFAULT_GROWTH_FACTOR, GeometricGrowthField, MeshField, ThresholdField
@@ -33,10 +33,6 @@ DEFAULT_CONNECTIVITY_TOLERANCE = 1e-3
 # 0.5 keeps the nearest line node at least half a cell from the junction node
 # while moving any line end by at most half a cell.
 DEFAULT_LINE_JUNCTION_FRACTION = 0.5
-# A hex_ring point's ring seeds sit at 1 x lc; every other node-bearing feature
-# must stay at least HEX_RING_CLEARANCE x lc away, so at least one cell width
-# separates the ring from foreign nodes (closer ones would cut the hexagon).
-HEX_RING_CLEARANCE = 2.0
 HEX_RING_ANGLES_DEG = tuple(30.0 + 60.0 * k for k in range(6))
 # Gmsh keeps the ring's radius-r edges intact only while the target size inside
 # the ring stays above ~0.85 r (measured with a uniform size: 0.85 r kept the
@@ -1263,6 +1259,8 @@ class ConceptualMesh:
     def _assign_hex_ring_seeds(self, field_only_polys=()):
         """Set each working point's ``ring_seeds``: its six ring seeds, or None when off or conflicting.
 
+        ``ring_near_barrier`` is True for a dropped ring that a barrier passes too close to.
+
         A ring is dropped when another embedded feature is too close (see
         ``_hex_ring_conflict``) or when any feature's size field is too fine
         inside the ring (see ``_hex_ring_size_conflict``). Other embedded
@@ -1272,10 +1270,15 @@ class ConceptualMesh:
         requested = [i for i, p in enumerate(self.raw_points) if p.get('hex_ring', False)]
         for point_data in self.raw_points:
             point_data['ring_seeds'] = None
+            point_data['ring_near_barrier'] = False
         if not requested:
             return
 
         feature_obstacles = self._hex_ring_obstacles()
+        barrier_obstacles = [
+            (None, line['geometry'], 0.0) for line in self.raw_lines
+            if bool(line.get('embed', True)) and is_face_line(line) and not self.keep_close_rings
+        ]
         feature_sources = self._hex_ring_size_sources(field_only_polys)
         point_obstacles = [
             (
@@ -1301,6 +1304,9 @@ class ConceptualMesh:
                     Polygon(seeds), lc, feature_sources + other_sources
                 )
             if reason is not None:
+                # barrier_report lists the rings a barrier alone would have dropped.
+                point_data['ring_near_barrier'] = _hex_ring_conflict(
+                    point_data['geometry'], lc, barrier_obstacles) is not None
                 warnings.warn(
                     f"Point {point_data['point_id']!r}: {reason}; hex_ring ignored.",
                     UserWarning,
@@ -1453,6 +1459,7 @@ class ConceptualMesh:
                     'hex_ring',
                     'label',
                     'ring_seeds',
+                    'ring_near_barrier',
                 ],
                 crs=self.crs,
             )

@@ -52,7 +52,7 @@ from .fields import (
     ThresholdField,
     _BorderGradingField,
 )
-from ._log import current_verbosity, verbosity_scope
+from ._log import current_verbosity, verbosity_scope, warn_user
 from ._plot import get_ax
 from . import buffer
 from . import _lloyd
@@ -2888,6 +2888,8 @@ class MeshGenerator:
             self.node_is_site = np.zeros(len(self.nodes), dtype=bool)
             if barrier_plan is not None:
                 self._fit_barrier_sites(barrier_plan, barrier_context, clean_lines.crs)
+            else:
+                self._set_barrier_report(_barrier_frames.dropped_report(clean_lines))
             return self
 
         except Exception as e:
@@ -2919,18 +2921,26 @@ class MeshGenerator:
         self.node_edges, self.node_is_site = fitted["edges"], fitted["is_site"]
         self.barrier_circles = (plan.layout.xy + context.origin, plan.layout.radius.copy())
         self.barrier_lines = _barrier_frames.barrier_lines_frame(plan, context, crs)
-        self.barrier_report = _barrier_frames.report(plan, context, fitted)
-        for tip in self.barrier_report['tips']:
-            logger.warning(
+        self._set_barrier_report(_barrier_frames.report(plan, context, fitted))
+
+    def _set_barrier_report(self, report):
+        """Store ``barrier_report``, log its tips and stubs, and warn once per kind of thing given up."""
+        self.barrier_report = report
+        if report is None:
+            return
+        for tip in report['tips']:
+            logger.info(
                 f"Barrier {tip['line_id']!r}: the spike tip at ({tip['location'][0]:.2f}, "
                 f"{tip['location'][1]:.2f}) is sharper than sharp_angle={self.sharp_angle:g} degrees; "
                 f"its last {tip['length']:.3g} (both legs) has no cell faces."
             )
-        for stub in self.barrier_report['stubs']:
+        for stub in report['stubs']:
             logger.info(
-                f"Barrier {stub['line_id']!r}: dropped a {stub['length']:.3g} dangling stub past a junction "
+                f"Barrier {stub['line_id']!r}: dropped a {stub['length']:.3g} dangling stub "
                 f"at ({stub['location'][0]:.2f}, {stub['location'][1]:.2f})."
             )
+        for message in _barrier_frames.report_warnings(report, self.sharp_angle):
+            warn_user(message)
 
     def _check_hex_rings(self, gmsh_map, points_gdf):
         """Warn for each hex_ring point whose ring the mesher split; record the outcome in diagnostics.

@@ -9,14 +9,21 @@
    the fine-field lines and the embeddable sites appended as new rows (the
    barrier rows themselves become field-only curves in the engine).
 3. ``fit_sites`` (after Gmsh): remove the mesh nodes inside the circles or
-   crowding a site (never a feature node), polish the free nodes, and append
-   the sites.
-4. ``report``: ``MeshGenerator.barrier_report``.
+   crowding a site (never a feature node; a node of a fixed line only inside
+   a circle, and reported unless it is next to where the line meets a
+   barrier), polish the free nodes, and append the sites.
+4. ``report``: ``MeshGenerator.barrier_report``; ``report_warnings`` sums
+   up what the construction gave up, one warning per kind.
 
 The size field: each sizing feature (polygon, standard line, point) adds
 the sizes its fields ask for at each distance (``MeshField.python_size``),
 polygons at distance 0 inside; the background lc caps it. Fields without a
-Python size (custom ones) are left out of this estimate only.
+Python size (custom ones) are left out of this estimate only, with a
+warning.
+
+A point feature (or a kept hex-ring seed) closer than POINT_CLEARANCE x lc
+to a barrier raises BarrierMeshError: a cell centre cannot sit on a barrier
+face.
 """
 from __future__ import annotations
 
@@ -31,18 +38,23 @@ import pandas as pd
 import shapely
 import shapely.affinity
 from shapely.geometry import LineString, Point
+from scipy.spatial import cKDTree
 from shapely.validation import make_valid
 
 from .. import _lloyd
 from .._features import feature_lc, is_embedded, is_face_line, line_parts, row_bool, ring_seed_coords
+from .._log import warn_user
+from ..buffer import protection_epsilon
 from . import pipeline as planning
 from . import polish
-from .sizing import size_function
+from .sizing import CROSSING_REACH, FEATURE_CAP, Obstacle, near_crossing, size_function
 
 logger = logging.getLogger(__name__)
 
 SIZE_SMOOTHING = 5        # passes of node-size smoothing behind the polish density (as lloyd_size_smoothing)
-RING_CLEARANCE = 2.0      # x resolution: a hex ring this close to a barrier is reported as dropped
+POINT_CLEARANCE = 2 * planning.MIN_H_FRACTION / FEATURE_CAP  # x barrier lc: closer points cannot be meshed
+END_REACH = 1.0           # x barrier lc: a barrier end this close to a fixed line meets it (as a crossing)
+ON_LINE_FRACTION = 1e-7   # x domain extent: a mesh node this close to a fixed line lies on it
 
 
 @dataclasses.dataclass
@@ -57,9 +69,10 @@ class Context:
     rings: list                 # (local xy, resolution) of kept hex rings
     size_fn: object             # local size function
     face_rows: dict             # clean-line index -> (line_id, is_barrier)
-    events: list                # cleaning events from ConceptualMesh (global)
+    events: list                # cleaning events from ConceptualMesh (global), with those of dropped lines
     rings_dropped: list         # (point_id, global xy) of hex rings dropped next to a barrier
     constraint_lines: object    # union of the embedded clean lines (global), or None
+    obstacles: list             # local sizing.Obstacle of the fixed lines
 
 
 def _local(geom, origin: np.ndarray):
@@ -74,9 +87,10 @@ def _embedded_rows(gdf) -> list:
     return [(idx, row) for idx, row in gdf.iterrows() if is_embedded(row)]
 
 
-def size_sources(polys, lines, points, background_lc: float, feature_fields, origin: np.ndarray) -> list:
-    """(local geometry, is_area, ramp) of every non-barrier feature whose fields have a Python size."""
-    out = []
+def size_sources(polys, lines, points, background_lc: float, feature_fields, origin: np.ndarray) -> tuple:
+    """(sources, ignored): (local geometry, is_area, ramp) of every non-barrier feature whose fields have a
+    Python size, and the names of the fields without one."""
+    out, ignored = [], []
     for gdf, geom_type in ((polys, 'surfaces'), (lines, 'lines'), (points, 'points')):
         if gdf is None or gdf.empty:
             continue
@@ -87,19 +101,27 @@ def size_sources(polys, lines, points, background_lc: float, feature_fields, ori
             lc = None if lc is None or pd.isna(lc) else float(lc)
             for field in feature_fields(row, geom_type, background_lc):
                 if field.python_size(np.zeros(1), background_lc, lc) is None:
-                    logger.debug(f"Barrier sizing ignores a {type(field).__name__} (no python_size).")
+                    ignored.append(type(field).__name__)
                     continue
                 geom = _local(row.geometry, origin)
                 if geom_type == 'surfaces':
                     geom = make_valid(geom)
                 out.append((geom, geom_type == 'surfaces',
                             lambda d, f=field, lc=lc: f.python_size(d, background_lc, lc)))
-    return out
+    return out, sorted(set(ignored))
+
+
+def warn_ignored_fields(names: list) -> None:
+    """Warn once that the barrier sizing leaves out the size fields ``names`` (no python_size)."""
+    if names:
+        warn_user(f"Barrier sizing ignores size fields without a python_size ({', '.join(names)}): Gmsh still "
+                  "applies them, but the barrier faces are sized without them, so the cells along a barrier may "
+                  "not follow them. Give the field a python_size (see MeshField.python_size).")
 
 
 def _events(lines) -> list:
-    """Cleaning events of the barrier rows, each with its line_id."""
-    out = []
+    """Cleaning events of the barrier rows, each with its line_id, and those of rows the cleaning dropped."""
+    out = list(lines.attrs.get('dropped_barrier_events', []))
     if 'barrier_events' not in lines:
         return out
     for _, row in lines.iterrows():
@@ -109,18 +131,69 @@ def _events(lines) -> list:
     return out
 
 
-def _dropped_rings(points, barriers_global) -> list:
-    """(point_id, xy) of hex_ring points without seeds that a barrier passes within RING_CLEARANCE x lc of."""
+def _dropped_rings(points) -> list:
+    """(point_id, xy) of the hex_ring points whose ring ConceptualMesh dropped because a barrier is too close."""
+    if points is None or points.empty or 'ring_near_barrier' not in points:
+        return []
+    return [(row.get('point_id'), (float(row.geometry.x), float(row.geometry.y)))
+            for _, row in points.iterrows() if row_bool(row, 'ring_near_barrier', False)]
+
+
+def check_points_off_barriers(points, items: list, face_rows: dict, origin: np.ndarray) -> None:
+    """Raise BarrierMeshError for a point feature or kept hex-ring seed closer than POINT_CLEARANCE x lc to a barrier.
+
+    ``items`` holds ``(clean-line index, local xy, lc)`` of the barrier parts.
+    """
+    lines = [(face_rows[idx][0], LineString(xy), lc) for idx, xy, lc in items]
+    for _, row in _embedded_rows(points):
+        pid = row.get('point_id')
+        candidates = [(f"point {pid!r}", (row.geometry.x, row.geometry.y))]
+        candidates += [(f"the hex-ring seed of point {pid!r}", seed) for seed in ring_seed_coords(row)]
+        for label, xy in candidates:
+            local = Point(np.asarray(xy, dtype=float) - origin)
+            for line_id, line, lc in lines:
+                d = line.distance(local)
+                if d < POINT_CLEARANCE * lc:
+                    raise planning.BarrierMeshError(
+                        f"{label} at ({xy[0]:.2f}, {xy[1]:.2f}) is {d:.3g} from barrier {line_id!r}: a cell centre "
+                        f"cannot sit on a barrier face. Move it off the barrier (at least {POINT_CLEARANCE * lc:.3g} "
+                        "away; the faces next to it get shorter the closer it is).")
+
+
+def _obstacle(label: str, geometry, half_width: float, barriers, ends: np.ndarray, end_lc: np.ndarray) -> Obstacle:
+    """An Obstacle whose crossings are where it meets ``barriers`` and the barrier ends within END_REACH x lc."""
+    crossings = [shapely.get_coordinates(shapely.intersection(geometry, barriers))]
+    if len(ends):
+        pts = shapely.points(ends)
+        close = shapely.distance(geometry, pts) <= END_REACH * end_lc
+        crossings.append(shapely.get_coordinates(shapely.get_point(shapely.shortest_line(geometry, pts[close]), 0)))
+    return Obstacle(label, geometry, float(half_width), np.vstack(crossings).reshape(-1, 2))
+
+
+def obstacles(polys, lines, domain, items: list, origin: np.ndarray, background_lc: float, tol: float) -> list:
+    """The fixed lines (sizing.Obstacle, local) whose nodes the circles must not reach.
+
+    Embedded standard lines, quad-buffer lines and polygons (by their strip
+    half-width), and the zone edges inside the domain.
+    """
+    barriers = shapely.union_all([LineString(xy) for _, xy, _ in items])
+    ends = np.array([xy[k] for _, xy, _ in items for k in (0, -1)]).reshape(-1, 2)
+    end_lc = np.array([lc for _, _, lc in items for _ in (0, 1)])
+    outer = domain.boundary.buffer(tol)
     out = []
-    if points is None or points.empty or 'hex_ring' not in points or not barriers_global:
-        return out
-    union = shapely.union_all(barriers_global)
-    for _, row in points.iterrows():
-        if not row_bool(row, 'hex_ring', False) or ring_seed_coords(row):
+    for _, row in _embedded_rows(polys):
+        edges = _local(row.geometry.boundary, origin).difference(outer)
+        if not edges.is_empty:
+            out.append(_obstacle(f"edge of zone {row.get('zone_id')!r}", edges, 0.0, barriers, ends, end_lc))
+        if row_bool(row, 'quad_buffer', False):
+            out.append(_obstacle(f"quad buffer of zone {row.get('zone_id')!r}", _local(row.geometry.boundary, origin),
+                                 protection_epsilon(row, background_lc), barriers, ends, end_lc))
+    for _, row in _embedded_rows(lines):
+        if is_face_line(row):
             continue
-        lc = float(row.get('lc'))
-        if union.distance(row.geometry) < RING_CLEARANCE * lc:
-            out.append((row.get('point_id'), (float(row.geometry.x), float(row.geometry.y))))
+        half = protection_epsilon(row, background_lc) if row_bool(row, 'quad_buffer', False) else 0.0
+        for part in line_parts(row.geometry):
+            out.append(_obstacle(f"line {row.get('line_id')!r}", _local(part, origin), half, barriers, ends, end_lc))
     return out
 
 
@@ -152,20 +225,23 @@ def prepare(polys, lines, points, background_lc: float, feature_fields, gradatio
     features = np.vstack(features) if features else np.empty((0, 2))
     items = [(idx, np.asarray(part.coords, dtype=float)[:, :2] - origin, feature_lc(row, background_lc))
              for idx, row in face for part in line_parts(row.geometry)]
+    face_rows = {idx: (row.get('line_id'), row_bool(row, 'is_barrier', False)) for idx, row in face}
+    check_points_off_barriers(points, items, face_rows, origin)
     barrier_lines = planning.barrier_lines(items, standard, domain)
-    size_fn = size_function(size_sources(polys, lines, points, background_lc, feature_fields, origin),
-                            background_lc)
+    sources, ignored = size_sources(polys, lines, points, background_lc, feature_fields, origin)
+    warn_ignored_fields(ignored)
+    size_fn = size_function(sources, background_lc)
     embedded_lines = [row.geometry for _, row in _embedded_rows(lines)]
     context = Context(
         origin=origin, domain=domain, domain_global=domain_global, zones=zones, standard=standard,
-        features=features, rings=rings, size_fn=size_fn,
-        face_rows={idx: (row.get('line_id'), row_bool(row, 'is_barrier', False)) for idx, row in face},
+        features=features, rings=rings, size_fn=size_fn, face_rows=face_rows,
         events=_events(lines),
-        rings_dropped=_dropped_rings(points, [row.geometry for _, row in face]),
+        rings_dropped=_dropped_rings(points),
         constraint_lines=shapely.union_all(embedded_lines) if embedded_lines else None,
+        obstacles=obstacles(polys, lines, domain, items, origin, background_lc, planning.touch_tolerance(domain)),
     )
     plan = planning.plan(barrier_lines, standard, domain, features, size_fn, origin, gradation,
-                         math.radians(sharp_angle_deg))
+                         math.radians(sharp_angle_deg), context.obstacles)
     return plan, context
 
 
@@ -225,12 +301,59 @@ def _polish(plan, context, nodes, keep, is_free, sizes, edges, footprints, itera
     return nodes, report
 
 
+def on_fixed_lines(xy: np.ndarray, obstacles: list, reach: np.ndarray, tol: float) -> tuple:
+    """(labels, near): the obstacle each point lies on (None: none), and whether it lies within ``reach`` of
+    where that obstacle meets a barrier."""
+    labels = np.full(len(xy), None, dtype=object)
+    found = np.zeros(len(xy), dtype=bool)
+    near = np.zeros(len(xy), dtype=bool)
+    pts = shapely.points(xy)
+    for ob in obstacles:
+        on = ~found & (shapely.distance(ob.geometry, pts) <= ob.half_width + tol)
+        labels[on] = ob.label
+        near[on] = near_crossing(ob, xy[on], reach[on])
+        found |= on
+    return labels, near
+
+
+def protected_nodes(local: np.ndarray, plan, context) -> tuple:
+    """(protected, labels): nodes on a fixed line away from where it meets a barrier, and their line's label.
+
+    Only the nodes the circles or the sites could remove are looked at.
+    """
+    labels = np.full(len(local), None, dtype=object)
+    protected = np.zeros(len(local), dtype=bool)
+    candidates = np.flatnonzero(planning.nodes_to_drop(local, plan.layout, context.features, protected)[0])
+    if len(candidates) == 0 or not context.obstacles:
+        return protected, labels
+    _, nearest = cKDTree(plan.layout.sites).query(local[candidates])
+    reach = (CROSSING_REACH + 1) * planning.site_spacing(plan.layout)[nearest]
+    tol = ON_LINE_FRACTION * max(np.ptp(np.asarray(context.domain.bounds).reshape(2, 2), axis=0))
+    found, near = on_fixed_lines(local[candidates], context.obstacles, reach, tol)
+    labels[candidates] = found
+    protected[candidates] = np.not_equal(found, None) & ~near
+    return protected, labels
+
+
+def _dropped_fixed(nodes: np.ndarray, dropped: np.ndarray, labels: np.ndarray) -> list:
+    """Per fixed line, the number of its nodes in ``dropped`` and where the first one was (global)."""
+    out = {}
+    for k in np.flatnonzero(dropped):
+        entry = out.setdefault(labels[k], {'feature': labels[k], 'nodes': 0,
+                                           'location': (float(nodes[k, 0]), float(nodes[k, 1]))})
+        entry['nodes'] += 1
+    return list(out.values())
+
+
 def fit_sites(plan, context, nodes, tags, is_free, sizes, edges, footprints, iterations) -> dict:
     """Mesh arrays with the barrier sites in: nodes, tags, is_free, sizes, edges, is_site, plus counts."""
     nodes = np.asarray(nodes, dtype=float)
     tags = np.asarray(tags).astype(np.int64)
-    remove = planning.nodes_to_drop(nodes - context.origin, plan.layout, context.features)
+    local = nodes - context.origin
+    protected, labels = protected_nodes(local, plan, context)
+    remove, copies = planning.nodes_to_drop(local, plan.layout, context.features, protected)
     keep = ~remove
+    fixed = _dropped_fixed(nodes, remove & protected & ~copies, labels)
     nodes, polish_report = _polish(plan, context, nodes, keep, is_free, sizes, edges, footprints, iterations)
     sites = plan.layout.sites + context.origin
     first_tag = int(tags.max()) + 1 if len(tags) else 1
@@ -245,7 +368,8 @@ def fit_sites(plan, context, nodes, tags, is_free, sizes, edges, footprints, ite
         "sizes": np.concatenate([np.asarray(sizes, dtype=float)[keep], planning.site_spacing(plan.layout)]),
         "edges": edges,
         "is_site": np.concatenate([np.zeros(int(keep.sum()), dtype=bool), np.ones(len(sites), dtype=bool)]),
-        "removed": int(remove.sum()),
+        "removed": int((remove & ~copies).sum()),
+        "fixed": fixed,
         "polish": polish_report,
     }
 
@@ -279,26 +403,79 @@ def _corridor_entry(c, plan, context) -> dict:
             'location': (float(mid[0]), float(mid[1])), 'length': float(c.x1 - c.x0)}
 
 
+def _clean_event(e: dict) -> dict:
+    """A cleaning event for ``barrier_report``."""
+    return {'line_id': e.get('line_id'), 'kind': e['kind'], 'distance': float(e['distance']),
+            'location': (float(e['location'][0]), float(e['location'][1])), 'note': e['note']}
+
+
+def _cleaning_entries(events: list) -> dict:
+    """The ``barrier_report`` entries that come from the cleaning in ConceptualMesh."""
+    return {
+        'stubs': [{'line_id': e.get('line_id'), 'length': float(e['distance']),
+                   'location': (float(e['location'][0]), float(e['location'][1]))}
+                  for e in events if e['kind'] == 'stub'],
+        'snaps': [_clean_event(e) for e in events if e['kind'] in ('snap', 'trim', 'simplify')],
+        'noise': [_clean_event(e) for e in events if e['kind'] == 'noise'],
+        'on_boundary': [_clean_event(e) for e in events if e['kind'] == 'boundary'],
+    }
+
+
 def report(plan, context, fitted: dict) -> dict:
     """``MeshGenerator.barrier_report`` (see its docstring)."""
     origin = context.origin
-    tips, stubs = [], []
+    cleaning = _cleaning_entries(context.events)
+    tips, stubs = [], cleaning['stubs']
     for kind, length, xy, line in plan.net.uncovered:
         entry = {'line_id': context.face_rows[line][0], 'length': float(length),
                  'location': (float(xy[0] + origin[0]), float(xy[1] + origin[1]))}
         (tips if kind == "spike tip" else stubs).append(entry)
-    def clean(e):
-        return {'line_id': e.get('line_id'), 'kind': e['kind'], 'distance': float(e['distance']),
-                'location': (float(e['location'][0]), float(e['location'][1])), 'note': e['note']}
     return {
         'corridors': [_corridor_entry(c, plan, context) for c in plan.net.corridors],
         'tips': tips,
         'stubs': stubs,
-        'snaps': [clean(e) for e in context.events if e['kind'] in ('snap', 'trim', 'simplify')],
-        'noise': [clean(e) for e in context.events if e['kind'] == 'noise'],
+        'snaps': cleaning['snaps'],
+        'noise': cleaning['noise'],
+        'on_boundary': cleaning['on_boundary'],
         'rings': [{'point_id': pid, 'location': xy} for pid, xy in context.rings_dropped],
+        'fixed_nodes': fitted['fixed'],
         'repair_rounds': int(plan.rounds),
         'sites': int(len(plan.layout.sites)),
         'removed_nodes': fitted['removed'],
         'polish': fitted['polish'],
     }
+
+
+def dropped_report(lines) -> dict | None:
+    """``barrier_report`` when the cleaning dropped every barrier (None if there were none)."""
+    events = list(lines.attrs.get('dropped_barrier_events', [])) if lines is not None else []
+    if not events:
+        return None
+    return {'corridors': [], 'tips': [], **_cleaning_entries(events), 'rings': [], 'fixed_nodes': [],
+            'repair_rounds': 0, 'sites': 0, 'removed_nodes': 0, 'polish': {}}
+
+
+def report_warnings(report: dict, sharp_angle: float) -> list:
+    """One message per kind of thing the barrier construction gave up or moved (the details are in ``report``).
+
+    Noise and boundary parts are warned about one by one when ConceptualMesh cleans the lines.
+    """
+    out = []
+    if report['tips']:
+        out.append(f"{len(report['tips'])} barrier spike tip(s) sharper than sharp_angle={sharp_angle:g} degrees "
+                   f"are left without cell faces ({sum(t['length'] for t in report['tips']):.3g} of barrier "
+                   "length); see MeshGenerator.barrier_report['tips'].")
+    if report['stubs']:
+        out.append(f"{len(report['stubs'])} short dangling barrier stub(s) were dropped "
+                   f"({sum(t['length'] for t in report['stubs']):.3g} of barrier length); see "
+                   "MeshGenerator.barrier_report['stubs'].")
+    moved = [e for e in report['snaps'] if e['kind'] in ('snap', 'trim')]
+    if moved:
+        out.append(f"{len(moved)} barrier end(s) were snapped or trimmed onto another barrier or the domain "
+                   "boundary; see MeshGenerator.barrier_report['snaps'].")
+    if report['fixed_nodes']:
+        names = ", ".join(e['feature'] for e in report['fixed_nodes'])
+        out.append(f"{sum(e['nodes'] for e in report['fixed_nodes'])} mesh node(s) of {names} lie inside the "
+                   "barrier circles and were removed, so the cells there do not follow that feature; see "
+                   "MeshGenerator.barrier_report['fixed_nodes'].")
+    return out

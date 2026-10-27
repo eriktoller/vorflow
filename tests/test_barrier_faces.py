@@ -318,8 +318,8 @@ def test_hex_ring_next_to_a_barrier_is_dropped_unless_kept():
 
 def test_barrier_report_lists_every_entry():
     mg, _, _ = _mesh(_model(EXACT_CASES["t_junction"]))
-    assert set(mg.barrier_report) == {"corridors", "tips", "stubs", "snaps", "noise", "rings", "repair_rounds",
-                                      "sites", "removed_nodes", "polish"}
+    assert set(mg.barrier_report) == {"corridors", "tips", "stubs", "snaps", "noise", "on_boundary", "rings",
+                                      "fixed_nodes", "repair_rounds", "sites", "removed_nodes", "polish"}
     assert mg.barrier_report["sites"] > 0
 
 

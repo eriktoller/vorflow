@@ -6,9 +6,11 @@
    nodes and pieces, the sector plan of every node (rungs, shared, split);
    ``corridor.find_corridors``: narrow gaps that get one shared row of
    sites (their chord nodes are re-planned to take their radii from it).
-2. ``sizing.build_field``: target face length along the network from
+2. ``sizing.capped_field``: target face length along the network from
    vorflow's size field, capped by the distance to other barrier parts, the
-   boundary and feature nodes; Lipschitz; ladders; junction sizes;
+   boundary, feature nodes and fixed lines (``sizing.Obstacle``); a face
+   length below MIN_H_FRACTION x lc fails here, before anything divides by
+   it. ``sizing.grade_field``: Lipschitz; ladders; junction sizes;
    corridors.
 3. ``sites.construct``: 1D nodes, radii, closed-form sites.
 4. ``validate.defects``. A corridor that cannot be laid out, or has a
@@ -25,8 +27,10 @@ face length along a corridor (CORRIDOR_BLEND), grouped in size classes.
 
 After Gmsh (see ``MeshGenerator``): Gmsh nodes inside a circle (by
 CIRCLE_MARGIN) or within CLEAR_FRACTION x the local spacing of a site are
-removed, except feature nodes (wells, hex-ring seeds, embedded points),
-which the size caps keep outside every circle; then the sites are added.
+removed, then the sites are added. Feature nodes (wells, hex-ring seeds,
+embedded points) are never removed: the size caps keep them outside every
+circle. Nodes of fixed lines away from where they meet a barrier are
+removed only inside a circle (the caller reports those).
 
 Everything here is in the local frame (``origin`` subtracted).
 """
@@ -41,10 +45,11 @@ from scipy.spatial import cKDTree
 from shapely.geometry import LineString, MultiLineString
 
 from . import corridor as corridors
+from .._features import HEX_RING_CLEARANCE
 from .lines import BarrierLine, must_keep
 from .network import SHARP_ANGLE, Network, build_network, replan_chord_nodes
 from .sites import Layout, construct
-from .sizing import GRADATION, SizeField, build_field
+from .sizing import GRADATION, SizeField, capped_field, grade_field
 from .validate import all_finite, defects
 
 REPAIR_ROUNDS = 8
@@ -60,7 +65,6 @@ CORRIDOR_BLEND = 0.0     # ... along a corridor, whose outer cells should match 
 EMBED_GAP = 0.05         # x spacing: sites this close to an edge, line or feature are not Gmsh points
 CIRCLE_MARGIN = 0.02     # Gmsh nodes within R (1 + CIRCLE_MARGIN) of a circle centre are removed
 CLEAR_FRACTION = 0.5     # ... and those within this x the local spacing of a site
-RING_CLEARANCE = 2.0     # x resolution: sites this close to a kept hex-ring well are not Gmsh points
 
 
 class BarrierMeshError(ValueError):
@@ -120,7 +124,8 @@ def check_floor(net: Network, field: SizeField, origin: np.ndarray) -> None:
     if tiny.any():
         k = int(np.argmin(field.h / lc))
         _fail(f"the faces would have to be {field.h[k]:.3g} long ({field.h[k] / lc[k]:.2g} x lc); two barrier "
-              "parts, a barrier and the boundary, or a barrier and a well are that close", field.xy[tiny], origin)
+              "parts, a barrier and the boundary, or a barrier and a well, an embedded line or a zone edge are "
+              "that close", field.xy[tiny], origin)
 
 
 def repair_bounds(field: SizeField, layout: Layout, bad: list, refine: np.ndarray | None) -> np.ndarray:
@@ -159,13 +164,19 @@ def _troubled(net: Network, field: SizeField, bad: list) -> set:
 
 
 def plan(lines: list, standard: list, domain, features: np.ndarray, size_fn, origin: np.ndarray,
-         gradation: float = GRADATION, sharp_angle: float = SHARP_ANGLE) -> BarrierPlan:
-    """A barrier construction that passes the validity gate (module docstring), or BarrierMeshError."""
+         gradation: float = GRADATION, sharp_angle: float = SHARP_ANGLE, obstacles: list = ()) -> BarrierPlan:
+    """A barrier construction that passes the validity gate (module docstring), or BarrierMeshError.
+
+    ``obstacles`` are the fixed lines (``sizing.Obstacle``) whose nodes the circles must not reach.
+    """
     skip = set()
+    tol = touch_tolerance(domain)
     net = network_with_corridors(lines, standard, domain, features, size_fn, sharp_angle, skip)
     refine, first, rounds = None, None, 0
     while True:
-        field = build_field(net, size_fn, domain, features, refine, gradation)
+        field = capped_field(net, size_fn, domain, features, obstacles, refine, tol)
+        check_floor(net, field, origin)
+        field = grade_field(net, field, gradation)
         if field.failed:
             skip |= set(field.failed)
             net = network_with_corridors(lines, standard, domain, features, size_fn, sharp_angle, skip)
@@ -225,7 +236,7 @@ def embeddable(sites: np.ndarray, spacing: np.ndarray, edges, features: np.ndarr
     """Sites that can be Gmsh points: clear of polygon edges and standard lines (``edges``), features and rings.
 
     ``rings`` holds ``(xy, resolution)`` of the kept hex-ring wells: Gmsh
-    would split a ring with a point closer than RING_CLEARANCE x resolution.
+    would split a ring with a point closer than HEX_RING_CLEARANCE x resolution.
     """
     ok = np.ones(len(sites), dtype=bool)
     if edges is not None and not edges.is_empty:
@@ -234,19 +245,27 @@ def embeddable(sites: np.ndarray, spacing: np.ndarray, edges, features: np.ndarr
         d, _ = cKDTree(features).query(sites)
         ok &= d > EMBED_GAP * spacing
     for xy, res in rings:
-        ok &= np.hypot(*(sites - xy).T) >= RING_CLEARANCE * res
+        ok &= np.hypot(*(sites - xy).T) >= HEX_RING_CLEARANCE * res
     return ok
 
 
-def nodes_to_drop(nodes: np.ndarray, layout: Layout, features: np.ndarray) -> np.ndarray:
-    """Mask of mesh nodes to remove: in a circle, crowding a site, or a site itself; never a feature node."""
+def nodes_to_drop(nodes: np.ndarray, layout: Layout, features: np.ndarray, protected: np.ndarray) -> tuple:
+    """(remove, copies) masks of mesh nodes: remove those in a circle, crowding a site or on a site; ``copies``
+    are those on a site (Gmsh's copies of the embedded sites).
+
+    Feature nodes are never removed; ``protected`` nodes (on fixed lines)
+    only in a circle or on a site, not for crowding.
+    """
     scale = 1e-9 * max(1.0, float(np.abs(nodes).max()) if len(nodes) else 1.0)
     spacing = site_spacing(layout)
     d_site, nearest = cKDTree(layout.sites).query(nodes)
-    remove = (d_site < CLEAR_FRACTION * spacing[nearest]) | (d_site <= scale)
+    copies = d_site <= scale
+    remove = copies | ((d_site < CLEAR_FRACTION * spacing[nearest]) & ~protected)
     for idx in cKDTree(nodes).query_ball_point(layout.xy, layout.radius * (1 + CIRCLE_MARGIN)):
         remove[idx] = True
     if len(features):
         d_feat, _ = cKDTree(features).query(nodes)
-        remove &= ~(d_feat <= 1e-6 * max(1.0, float(spacing.min())))
-    return remove
+        feature = d_feat <= 1e-6 * max(1.0, float(spacing.min()))
+        remove &= ~feature
+        copies &= ~feature
+    return remove, copies

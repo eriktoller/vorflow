@@ -19,7 +19,13 @@
      the boundary;
    - feature nodes (wells, hex-ring seeds, embedded points): ``h <=
      FEATURE_CAP x e`` (they stay outside every circle, sites keep 0.4 e
-     away).
+     away);
+   - fixed lines (``Obstacle``: embedded standard lines, internal zone
+     edges, quad-buffer strips): ``h <= OBSTACLE_CAP x e``, e the distance
+     to the line (beyond a strip's half-width), so their Gmsh nodes stay
+     outside the circles too; except within CROSSING_REACH x h of where the
+     line meets a barrier (the crossing's own plan handles it) and on the
+     line itself.
 4. A piece shorter than h is a source of ``L^(1 - SHORT_BLEND) h^SHORT_BLEND``
    (between its own length and h; upr's size_blend), so one short
    digitised piece does not shrink everything around it.
@@ -38,6 +44,7 @@
 from __future__ import annotations
 
 import dataclasses
+import itertools
 import math
 
 import numpy as np
@@ -55,9 +62,12 @@ GRADATION = 0.3
 BARRIER_CAP = 0.49 * math.sqrt(2.0)
 BOUNDARY_CAP = 1.6
 FEATURE_CAP = 0.85
+OBSTACLE_CAP = FEATURE_CAP
+CROSSING_REACH = 4.0     # x h: no obstacle cap this close to where the obstacle meets a barrier
 GEODESIC_RATIO = 2.0
 PROTECT_FRACTION = 1.5   # x h at the node: protection radius of a hard node
 CAP_REACH = 1.5          # x h: caps are only looked for this far
+PAIR_CHUNK = 20000       # samples per neighbour query in ``near_pairs``
 SHORT_BLEND = 0.5
 JUNCTION_PASSES = 3
 DEFAULT_GROWTH = 1.2
@@ -93,6 +103,15 @@ def size_function(sources: list, background_lc: float):
 # ---------------------------------------------------------------------------
 # Samples
 # ---------------------------------------------------------------------------
+@dataclasses.dataclass
+class Obstacle:
+    """A fixed line whose Gmsh nodes the barrier circles must not reach (local coordinates)."""
+    label: str
+    geometry: object         # the line (or a zone's inner edges)
+    half_width: float        # nodes lie up to this far from it (quad-buffer strips), else 0
+    crossings: np.ndarray    # (k, 2) points where it meets the barrier lines
+
+
 @dataclasses.dataclass
 class SizeField:
     """Target spacing h at samples along every piece, plus the ladders laid out from it."""
@@ -155,19 +174,39 @@ def node_distances(net: Network, limit: float) -> np.ndarray:
     return dijkstra(graph, directed=False, limit=limit)
 
 
+def near_pairs(field: SizeField, h0: np.ndarray, chunk: int = PAIR_CHUNK) -> tuple:
+    """(i, j), i < j, of samples on different pieces closer than CAP_REACH x the larger of their h0.
+
+    Each sample looks only as far as its own reach, so the memory grows
+    with the number of close pairs, not with the coarsest h0 over the finest
+    sample spacing (a single global radius did).
+    """
+    tree = cKDTree(field.xy)
+    radius = CAP_REACH * h0
+    rows, cols = [], []
+    for start in range(0, len(h0), chunk):
+        stop = min(start + chunk, len(h0))
+        hits = tree.query_ball_point(field.xy[start:stop], radius[start:stop], return_sorted=False)
+        counts = np.fromiter(map(len, hits), dtype=np.int64, count=len(hits))
+        j = np.fromiter(itertools.chain.from_iterable(hits), dtype=np.int64, count=int(counts.sum()))
+        i = np.repeat(np.arange(start, stop), counts)
+        keep = field.piece[i] != field.piece[j]
+        rows.append(np.minimum(i[keep], j[keep]))
+        cols.append(np.maximum(i[keep], j[keep]))
+    key = np.unique(np.concatenate(rows) * len(h0) + np.concatenate(cols))
+    return key // len(h0), key % len(h0)
+
+
 def barrier_cap(net: Network, field: SizeField, h0: np.ndarray, rho: np.ndarray, extents: list) -> np.ndarray:
     """Per sample: BARRIER_CAP x distance to the nearest network point that is far along the network."""
     lengths = piece_lengths(net)
     reach = CAP_REACH * float(h0.max())
     graph = node_distances(net, GEODESIC_RATIO * reach + 2 * float(lengths.max()))
-    pairs = cKDTree(field.xy).query_pairs(reach, output_type="ndarray")
+    i, j = near_pairs(field, h0)
     cap = np.full(len(h0), np.inf)
-    if len(pairs) == 0:
+    if len(i) == 0:
         return cap
-    i, j = pairs[:, 0], pairs[:, 1]
     pi, pj = field.piece[i], field.piece[j]
-    keep = pi != pj
-    i, j, pi, pj = i[keep], j[keep], pi[keep], pj[keep]
     e = np.hypot(*(field.xy[i] - field.xy[j]).T)
     keep = e < CAP_REACH * np.maximum(h0[i], h0[j])
     i, j, pi, pj, e = i[keep], j[keep], pi[keep], pj[keep], e[keep]
@@ -224,6 +263,25 @@ def feature_cap(field: SizeField, features: np.ndarray) -> np.ndarray:
         return np.full(len(field.s), np.inf)
     d, _ = cKDTree(features).query(field.xy)
     return FEATURE_CAP * d
+
+
+def near_crossing(obstacle: Obstacle, xy: np.ndarray, reach: np.ndarray) -> np.ndarray:
+    """Mask of the points ``xy`` closer than ``reach`` to where ``obstacle`` meets a barrier."""
+    if len(obstacle.crossings) == 0:
+        return np.zeros(len(xy), dtype=bool)
+    d, _ = cKDTree(obstacle.crossings).query(xy)
+    return d < reach
+
+
+def obstacle_cap(field: SizeField, obstacles: list, h0: np.ndarray, tol: float) -> np.ndarray:
+    """Per sample: OBSTACLE_CAP x distance to the nearest obstacle, away from its crossings (module docstring)."""
+    cap = np.full(len(field.s), np.inf)
+    pts = shapely.points(field.xy)
+    for ob in obstacles:
+        e = np.maximum(shapely.distance(ob.geometry, pts) - ob.half_width, 0.0)
+        exempt = near_crossing(ob, field.xy, CROSSING_REACH * h0) | (e <= tol)
+        cap = np.minimum(cap, np.where(exempt, np.inf, OBSTACLE_CAP * e))
+    return cap
 
 
 # ---------------------------------------------------------------------------
@@ -377,9 +435,12 @@ def lay_corridors(net: Network, field: SizeField) -> None:
             field.h[sel[inside]] = np.diff(t)[k[inside]]
 
 
-def build_field(net: Network, size_fn, domain, features: np.ndarray, refine: np.ndarray | None = None,
-                gradation: float = GRADATION) -> SizeField:
-    """The target spacing along the network (module docstring), with ``refine`` (per-sample upper bounds) applied."""
+def capped_field(net: Network, size_fn, domain, features: np.ndarray, obstacles: list = (),
+                 refine: np.ndarray | None = None, tol: float = 0.0) -> SizeField:
+    """Samples with h from the size field and the caps (steps 1-4 of the module docstring), not yet graded.
+
+    ``refine`` holds per-sample upper bounds of h (repair rounds).
+    """
     field = samples(net)
     lc = net.piece_lc[field.piece]
     h0 = np.minimum(lc, size_fn(field.xy))
@@ -390,13 +451,20 @@ def build_field(net: Network, size_fn, domain, features: np.ndarray, refine: np.
         for n in rung.nodes:
             rho[n] = max(rho[n], extent)
     h = np.minimum.reduce([h0, barrier_cap(net, field, h0, rho, extents), boundary_cap(net, field, domain, rho),
-                           feature_cap(field, features)])
+                           feature_cap(field, features), obstacle_cap(field, obstacles, h0, tol)])
     lengths = piece_lengths(net)[field.piece]
     short = lengths < h
     h = np.where(short, lengths ** (1 - SHORT_BLEND) * h ** SHORT_BLEND, h)
     if refine is not None:
         h = np.minimum(h, refine)
-    field.h = lipschitz(field, h, gradation)
+    field.h = h
+    return field
+
+
+def grade_field(net: Network, field: SizeField, gradation: float = GRADATION) -> SizeField:
+    """``field`` graded (steps 5-7 of the module docstring), in place; h must be positive."""
+    assert (field.h > 0).all(), "barrier face lengths must be positive before grading"
+    field.h = lipschitz(field, field.h, gradation)
     lay_ladders(net, field, gradation)
     lay_corridors(net, field)
     field.h = lipschitz(field, field.h, gradation)
@@ -406,3 +474,4 @@ def build_field(net: Network, size_fn, domain, features: np.ndarray, refine: np.
     lay_ladders(net, field, gradation)
     lay_corridors(net, field)
     return field
+

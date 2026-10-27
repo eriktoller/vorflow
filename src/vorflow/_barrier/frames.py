@@ -47,7 +47,7 @@ from .._log import warn_user
 from ..buffer import protection_epsilon
 from . import pipeline as planning
 from . import polish
-from .sizing import CROSSING_REACH, FEATURE_CAP, Obstacle, near_crossing, size_function
+from .sizing import FEATURE_CAP, Obstacle, near_crossing, size_function
 
 logger = logging.getLogger(__name__)
 
@@ -161,13 +161,14 @@ def check_points_off_barriers(points, items: list, face_rows: dict, origin: np.n
 
 
 def _obstacle(label: str, geometry, half_width: float, barriers, ends: np.ndarray, end_lc: np.ndarray) -> Obstacle:
-    """An Obstacle whose crossings are where it meets ``barriers`` and the barrier ends within END_REACH x lc."""
-    crossings = [shapely.get_coordinates(shapely.intersection(geometry, barriers))]
+    """An Obstacle crossing ``barriers`` where they intersect, next to the barrier ``ends`` within END_REACH x lc."""
+    crossings = shapely.get_coordinates(shapely.intersection(geometry, barriers))
+    near_ends = np.empty((0, 2))
     if len(ends):
         pts = shapely.points(ends)
         close = shapely.distance(geometry, pts) <= END_REACH * end_lc
-        crossings.append(shapely.get_coordinates(shapely.get_point(shapely.shortest_line(geometry, pts[close]), 0)))
-    return Obstacle(label, geometry, float(half_width), np.vstack(crossings).reshape(-1, 2))
+        near_ends = shapely.get_coordinates(shapely.get_point(shapely.shortest_line(geometry, pts[close]), 0))
+    return Obstacle(label, geometry, float(half_width), crossings.reshape(-1, 2), near_ends.reshape(-1, 2))
 
 
 def obstacles(polys, lines, domain, items: list, origin: np.ndarray, background_lc: float, tol: float) -> list:
@@ -301,9 +302,9 @@ def _polish(plan, context, nodes, keep, is_free, sizes, edges, footprints, itera
     return nodes, report
 
 
-def on_fixed_lines(xy: np.ndarray, obstacles: list, reach: np.ndarray, tol: float) -> tuple:
-    """(labels, near): the obstacle each point lies on (None: none), and whether it lies within ``reach`` of
-    where that obstacle meets a barrier."""
+def on_fixed_lines(xy: np.ndarray, obstacles: list, h: np.ndarray, tol: float) -> tuple:
+    """(labels, near): the obstacle each point lies on (None: none), and whether that obstacle meets a barrier
+    there (``sizing.near_crossing`` with a margin of one ``h``: the reach of a circle centred inside it)."""
     labels = np.full(len(xy), None, dtype=object)
     found = np.zeros(len(xy), dtype=bool)
     near = np.zeros(len(xy), dtype=bool)
@@ -311,7 +312,7 @@ def on_fixed_lines(xy: np.ndarray, obstacles: list, reach: np.ndarray, tol: floa
     for ob in obstacles:
         on = ~found & (shapely.distance(ob.geometry, pts) <= ob.half_width + tol)
         labels[on] = ob.label
-        near[on] = near_crossing(ob, xy[on], reach[on])
+        near[on] = near_crossing(ob, xy[on], h[on], extra=1.0)
         found |= on
     return labels, near
 
@@ -320,16 +321,20 @@ def protected_nodes(local: np.ndarray, plan, context) -> tuple:
     """(protected, labels): nodes on a fixed line away from where it meets a barrier, and their line's label.
 
     Only the nodes the circles or the sites could remove are looked at.
+    ``h`` there is the size the sizing started from (the barrier's lc,
+    capped by vorflow's size field), as in ``sizing.obstacle_cap``.
     """
     labels = np.full(len(local), None, dtype=object)
     protected = np.zeros(len(local), dtype=bool)
     candidates = np.flatnonzero(planning.nodes_to_drop(local, plan.layout, context.features, protected)[0])
     if len(candidates) == 0 or not context.obstacles:
         return protected, labels
-    _, nearest = cKDTree(plan.layout.sites).query(local[candidates])
-    reach = (CROSSING_REACH + 1) * planning.site_spacing(plan.layout)[nearest]
+    layout = plan.layout
+    mids = 0.5 * (layout.xy[layout.segments[:, 0]] + layout.xy[layout.segments[:, 1]])
+    _, nearest = cKDTree(mids).query(local[candidates])
+    h0 = np.minimum(plan.net.piece_lc[layout.seg_piece[nearest]], context.size_fn(local[candidates]))
     tol = ON_LINE_FRACTION * max(np.ptp(np.asarray(context.domain.bounds).reshape(2, 2), axis=0))
-    found, near = on_fixed_lines(local[candidates], context.obstacles, reach, tol)
+    found, near = on_fixed_lines(local[candidates], context.obstacles, h0, tol)
     labels[candidates] = found
     protected[candidates] = np.not_equal(found, None) & ~near
     return protected, labels

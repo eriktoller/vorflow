@@ -23,9 +23,10 @@
    - fixed lines (``Obstacle``: embedded standard lines, internal zone
      edges, quad-buffer strips): ``h <= OBSTACLE_CAP x e``, e the distance
      to the line (beyond a strip's half-width), so their Gmsh nodes stay
-     outside the circles too; except within CROSSING_REACH x h of where the
-     line meets a barrier (the crossing's own plan handles it) and on the
-     line itself.
+     outside the circles too; except on the line itself, within
+     CROSSING_REACH x h of where it crosses a barrier (a line crossing at
+     10 degrees is that far within h of it; the crossing's own plan handles
+     it) and within PROTECT_FRACTION x h of a barrier end next to it.
 4. A piece shorter than h is a source of ``L^(1 - SHORT_BLEND) h^SHORT_BLEND``
    (between its own length and h; upr's size_blend), so one short
    digitised piece does not shrink everything around it.
@@ -63,7 +64,7 @@ BARRIER_CAP = 0.49 * math.sqrt(2.0)
 BOUNDARY_CAP = 1.6
 FEATURE_CAP = 0.85
 OBSTACLE_CAP = FEATURE_CAP
-CROSSING_REACH = 4.0     # x h: no obstacle cap this close to where the obstacle meets a barrier
+CROSSING_REACH = 7.0     # x h: no obstacle cap this close to where the obstacle crosses a barrier
 GEODESIC_RATIO = 2.0
 PROTECT_FRACTION = 1.5   # x h at the node: protection radius of a hard node
 CAP_REACH = 1.5          # x h: caps are only looked for this far
@@ -110,6 +111,7 @@ class Obstacle:
     geometry: object         # the line (or a zone's inner edges)
     half_width: float        # nodes lie up to this far from it (quad-buffer strips), else 0
     crossings: np.ndarray    # (k, 2) points where it meets the barrier lines
+    ends: np.ndarray         # (k, 2) points of it next to a barrier end
 
 
 @dataclasses.dataclass
@@ -265,12 +267,18 @@ def feature_cap(field: SizeField, features: np.ndarray) -> np.ndarray:
     return FEATURE_CAP * d
 
 
-def near_crossing(obstacle: Obstacle, xy: np.ndarray, reach: np.ndarray) -> np.ndarray:
-    """Mask of the points ``xy`` closer than ``reach`` to where ``obstacle`` meets a barrier."""
-    if len(obstacle.crossings) == 0:
+def _within(points: np.ndarray, xy: np.ndarray, reach: np.ndarray) -> np.ndarray:
+    """Mask of ``xy`` closer than ``reach`` to one of ``points``."""
+    if len(points) == 0 or len(xy) == 0:
         return np.zeros(len(xy), dtype=bool)
-    d, _ = cKDTree(obstacle.crossings).query(xy)
-    return d < reach
+    return cKDTree(points).query(xy)[0] < reach
+
+
+def near_crossing(obstacle: Obstacle, xy: np.ndarray, h: np.ndarray, extra: float = 0.0) -> np.ndarray:
+    """Mask of the points ``xy`` where ``obstacle`` meets a barrier: within (CROSSING_REACH + extra) x ``h`` of
+    a crossing, or (PROTECT_FRACTION + extra) x ``h`` of a barrier end next to it."""
+    return _within(obstacle.crossings, xy, (CROSSING_REACH + extra) * h) | \
+        _within(obstacle.ends, xy, (PROTECT_FRACTION + extra) * h)
 
 
 def obstacle_cap(field: SizeField, obstacles: list, h0: np.ndarray, tol: float) -> np.ndarray:
@@ -279,7 +287,7 @@ def obstacle_cap(field: SizeField, obstacles: list, h0: np.ndarray, tol: float) 
     pts = shapely.points(field.xy)
     for ob in obstacles:
         e = np.maximum(shapely.distance(ob.geometry, pts) - ob.half_width, 0.0)
-        exempt = near_crossing(ob, field.xy, CROSSING_REACH * h0) | (e <= tol)
+        exempt = near_crossing(ob, field.xy, h0) | (e <= tol)
         cap = np.minimum(cap, np.where(exempt, np.inf, OBSTACLE_CAP * e))
     return cap
 

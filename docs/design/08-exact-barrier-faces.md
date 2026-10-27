@@ -198,10 +198,12 @@ standard line.
 
 | set | cut cells | faces of several edges | mean worst compactness next to barriers | median cell ratio |
 |---|---|---|---|---|
-| design (19) | 48 → 0 | 529 → 0 | 0.59 → 0.76 | 1.15 → 0.94 |
-| held-out (43) | 27 → 0 | 2692 → 0 | 0.49 → 0.66 | 1.15 → 0.97 |
+| design (19) | 48 → 0 | 529 → 0 | 0.59 → 0.76 | 1.15 → 0.93 |
+| held-out (43) | 27 → 0 | 2692 → 0 | 0.49 → 0.66 | 1.15 → 0.96 |
 | adversarial (11) | 3 → 0 | 0 → 0 | 0.55 → 0.73 | 1.18 → 0.93 |
 
+These are with the polish limited to the nodes near the barriers; polishing
+the whole domain gave the same compactness and cell ratios of 0.94 and 0.97.
 In the MODFLOW 6 check on the design set, the largest head RMSE fell from
 0.0192 to 0.0180. Spikes of 10 and 15 degrees in the held-out and adversarial
 sets each leave 7.2 m of tip without faces (0.9 x their 8 m resolution), as

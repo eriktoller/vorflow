@@ -9,6 +9,16 @@ and the project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- `ConceptualMesh.check(background_lc=None)` reports input defects that tend
+  to produce bad Voronoi cells, before meshing and without Gmsh: short
+  segments, close vertices (including a line crossing a polygon edge beside a
+  vertex), line ends and points that just miss another feature, sliver
+  polygons and narrow gaps. Each is measured against the local mesh size `h`
+  as `ratio = distance / h` and graded `"error"` or `"warning"`; one defect
+  site gives one row of a GeoDataFrame. Only embedded features are checked,
+  on the cleaned features before densification. The registered features and
+  earlier `generate()` results are left unchanged. See "Checking inputs
+  before meshing" in the user guide.
 - The release workflow creates the GitHub Release for each final tag once it
   is on PyPI, with notes from the tag's changelog section and the wheel and
   sdist attached (`scripts/release_notes.py`). A tag without a changelog

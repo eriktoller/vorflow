@@ -11,6 +11,7 @@ from ._log import set_verbosity
 # Call vorflow.set_verbosity(0) to silence everything except warnings/errors.
 set_verbosity(1)
 
+from ._barrier import BarrierMeshError
 from .blueprint import ConceptualMesh
 from .engine import MeshGenerator
 from .tessellator import VoronoiTessellator
@@ -24,4 +25,4 @@ from .fields import (
 __all__ = ["ConceptualMesh", "MeshGenerator", "VoronoiTessellator",
            "MeshField", "ThresholdField", "ExponentialField",
            "GeometricGrowthField",
-           "set_verbosity"]
+           "BarrierMeshError", "set_verbosity"]

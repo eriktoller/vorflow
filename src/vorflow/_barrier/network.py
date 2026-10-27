@@ -122,7 +122,7 @@ class Network:
     plans: list
     rungs: list
     lines: list          # the barrier polylines the faces follow (after stubs and spike tips)
-    uncovered: list      # (kind, length, xy) of barrier parts left without faces
+    uncovered: list      # (kind, length, xy, line_id) of barrier parts left without faces
     corridors: list = dataclasses.field(default_factory=list)  # see ``corridor``
 
 
@@ -185,7 +185,7 @@ def drop_stubs(lines: list, domain, tol: float, uncovered: list) -> list:
                 ie, iw = _node_id(hard, e), _node_id(hard, w)
                 length = float(np.hypot(*np.subtract(e, w)))
                 if degree[ie] == 1 and not boundary[ie] and degree[iw] >= 3 and length < STUB_FRACTION * b.lc:
-                    uncovered.append(("stub", length, np.array(e)))
+                    uncovered.append(("stub", length, np.array(e), b.line_id))
                     b.xy = b.xy[1:] if end == 0 else b.xy[:-1]
                     b.keep = b.keep[1:] if end == 0 else b.keep[:-1]
                     changed = True
@@ -234,7 +234,8 @@ def truncate_spikes(lines: list, standard: list, domain, tol: float, uncovered: 
         a, b = hard[v] + t0 * u[0], hard[v] + t0 * u[1]
         cut[tuple(hard[v])] = {tuple(hard[others[0]]): a, tuple(hard[others[1]]): b}
         spikes.append((hard[v].copy(), u[0], u[1], theta, t0, a, b))
-        uncovered.append(("spike tip", 2 * t0, hard[v].copy()))
+        apex_line = next(b.line_id for b in lines if (b.xy == hard[v]).all(axis=1).any())
+        uncovered.append(("spike tip", 2 * t0, hard[v].copy(), apex_line))
     if not cut:
         return lines, spikes
     out = []

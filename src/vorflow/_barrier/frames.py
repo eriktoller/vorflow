@@ -283,8 +283,8 @@ def report(plan, context, fitted: dict) -> dict:
     """``MeshGenerator.barrier_report`` (see its docstring)."""
     origin = context.origin
     tips, stubs = [], []
-    for kind, length, xy in plan.net.uncovered:
-        entry = {'line_id': context.face_rows[_nearest_line(xy, plan)][0], 'length': float(length),
+    for kind, length, xy, line in plan.net.uncovered:
+        entry = {'line_id': context.face_rows[line][0], 'length': float(length),
                  'location': (float(xy[0] + origin[0]), float(xy[1] + origin[1]))}
         (tips if kind == "spike tip" else stubs).append(entry)
     def clean(e):

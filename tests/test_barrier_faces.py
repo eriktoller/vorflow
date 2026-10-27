@@ -155,9 +155,9 @@ def _assert_exact(mg: MeshGenerator, vt: VoronoiTessellator, grid) -> None:
     assert not on.duplicated(["cell_id_1", "cell_id_2"]).any()
     assert on.geometry.length.sum() == pytest.approx(_barriers(mg).length, rel=1e-6)
     # ... which are the cleaned input lines less what the report says was left without faces
-    # (merged acute wedges move the lines a little; see test_acute_wedges_are_merged_over_a_short_reach).
+    # (merged wedges and parallel stretches move the lines a little and share faces; their own tests check them).
     report = mg.barrier_report
-    if report["collapsed"]:
+    if report["collapsed"] or report["merged"]:
         return
     uncovered = sum(entry["length"] for entry in report["tips"] + report["stubs"])
     assert on.geometry.length.sum() == pytest.approx(_cleaned_barrier_length(vt.cm) - uncovered, rel=1e-6)
@@ -362,8 +362,9 @@ def test_hex_ring_next_to_a_barrier_is_dropped_unless_kept():
 
 def test_barrier_report_lists_every_entry():
     mg, _, _ = _mesh(_model(EXACT_CASES["t_junction"]))
-    assert set(mg.barrier_report) == {"corridors", "collapsed", "tips", "stubs", "snaps", "noise", "on_boundary",
-                                      "rings", "fixed_nodes", "repair_rounds", "sites", "removed_nodes", "polish"}
+    assert set(mg.barrier_report) == {"corridors", "merged", "collapsed", "tips", "stubs", "snaps", "noise",
+                                      "on_boundary", "rings", "fixed_nodes", "repair_rounds", "sites",
+                                      "removed_nodes", "polish"}
     assert mg.barrier_report["sites"] > 0
 
 
@@ -813,3 +814,62 @@ def test_polish_moves_only_the_nodes_near_the_barrier():
     far = gap > frames.POLISH_BAND * fixed.node_sizes
     assert far.sum() > len(fixed.nodes) / 2
     assert np.array_equal(fixed.nodes[far], polished.nodes[far])  # bit-identical to Gmsh's
+
+
+# ---------------------------------------------------------------------------
+# Close parallel barriers: below 0.25 x resolution they share one line of faces
+# ---------------------------------------------------------------------------
+def _parallel(gap: float, x0: float = 0.0, x1: float = 300.0) -> list:
+    """Two barriers ``gap`` apart, from x0 to x1 (the domain boundary by default)."""
+    return [([(x0, 150), (x1, 150)], B), ([(x0, 150 + gap), (x1, 150 + gap)], B)]
+
+
+@pytest.mark.parametrize("gap", [0.5, 1.0])
+def test_close_parallel_barriers_are_merged_onto_one_line_of_faces(gap):
+    with pytest.warns(UserWarning, match="merged onto their midline.*combined properties"):
+        mg, vt, grid = _mesh(_model(_parallel(gap)))
+    _assert_exact(mg, vt, grid)
+    [merge] = mg.barrier_report["merged"]
+    assert sorted(merge["line_ids"]) == ["line0", "line1"] and merge["length"] == pytest.approx(300.0)
+    assert merge["gap"] == pytest.approx(gap) and merge["deviation"] <= gap / 2 + 1e-9
+    assert mg.barrier_report["corridors"] == []
+    # Both lines follow the midline, from boundary to boundary, so every face on it maps to both IDs.
+    rows = mg.barrier_lines.set_index("line_id").geometry
+    assert rows["line0"].equals(rows["line1"])
+    assert rows["line0"].hausdorff_distance(LineString([(0, 150 + gap / 2), (300, 150 + gap / 2)])) < 1e-9
+    on, _ = _barrier_faces(grid, mg, 1e-6)
+    for line in rows:
+        assert (shapely.distance(on.geometry.to_numpy(), line) < 1e-6).all()
+    assert _sealed(mg, grid, (150, 100), (150, 200))
+    # The pair costs about as many cells as one barrier.
+    single, _, single_grid = _mesh(_model(_parallel(gap)[:1]))
+    assert len(grid) <= 1.05 * len(single_grid)
+
+
+def test_merged_stretch_lets_both_barriers_go_on_where_they_part():
+    lines = [([(40, 150), (260, 150)], B), ([(40, 151), (150, 151), (260, 190)], B)]
+    with pytest.warns(UserWarning, match="merged onto their midline"):
+        mg, vt, grid = _mesh(_model(lines))
+    _assert_exact(mg, vt, grid)
+    [merge] = mg.barrier_report["merged"]
+    bound = 0.125 * LC  # half the merge gap, reached where the lines part
+    assert merge["deviation"] <= bound + 1e-9
+    rows = mg.barrier_lines.set_index("line_id").geometry
+    for line_id, (coords, _) in zip(["line0", "line1"], lines):
+        assert rows[line_id].hausdorff_distance(LineString(coords)) <= bound + 1e-6
+    assert rows["line0"].coords[-1] == (260.0, 150.0) and rows["line1"].coords[-1] == (260.0, 190.0)
+
+
+@pytest.mark.parametrize("gap, warned", [(2.0, True), (4.0, False)])
+def test_parallel_barriers_at_or_above_the_merge_gap_keep_their_corridor(gap, warned):
+    with warnings.catch_warnings(record=True) as record:
+        warnings.simplefilter("always")
+        mg, vt, grid = _mesh(_model(_parallel(gap, 40.0, 260.0)))
+    _assert_exact(mg, vt, grid)
+    assert mg.barrier_report["merged"] == []
+    [corridor] = mg.barrier_report["corridors"]
+    assert corridor["cells"] > corridor["length"] / LC and corridor["resolution"] == LC
+    dense = [w for w in record if "row of cells shorter than" in str(w.message)]
+    assert len(dense) == int(warned)
+    if warned:
+        assert f"{corridor['cells']} cells" in str(dense[0].message)

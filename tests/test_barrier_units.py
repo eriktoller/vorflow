@@ -261,7 +261,8 @@ def test_removed_fixed_line_nodes_are_counted_per_line_and_warned_about():
     fixed = frames._dropped_fixed(nodes, dropped, labels)
     assert fixed == [{"feature": "line 'r'", "nodes": 2, "location": (0.0, 0.0)},
                      {"feature": "edge of zone 2", "nodes": 1, "location": (3.0, 0.0)}]
-    report = {"collapsed": [], "tips": [], "stubs": [], "snaps": [], "fixed_nodes": fixed}
+    report = {"merged": [], "corridors": [], "collapsed": [], "tips": [], "stubs": [], "snaps": [],
+              "fixed_nodes": fixed}
     [message] = frames.report_warnings(report, 18.0)
     assert message.startswith("3 mesh node(s) of line 'r', edge of zone 2 lie inside the barrier circles")
 

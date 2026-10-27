@@ -268,7 +268,7 @@ def test_non_finite_sites_are_a_barrier_mesh_error(monkeypatch):
 
 def test_faces_below_the_floor_raise_before_grading():
     with pytest.raises(pipeline.BarrierMeshError, match="faces would have to be"):
-        _plan([[(40, 150), (260, 150)], [(40, 150.01), (260, 150.01)]])
+        _plan([[(40, 150), (260, 150)], [(150, 270), (150, 150.01)]])
 
 
 @pytest.mark.parametrize("coords, features, cause", [
@@ -438,3 +438,25 @@ def test_clean_noise_equals_the_repeated_scan(lc):
         assert (len(noise) == 1) == (dropped > 0)
         if dropped:
             assert noise[0]["distance"] == largest and noise[0]["location"] == tuple(map(float, where))
+
+
+# ---------------------------------------------------------------------------
+# parallel: close parallel stretches merged onto their midline
+# ---------------------------------------------------------------------------
+def test_parallel_merge_moves_both_lines_onto_their_midline():
+    net = _network([[(40, 150), (260, 150)], [(40, 151), (260, 151)]])
+    [merge] = net.merged
+    assert merge["gap"] == pytest.approx(1.0) and merge["length"] == pytest.approx(220.0)
+    assert np.array_equal(net.lines[0].xy, net.lines[1].xy)
+    assert np.allclose(net.lines[0].xy[:, 1], 150.5)
+
+
+@pytest.mark.parametrize("coords", [
+    [[(40, 150), (260, 150)], [(40, 152), (260, 152)]],                  # at the merge gap: a corridor
+    [[(40, 150), (260, 150)], [(40, 151), (45, 151)]],                   # shorter than MIN_STRETCH x lc
+    [[(40, 150), (260, 150)], [(40, 150.5), (150, 150), (260, 150.5)]],  # touching: a junction
+    [[(40, 150), (260, 150)], [(40, 151), (260, 151)], [(150, 100), (150, 200)]],  # crossed by a third line
+], ids=["gap", "short", "touching", "crossed"])
+def test_parallel_merge_leaves_what_it_must_not_move(coords):
+    net = _network(coords)
+    assert net.merged == []

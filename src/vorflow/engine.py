@@ -891,7 +891,14 @@ class MeshGenerator:
             be removed inside the circles), ``corridors`` (narrow gaps given
             one shared row of cells: ``kind`` "barriers" between two close
             parallel barriers or "boundary" along a boundary edge,
-            ``line_ids``, ``length``), ``collapsed`` (barrier legs meeting
+            ``line_ids``, ``length``, ``cells`` in its row, ``resolution``;
+            a row of cells shorter than 0.5 x resolution raises one
+            UserWarning), ``merged`` (stretches of two barriers closer than
+            0.25 x resolution moved onto their midline, which carries the
+            faces of both: ``line_ids``, ``gap``, ``length``,
+            ``deviation``, the largest move, at most 0.125 x resolution;
+            give the HFB on those faces the combined properties of both
+            barriers), ``collapsed`` (barrier legs meeting
             at less than ``sharp_angle``, or fans of legs closer than 29
             degrees, merged over a short reach: ``kind`` "junction" or
             "boundary", ``line_ids``, ``angle``, ``reach``, ``deviation``,
@@ -900,8 +907,9 @@ class MeshGenerator:
             removed for the sites, not counting Gmsh's copies of the sites)
             and ``polish`` (``iterations``, ``residual``, ``rejected``,
             short faces before and after, and ``moved``, the nodes it
-            moved). Merges, tips, stubs, snapped ends and fixed-line nodes
-            each raise one UserWarning with their count. When the cleaning dropped every barrier, the report holds
+            moved). Merged stretches, merged wedges, tips, stubs, snapped
+            ends and fixed-line nodes each raise one UserWarning with their
+            count. When the cleaning dropped every barrier, the report holds
             only what it dropped.
         barrier_lines (GeoDataFrame): The lines the barrier faces follow
             (after stubs and sharp tips are removed and narrow junctions

@@ -14,6 +14,7 @@ from shapely.prepared import prep
 from shapely.validation import make_valid
 
 from . import _junctions
+from ._log import warn_user
 from ._features import line_parts as _line_parts
 from ._features import is_face_line, positive_number, row_bool
 from ._plot import features_frame, get_ax, plot_features
@@ -684,17 +685,17 @@ class ConceptualMesh:
                 omit them to use the default GeometricGrowthField.
             dist_max (float, optional): Distance from the line over which the mesh
                 transitions to the background resolution. See dist_min.
-            straddle_width (float, optional): Ignored, with a DeprecationWarning. It set
-                the width of the node pairs that made cell faces follow the line; the
-                faces are now placed exactly and automatically. A non-barrier line that
-                sets it still gets cell faces along it, as before.
+            straddle_width (float, optional): Deprecated, with a FutureWarning; its value is
+                ignored. It set the width of the node pairs that made cell faces follow the
+                line; the faces are now placed exactly and automatically. A non-barrier line
+                that sets it still gets exact cell faces along it, as before.
         """
         if straddle_width is not None:
-            warnings.warn(
-                "straddle_width is deprecated and ignored: barrier faces are now placed exactly and "
-                "automatically. Remove it from add_line().",
-                DeprecationWarning,
-                stacklevel=2,
+            warn_user(
+                "straddle_width is deprecated and its value is ignored: cell faces along a barrier are now "
+                "placed exactly and automatically, and a non-barrier line that sets it still gets exact faces "
+                "along it. Remove it from add_line() (use is_barrier=True for a flow barrier).",
+                FutureWarning,
             )
         if not geometry.is_valid:
             geometry = make_valid(geometry)

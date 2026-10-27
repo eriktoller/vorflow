@@ -293,7 +293,7 @@ def test_keep_close_rings_must_be_a_bool():
 def test_straddle_width_is_deprecated_and_ignored():
     lines = EXACT_CASES["kink"]
     plain, _, _ = _mesh(_model(lines))
-    with pytest.warns(DeprecationWarning, match="straddle_width"):
+    with pytest.warns(FutureWarning, match="straddle_width"):
         cm = _model([(lines[0][0], {**B, "straddle_width": 10.0})])
     mg, vt, grid = _mesh(cm)
     _assert_exact(mg, vt, grid)
@@ -338,7 +338,7 @@ def test_safety_net_warns_or_raises_when_a_barrier_face_is_not_exact(monkeypatch
     with pytest.raises(vorflow.BarrierMeshError, match="safety net"):
         VoronoiTessellator(mg, cm).generate()
 
-    monkeypatch.setattr(VoronoiTessellator, "strict_barriers", False)
+    monkeypatch.setattr(vorflow.tessellator, "STRICT_BARRIERS", False)
     vt = VoronoiTessellator(mg, cm)
     with pytest.warns(UserWarning, match="safety net"):
         vt.generate()

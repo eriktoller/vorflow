@@ -199,7 +199,8 @@ def test_plan_quad_buffers_keys_lines_then_embedded_polygons():
 
 def test_protection_epsilon_by_feature_kind():
     assert buffer.protection_epsilon(_row(lc=2.0, quad_buffer=True, quad_buffer_thickness=2), 5) == 2.0
-    assert buffer.protection_epsilon(_row(lc=2.0, straddle_width=0.6), 5) == pytest.approx(0.3)
+    # The deprecated straddle_width is ignored.
+    assert buffer.protection_epsilon(_row(lc=2.0, straddle_width=0.6), 5) == pytest.approx(0.4)
     assert buffer.protection_epsilon(_row(lc=2.0, is_barrier=True), 5) == pytest.approx(0.4)
 
 

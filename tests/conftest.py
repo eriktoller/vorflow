@@ -24,6 +24,6 @@ def strict_barriers(monkeypatch):
     The barrier construction should never leave work for that safety net,
     so in tests any such repair is a failure.
     """
-    from vorflow import VoronoiTessellator
+    from vorflow import tessellator
 
-    monkeypatch.setattr(VoronoiTessellator, "strict_barriers", True)
+    monkeypatch.setattr(tessellator, "STRICT_BARRIERS", True)

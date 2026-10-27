@@ -602,7 +602,7 @@ def _residual_grid(lines):
     return vt.generate(), mg, vt
 
 
-@pytest.mark.filterwarnings("ignore:straddle_width is deprecated:DeprecationWarning")
+@pytest.mark.filterwarnings("ignore:straddle_width is deprecated:FutureWarning")
 @pytest.mark.parametrize("lines", [
     # Legs shorter than KINK_MIN_LEG * resolution kept the even spacing.
     [dict(coords=list(zip(_SINE_X, 150 + 40 * np.sin((_SINE_X - 40) / 220 * 2 * np.pi))),

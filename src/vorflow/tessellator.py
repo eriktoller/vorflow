@@ -14,6 +14,7 @@ from shapely.ops import unary_union, split
 from shapely.validation import make_valid
 
 from . import _lloyd
+from ._log import warn_user
 from ._plot import get_ax
 from ._barrier import BarrierMeshError
 from .utils import grid_to_disv
@@ -26,10 +27,11 @@ BARRIER_SLIVER_FRACTION = 1e-6
 
 # Split pieces without the generator smaller than this fraction of the cell
 # area join the neighbouring cell on their side of the barrier instead of
-# becoming cells of their own. A curved barrier leaves such pieces all along
-# it: the straddle pairs' Voronoi faces are chords of the curve, which bulges
-# across them by the sagitta (pieces of 0.03-13% of the cell on curves with
-# radius 1-4 lc).
+# becoming cells of their own. Wherever generators near a curved barrier are
+# not placed for it (quad buffers on a barrier, or nodes from elsewhere),
+# their Voronoi faces are chords of the curve, which bulges across them by
+# the sagitta and leaves such pieces all along it (0.03-13% of the cell on
+# curves with radius 1-4 lc).
 BARRIER_FRAGMENT_MERGE_FRACTION = 0.2
 
 # Rounds of barrier mirroring before leftover crossings go to the post-hoc split.
@@ -38,9 +40,15 @@ BARRIER_MIRROR_PASSES = 3
 # A mirror generator is dropped when an existing node lies closer to it than
 # this fraction of its distance to the original node: that node already
 # acts as the partner, and a mirror beside it would squeeze both cells. On a
-# curved barrier a straddle point's partner reflected across the nearest
-# segment lands 4-19% of the reflection distance from it (lc 2, radius 1.7-8).
+# curved barrier, a node and its partner across the line (measured with the
+# retired straddle pairs) reflect across the nearest segment to within 4-19%
+# of the reflection distance of each other (lc 2, radius 1.7-8).
 BARRIER_MIRROR_MERGE_FRACTION = 0.1
+
+# Exact barrier faces (MeshGenerator.barrier_lines) should never need the
+# mirror pass or the cut. When they do, generate() warns; with True it raises
+# BarrierMeshError instead. A test hook: the test suite sets it True.
+STRICT_BARRIERS = False
 
 # Cell vertices closer than this fraction of the grid's coordinate scale are
 # one vertex. Clipping puts a cut point within roundoff of a domain vertex
@@ -553,11 +561,6 @@ class VoronoiTessellator:
             ``lloyd_shift`` column with the total move of each node.
     """
 
-    # Exact barrier faces (MeshGenerator.barrier_lines) should never need the
-    # mirror pass or the cut. When they do, generate() warns; with True it
-    # raises BarrierMeshError instead (the test suite sets this).
-    strict_barriers = False
-
     def __init__(
         self,
         mesh_generator,
@@ -933,7 +936,7 @@ class VoronoiTessellator:
         return np.asarray(circles[0], dtype=float), np.asarray(circles[1], dtype=float)
 
     def _report_barrier_repairs(self):
-        """Warn (or raise, with ``strict_barriers``) when the safety net touched an exact barrier."""
+        """Warn (or raise, with STRICT_BARRIERS) when the safety net touched an exact barrier."""
         mirrors, cuts = self.n_exact_barrier_mirrors, self.n_exact_barrier_cuts
         if mirrors == 0 and cuts == 0:
             return
@@ -942,9 +945,9 @@ class VoronoiTessellator:
             "tessellator's safety net; the barrier sites did not make every barrier segment a face. "
             "Please report this with the model."
         )
-        if self.strict_barriers:
+        if STRICT_BARRIERS:
             raise BarrierMeshError(message)
-        warnings.warn(message, UserWarning, stacklevel=3)
+        warn_user(message)
 
     def _barrier_mirror_points(self, raw_gdf, generators, domain_geom):
         """

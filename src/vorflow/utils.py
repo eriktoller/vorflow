@@ -836,8 +836,8 @@ def _insert_hanging_vertices(cell_vertices, vertex_xy, tolerance):
 
 def cells_on(
     gdf: gpd.GeoDataFrame,
-    geometry: shapely.Point | shapely.LineString | shapely.MultiLineString,
-) -> gpd.GeoDataFrame | gpd.GeoSeries:
+    geometry: shapely.Point | shapely.LineString | shapely.MultiLineString | shapely.Polygon,
+) -> gpd.GeoDataFrame:
     """Returns a GeoPandas DataFrame for the cells that lies on the geometry object. For a Point a single series will be returned.
 
     Args:
@@ -846,30 +846,36 @@ def cells_on(
         geometry (Point | LineString | MultiLineString): The geometrical object for which to find the intersecting cells.
 
     Returns:
-        cells (GeoDataFrame | GeoSeries): If ``geometry`` is a LineString or MultiLineString,
-            returns a GeoDataFrame of all intersecting cells containing columns for ``cell_id``,
+        cells (GeoDataFrame): Returns a GeoDataFrame of all intersecting cells containing columns for ``cell_id``,
             ``cell_area``, and the intersection ``length``. If ``geometry`` is a Point,
-            returns a single GeoSeries for the nearest cell.
+            returns a single row GeoDataFrame for the nearest cell.
 
     Raises:
         ValueError: If ``geometry`` is not an instance of Point, LineString, or MultiLineString.
+        ValueError: If ``geometry`` is outside of the grid.
     """
 
-    if not isinstance(geometry, (Point, LineString, MultiLineString)):
-        raise ValueError("geometry must be a Point, LineString, or MultiLineString.")
+    if not isinstance(geometry, (Point, LineString, MultiLineString, Polygon)):
+        raise ValueError("geometry must be a Point, LineString, MultiLineString, or Polygon.")
 
-    mask = gdf.geometry.intersects(geometry).to_numpy()
+    if isinstance(geometry, Polygon):
+        mask = gdf.geometry.within(geometry).to_numpy()
+    else:
+        mask = gdf.geometry.intersects(geometry).to_numpy()
+
     cells = gdf.loc[mask].copy()
+    if cells.empty:
+            raise ValueError("the geometry is outside the grid")
     if isinstance(geometry, Point):
         # if more than one point find the nearest cell generator to point
         if len(cells) > 1:
-            dist = gpd.GeoSeries(
-                gpd.points_from_xy(cells["x"], cells["y"]), crs=cells.crs
-            ).distance(geometry)
-            cells = cells.loc[dist.idxmin()].copy()
-            cells["cell_id"] = dist.idxmin()
+            rows = np.flatnonzero(mask)
+            d = shapely.distance(shapely.points(cells["x"], cells["y"]), geometry)
+            i = int(np.argmin(d))
+            cells = cells.iloc[[i]].copy()
+            cells["cell_id"] = rows[i]
         else:
-            cells = cells.iloc[0].copy()
+            cells = cells.iloc[[0]].copy()
             cells["cell_id"] = np.flatnonzero(mask)[0]
         cells["length"] = 0.0
         cells["cell_area"] = cells.geometry.area
@@ -881,7 +887,7 @@ def cells_on(
     return cells
 
 
-def faces_on(gdf, geometry, tolerance=None, predicate="intersects"):
+def faces_on(gdf, geometry, tolerance=None, predicate="within"):
     """Return rows from a connectivity GeoDataFrame whose faces are near a line.
 
     Pass the result of :func:`build_connectivity` as ``gdf``. ``tolerance``

@@ -4,7 +4,7 @@ import geopandas as gpd
 import pandas as pd
 import numpy as np
 import pytest
-from shapely.geometry import LineString, MultiLineString, Point, Polygon
+from shapely.geometry import LineString, MultiLineString, Point, Polygon, LinearRing
 
 from vorflow.utils import (
     build_connectivity,
@@ -51,32 +51,44 @@ def test_calculate_mesh_quality_computes_expected_scalar_metrics(paired_polygons
     [
         LineString([(-1, 0.5), (3, 0.5)]),
         MultiLineString([[(-1, 0.5), (1, 0.5)], [(1, 0.5), (3, 0.5)]]),
+        Polygon([(-1, -1), (3, -1), (3, 2), (-1, 2)]),
+
     ],
 )
 def test_cells_on_line_returns_cell_areas_and_intersection_lengths(paired_polygons, line):
     cells = cells_on(paired_polygons, line)
 
-    assert cells["cell_area"].tolist() == pytest.approx([1.0, 1.0])
-    assert cells["length"].tolist() == pytest.approx([1.0, 1.0])
+    if isinstance(line, Polygon):
+        # length is perimeter 
+        assert cells["cell_area"].tolist() == pytest.approx([1.0, 1.0])
+        assert cells["length"].tolist() == pytest.approx([4.0, 4.0])
+    else:
+        # length of line
+        assert cells["cell_area"].tolist() == pytest.approx([1.0, 1.0])
+        assert cells["length"].tolist() == pytest.approx([1.0, 1.0])
 
 
 def test_cells_on_point_returns_containing_cell_and_zero_length(paired_polygons):
     cells = cells_on(paired_polygons, Point(0.5, 0.5))
 
-    assert isinstance(cells, pd.Series)
-    assert cells["cell_area"] == pytest.approx(1.0)
-    assert cells["length"] == pytest.approx(0.0)
+    assert len(cells) == 1
+    assert cells["cell_area"].tolist() == pytest.approx([1.0])
+    assert cells["length"].tolist() == pytest.approx([0.0])
 
 
 def test_cells_on_point_on_shared_edge_returns_both_touching_cells(paired_polygons):
     cells = cells_on(paired_polygons, Point(1.0, 0.5))
 
-    assert isinstance(cells, pd.Series)
+    assert len(cells) == 1
 
 
 def test_cells_on_rejects_unsupported_geometry(paired_polygons):
-    with pytest.raises(ValueError, match="Point, LineString, or MultiLineString"):
-        cells_on(paired_polygons, Polygon([(0, 0), (1, 0), (1, 1), (0, 1)]))
+    with pytest.raises(ValueError, match="Point, LineString, MultiLineString, or Polygon"):
+        cells_on(paired_polygons, paired_polygons)
+
+def test_cells_on_rejects_geometry_outside_grid(paired_polygons):
+    with pytest.raises(ValueError, match="the geometry is outside the grid"):
+        cells_on(paired_polygons, Point(999,999))
 
 
 def test_faces_on_returns_shared_face_length_and_connected_cell_ids(paired_polygons):

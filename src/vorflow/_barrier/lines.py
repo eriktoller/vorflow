@@ -37,6 +37,7 @@ Barriers are not densified: the barrier construction places its own nodes.
 from __future__ import annotations
 
 import dataclasses
+import math
 
 import numpy as np
 import shapely
@@ -48,6 +49,7 @@ NOISE_FRACTION = 0.1      # x lc: vertices closer than this to a neighbour are d
 SIMPLIFY_MARGIN = 0.98    # simplification uses this x simplify_tolerance
 SHORT_PENALTY = 4.0       # simplification cost of a chord of length L: 1 + SHORT_PENALTY max(0, 1 - L/lc)^2
 MERGE_FRACTION = 1e-9     # x extent: vertices closer than this are one vertex
+SNAP_PARALLEL_ANGLE = math.radians(12.0)  # an end segment this close to parallel with its snap target runs along it
 
 
 @dataclasses.dataclass
@@ -100,34 +102,69 @@ def _trim_overshoot(barrier: BarrierLine, end: int, others, tol: float, start_to
     return overshoot
 
 
-def _snap_target(point: np.ndarray, others: list, tol: float) -> np.ndarray | None:
-    """Where an end at ``point`` moves: a vertex of ``others`` within tol, else their nearest point within tol."""
-    best, best_d = None, np.inf
-    for xy in others:
+def _snap_target(point: np.ndarray, others: list, tol: float) -> tuple:
+    """(where an end at ``point`` moves, index into ``others`` of the line it moves onto), or (None, -1).
+
+    A vertex of ``others`` within tol wins, else their nearest point within tol.
+    """
+    best, best_k, best_d = None, -1, np.inf
+    for k, xy in enumerate(others):
         d = np.hypot(*(xy - point).T)
-        k = int(np.argmin(d))
-        if 0 < d[k] <= tol and d[k] < best_d:
-            best, best_d = xy[k], d[k]
+        i = int(np.argmin(d))
+        if 0 < d[i] <= tol and d[i] < best_d:
+            best, best_k, best_d = xy[i].copy(), k, d[i]
     if best is not None:
-        return best.copy()
-    for xy in others:
+        return best, best_k
+    for k, xy in enumerate(others):
         if len(xy) < 2:
             continue
         line = LineString(xy)
         d = line.distance(Point(point))
         if 0 < d <= tol and d < best_d:
-            best, best_d = np.array(line.interpolate(line.project(Point(point))).coords[0]), d
-    return best
+            best, best_k, best_d = np.array(line.interpolate(line.project(Point(point))).coords[0]), k, d
+    return best, best_k
+
+
+def runs_alongside(xy: np.ndarray, end: int, target: np.ndarray, tol: float,
+                   angle: float = SNAP_PARALLEL_ANGLE) -> bool:
+    """True when the end segment of ``xy`` at ``end`` runs alongside the line ``target``.
+
+    That is: both its vertices are within ``tol`` of ``target`` and it is
+    within ``angle`` of the target segment nearest to its end. Snapping
+    such an end would pull a parallel neighbour onto the target instead of
+    closing a near miss; the gap between them is a corridor (``corridor``).
+    """
+    if len(target) < 2 or len(xy) < 2:
+        return False
+    a, b = (xy[0], xy[1]) if end == 0 else (xy[-1], xy[-2])
+    line = LineString(target)
+    if line.distance(Point(b)) > tol:
+        return False
+    segments = shapely.linestrings(np.stack([target[:-1], target[1:]], axis=1))
+    k = int(np.argmin(shapely.distance(segments, Point(a))))
+    u, w = b - a, target[k + 1] - target[k]
+    cos = abs(float(u @ w)) / max(float(np.hypot(*u) * np.hypot(*w)), 1e-300)
+    return bool(cos >= np.cos(angle))
 
 
 def snap_ends(barriers: list, domain, connectivity_tolerance: float, merge_tol: float) -> None:
-    """Join barrier ends that nearly meet another barrier or the domain boundary (step 1)."""
+    """Join barrier ends that nearly meet another barrier or the domain boundary (step 1).
+
+    An end whose last segment runs alongside the barrier it would snap onto
+    is left alone (``runs_alongside``), and so is a barrier whose two ends
+    would both snap onto the same other barrier while lying within the
+    tolerance of it all along: snapping would merge two parallel barriers.
+    """
     boundary = domain.boundary
     for k, barrier in enumerate(barriers):
         tol = max(connectivity_tolerance, barrier.tol)
+        before_xy, before_events = barrier.xy.copy(), len(barrier.events)
+        targets = []
         for end in (0, -1):
-            others = [b.xy for j, b in enumerate(barriers) if j != k]
+            owners = [j for j in range(len(barriers)) if j != k]
+            others = [barriers[j].xy for j in owners]
             if len(barrier.xy) > 3:  # a nearly closed loop snaps onto its own other end
+                owners.append(k)
                 others.append(barrier.xy[[-1 if end == 0 else 0]])
             point = barrier.xy[end].copy()
             if others:
@@ -139,9 +176,12 @@ def snap_ends(barriers: list, domain, connectivity_tolerance: float, merge_tol: 
                     barrier.events.append(_event("trim", point, trimmed,
                                                  f"end trimmed back to the barrier it overshoots (tolerance {tol:.3g})"))
                     continue
-                target = _snap_target(point, others, tol)
+                target, j = _snap_target(point, others, tol)
+                if target is not None and owners[j] != k and runs_alongside(barrier.xy, end, others[j], tol):
+                    continue
                 if target is not None:
                     barrier.xy[end] = target
+                    targets.append(owners[j])
                     barrier.events.append(_event("snap", point, np.hypot(*(target - point)),
                                                  f"end moved onto another barrier (tolerance {tol:.3g})"))
                     continue
@@ -150,7 +190,14 @@ def snap_ends(barriers: list, domain, connectivity_tolerance: float, merge_tol: 
                 barrier.xy[end] = np.array(boundary.interpolate(boundary.project(Point(point))).coords[0])
                 barrier.events.append(_event("snap", point, d,
                                              f"end moved onto the domain boundary (tolerance {tol:.3g})"))
+        if len(targets) == 2 and targets[0] == targets[1] != k and _within(barrier.xy, barriers[targets[0]].xy, tol):
+            barrier.xy, barrier.events = before_xy, barrier.events[:before_events]
         barrier.xy = _dedupe(barrier.xy)
+
+
+def _within(xy: np.ndarray, target: np.ndarray, tol: float) -> bool:
+    """True when every vertex of ``xy`` lies within ``tol`` of the line ``target``."""
+    return len(target) > 1 and bool((shapely.distance(LineString(target), shapely.points(xy)) <= tol).all())
 
 
 def path_length(xy: np.ndarray) -> float:

@@ -21,12 +21,16 @@ edge, which leaves one row of cells between the barrier and the boundary
 (the sites are side-shared onto the boundary). A vertex of a side inside
 the corridor is a forced chord.
 
-*Strips* (``strips``). The chord spacing follows L(x) = min(h,
-CORRIDOR_ASPECT x gap); the gap of a boundary run is twice the distance to
-the edge (the run is a corridor between the barrier and its mirror image). Between forced chords the sites are spaced at equal
-steps of the integral of 1/L; the offset of the first site after a forced
-chord equals that of the last site before it. Every site must lie in the
-middle 1 - 2 CORRIDOR_FOOT of its strip.
+*Marching* (``march``). From the start chord, each next site goes on M (the
+bisector of the current side pieces; the edge for a boundary run) at the
+local spacing L = min(h, CORRIDOR_ASPECT x gap), where the gap of a
+boundary run is twice the distance to the edge (the run is a corridor
+between the barrier and its mirror image). The steps are evened out so
+that the sites straddle the next event (a side vertex or the end)
+symmetrically, and consecutive steps differ by at most MAX_STEP_RATIO. A
+side vertex is a forced chord: the next site is where the circle about the
+vertex through the last site meets the next M, so the perpendicular
+bisector of the two sites passes through the vertex and M bends there.
 
 *Ends.*
 
@@ -71,8 +75,6 @@ MIN_OVERLAP = 2.0        # x h0: shorter facing stretches get no corridor
 ALIGN_FRACTION = 0.25    # x L: two free ends this close along M end the corridor together
 STAGGER_TILT = math.radians(10.0)
 EDGE_MARGIN = 1.0        # x h0: a boundary run keeps this far from the ends of its edge
-BISECT_STEPS = 60
-GRID_POINTS = 48         # per interval between forced chords, for the integral of 1/L
 
 
 @dataclasses.dataclass
@@ -89,7 +91,8 @@ class Corridor:
 
     ``sides`` holds one list of SidePieces (a run along the boundary edge M)
     or two (two barriers); ``ends`` the end kinds at x0 and x1; ``end_nodes``
-    the hard nodes on each end chord.
+    the hard nodes on each end chord. x0 and x1 bound the corridor along
+    (origin, m), for the size caps.
     """
     origin: np.ndarray
     m: np.ndarray
@@ -175,12 +178,17 @@ def _node_kind(net, v: int, degree: np.ndarray, rung_nodes: set) -> str:
     return {1: "free", 2: "kink"}.get(int(degree[v]), "other")
 
 
-def _bisector(a0: np.ndarray, ua: np.ndarray, b0: np.ndarray, ub: np.ndarray) -> tuple:
-    """(origin, m): the line midway between the lines (a0, ua) and (b0, ub), m oriented like ua."""
+def _bisector(a0: np.ndarray, a1: np.ndarray, b0: np.ndarray, b1: np.ndarray) -> tuple:
+    """(origin, m): the line midway between the lines through pieces a0-a1 and b0-b1, m oriented like a1 - a0.
+
+    The normals are oriented towards the other piece's midpoint, so pieces
+    that meet (a ladder's legs) work too.
+    """
+    ua, ub = _unit(a1 - a0), _unit(b1 - b0)
     na = _rot90(ua)
-    na = na if na @ (b0 - a0) > 0 else -na
+    na = na if na @ (0.5 * (b0 + b1) - a0) > 0 else -na
     nb = _rot90(ub)
-    nb = nb if nb @ (a0 - b0) > 0 else -nb
+    nb = nb if nb @ (0.5 * (a0 + a1) - b0) > 0 else -nb
     k = na - nb
     m = _unit(_rot90(k))
     m = m if m @ ua > 0 else -m
@@ -237,12 +245,12 @@ def _pair_corridor(net, pa: int, pb: int, size_fn, domain, obstacles: Obstacles,
     B0, B1 = xy[net.pieces[pb]]
     ua, ub = _unit(A1 - A0), _unit(B1 - B0)
     if ua @ ub < 0:
-        ub = -ub
+        ub, B0, B1 = -ub, B1, B0
     if math.acos(float(np.clip(ua @ ub, -1.0, 1.0))) >= CORRIDOR_ANGLE:
         return None
     if LineString([A0, A1]).intersects(LineString([B0, B1])):
         return None
-    origin, m = _bisector(A0, ua, B0, ub)
+    origin, m = _bisector(A0, A1, B0, B1)
     sa, sb = _oriented(net, pa, m), _oriented(net, pb, m)
     probe = Corridor(origin, m, [[sa], [sb]], 0.0, 0.0, (), (), Polygon(), (pa, pb))
     xa = proj(probe, xy[[sa.start, sa.end]])
@@ -432,11 +440,12 @@ def find_corridors(net, size_fn, domain, standard: list, features: np.ndarray, s
 
 
 def chord_nodes(c: Corridor) -> set:
-    """Hard nodes whose radius ``c`` sets: its end nodes (except free tips) and the vertices of its sides."""
-    out = {int(v) for kind, nodes in zip(c.ends, c.end_nodes) if kind != "tip" for v in nodes}
-    for side in c.sides:
-        out.update(int(sp.end) for sp in side[:-1])
-    return out
+    """Hard nodes on an end chord of ``c`` (except free tips), whose radius the corridor sets.
+
+    The side vertices the corridor passes are handled in ``sites`` (a hard
+    node whose segments all have explicit sites gets no sites of its own).
+    """
+    return {int(v) for kind, nodes in zip(c.ends, c.end_nodes) if kind != "tip" for v in nodes}
 
 
 def contains(c: Corridor, piece: int, xy: np.ndarray) -> np.ndarray:
@@ -449,140 +458,269 @@ def contains(c: Corridor, piece: int, xy: np.ndarray) -> np.ndarray:
 
 
 # ---------------------------------------------------------------------------
-# Strips
-# ---------------------------------------------------------------------------
-def _margin(a: float, b: float, sites: np.ndarray) -> float:
-    """Smallest fraction of its strip any site keeps from a chord (strips between a, the site midpoints, b)."""
-    chords = np.concatenate([[a], 0.5 * (sites[1:] + sites[:-1]), [b]])
-    ratio = (sites - chords[:-1]) / (chords[1:] - chords[:-1])
-    return float(min(ratio.min(), (1 - ratio).min()))
-
-
-def _interval_sites(a: float, b: float, eps: float, m: int, grid: np.ndarray, q: np.ndarray) -> np.ndarray | None:
-    """``m`` sites in (a, b): the first ``eps`` past a, then equal steps of q (the integral of 1/L)
-    such that the last one sits half its spacing before b."""
-    first = a + eps
-    if first >= b:
-        return None
-    if m == 1:
-        return np.array([first])
-    q1 = float(np.interp(first, grid, q))
-
-    def place(step: float) -> np.ndarray:
-        return np.interp(q1 + step * np.arange(m), q, grid)
-
-    lo, hi = 0.0, (float(np.interp(b, grid, q)) - q1) / (m - 1)
-    for _ in range(BISECT_STEPS):
-        mid = 0.5 * (lo + hi)
-        s = place(mid)
-        if s[-1] + 0.5 * (s[-1] - s[-2]) > b:
-            hi = mid
-        else:
-            lo = mid
-    s = place(lo)
-    return s if np.all(np.diff(s) > 0) and s[-1] < b else None
-
-
-def strips(forced: np.ndarray, spacing, eps0: float, foot: float = CORRIDOR_FOOT) -> np.ndarray | None:
-    """Site positions along M between the forced chords (module docstring), or None when a strip fails."""
-    out = []
-    eps = eps0
-    for a, b in zip(forced[:-1], forced[1:]):
-        grid = np.linspace(a, b, GRID_POINTS)
-        inv = 1.0 / spacing(grid)
-        q = np.concatenate([[0.0], np.cumsum(0.5 * (inv[1:] + inv[:-1]) * np.diff(grid))])
-        target = max(1, int(round(q[-1])))
-        best = None
-        for m in sorted({target, target - 1, target + 1} - {0}, key=lambda k: abs(k - q[-1])):
-            s = _interval_sites(a, b, eps, m, grid, q)
-            if s is None:
-                continue
-            margin = _margin(a, b, s)
-            if margin >= foot and (best is None or margin > best[0] + 0.1):
-                best = (margin, s)
-        if best is None:
-            return None
-        out.append(best[1])
-        eps = b - best[1][-1]
-    return np.concatenate(out)
-
-
-# ---------------------------------------------------------------------------
-# Layout
+# Marching layout
 # ---------------------------------------------------------------------------
 def _length(net, sp: SidePiece) -> float:
     """Length of a side piece."""
     return float(np.hypot(*np.subtract(*_piece_xy(net, sp))))
 
 
-def _spacing_fn(c: Corridor, net, field, aspect: float):
-    """L(x) = min(h on the sides, aspect x gap)."""
-    tables = []
-    for side in c.sides:
-        x = np.concatenate([proj(c, field.xy[field.piece == sp.piece]) for sp in side])
-        h = np.concatenate([field.h[field.piece == sp.piece] for sp in side])
-        order = np.argsort(x)
-        tables.append((x[order], h[order]))
-    probe = np.unique(np.concatenate([np.linspace(c.x0, c.x1, 64), _forced(c, net)]))
-    gaps = np.array([width(net, c, float(x)) for x in probe])
-
-    def spacing(x: np.ndarray) -> np.ndarray:
-        h = np.minimum.reduce([np.interp(x, tx, th) for tx, th in tables])
-        return np.minimum(h, aspect * np.interp(x, probe, gaps))
-
-    return spacing
+def local_m(c: Corridor, net, idx: list) -> tuple:
+    """(origin, m) of M for the current side pieces ``idx``: their bisector, or the boundary edge."""
+    if len(c.sides) == 1:
+        return c.origin, c.m
+    a0, a1 = _piece_xy(net, c.sides[0][idx[0]])
+    b0, b1 = _piece_xy(net, c.sides[1][idx[1]])
+    return _bisector(a0, a1, b0, b1)
 
 
-def _forced(c: Corridor, net) -> np.ndarray:
-    """Chord positions fixed by the ends and the side vertices."""
-    inner = [float(proj(c, net.hard_xy[sp.end])) for side in c.sides for sp in side[:-1]]
-    inner = [x for x in inner if c.x0 < x < c.x1]
-    return np.unique(np.array([c.x0, *inner, c.x1]))
+def _hit(net, sp: SidePiece, point: np.ndarray, direction: np.ndarray) -> float:
+    """t along ``sp`` (from its first node along M) where the line through ``point`` along ``direction`` meets it."""
+    p0, p1 = _piece_xy(net, sp)
+    u = p1 - p0
+    den = u[0] * direction[1] - u[1] * direction[0]
+    if abs(den) < 1e-15 * np.hypot(*u):
+        return math.nan
+    w = point - p0
+    return float((w[0] * direction[1] - w[1] * direction[0]) / den * np.hypot(*u))
 
 
-def _end_chord(c: Corridor, net, end: int, x: float) -> tuple:
-    """(point, direction) of the end chord at ``end``: tilted from the free end at a stagger, else perpendicular to M."""
-    n = _rot90(c.m)
-    if c.ends[end] != "stagger":
-        return c.origin + x * c.m, n
-    a = net.hard_xy[c.end_nodes[end][0]]
-    ending_side = next(k for k, side in enumerate(c.sides) if c.end_nodes[end][0] in (side[0].start, side[-1].end))
-    other = side_point(net, c, c.sides[1 - ending_side], x)[2]
-    n = _unit(other - a)
-    return a, _unit(n + math.tan(STAGGER_TILT) * (c.m if end == 1 else -c.m))
+def _h_at(net, field, sp: SidePiece, t: float) -> float:
+    """Target spacing h on side piece ``sp`` at ``t`` from its first node along M."""
+    sel = field.piece == sp.piece
+    s = t if net.pieces[sp.piece][0] == sp.start else _length(net, sp) - t
+    return float(np.interp(s, field.s[sel], field.h[sel]))
 
 
-def _on_chord(net, side: list, point: np.ndarray, direction: np.ndarray) -> tuple:
-    """(side piece index, t) where the line through ``point`` along ``direction`` crosses ``side``."""
-    for i, sp in enumerate(side):
+def _gap_and_h(c: Corridor, net, field, idx: list, point: np.ndarray, m: np.ndarray) -> tuple:
+    """(gap across M at ``point``, min h on the sides there); a boundary run's gap is twice its distance."""
+    n = _rot90(m)
+    feet, hs = [], []
+    for side, i in zip(c.sides, idx):
+        sp = side[i]
+        t = float(np.clip(_hit(net, sp, point, n), 0.0, _length(net, sp)))
         p0, p1 = _piece_xy(net, sp)
-        u = p1 - p0
-        den = u[0] * direction[1] - u[1] * direction[0]
-        if abs(den) < 1e-15:
-            continue
-        w = point - p0
-        f = (w[0] * direction[1] - w[1] * direction[0]) / den
-        if -1e-9 <= f <= 1 + 1e-9 or i == len(side) - 1:
-            return i, f * _length(net, sp)
-    raise AssertionError("an end chord misses a corridor side")
+        feet.append(p0 + t / _length(net, sp) * (p1 - p0))
+        hs.append(_h_at(net, field, sp, t))
+    gap = np.hypot(*(feet[0] - feet[1])) if len(feet) == 2 else 2.0 * np.hypot(*(feet[0] - point))
+    return float(gap), min(hs)
 
 
-def _chord_nodes(net, c: Corridor, side: list, chords: np.ndarray) -> list:
-    """(side piece index, t along M order) where each chord meets ``side``; end chords take its ending nodes."""
-    out = []
-    for k, x in enumerate(chords):
-        if k in (0, len(chords) - 1):
-            end = 0 if k == 0 else 1
-            idx = 0 if end == 0 else len(side) - 1
-            node = side[0].start if end == 0 else side[-1].end
-            if node in c.end_nodes[end]:
-                out.append((idx, 0.0 if end == 0 else _length(net, side[idx])))
+def _end_targets(c: Corridor, net, end: int) -> np.ndarray:
+    """Coordinates of the hard nodes the corridor ends on at ``end``."""
+    return net.hard_xy[list(c.end_nodes[end])]
+
+
+def _end_position(c: Corridor, net, end: int, o: np.ndarray, m: np.ndarray) -> float:
+    """Where along (o, m) the corridor's sites must stop (x1 end) or start (x0 end)."""
+    x = (_end_targets(c, net, end) - o) @ m
+    return float(x.min() if end == 1 else x.max())
+
+
+def _end_chord(c: Corridor, net, end: int, idx: list) -> tuple:
+    """(point, direction) of the end chord at ``end``: tilted from the free end at a stagger, else across M."""
+    o, m = local_m(c, net, idx)
+    n = _rot90(m)
+    x = _end_position(c, net, end, o, m)
+    if c.ends[end] != "stagger":
+        return o + x * m, n
+    a = net.hard_xy[c.end_nodes[end][0]]
+    k = next(k for k, side in enumerate(c.sides) if c.end_nodes[end][0] in (side[0].start, side[-1].end))
+    sp = c.sides[1 - k][idx[1 - k]]
+    t = _hit(net, sp, a, n)
+    p0, p1 = _piece_xy(net, sp)
+    other = p0 + t / _length(net, sp) * (p1 - p0)
+    return a, _unit(_unit(other - a) + math.tan(STAGGER_TILT) * (m if end == 1 else -m))
+
+
+def _circle_on_line(v: np.ndarray, r: float, o: np.ndarray, m: np.ndarray) -> np.ndarray | None:
+    """The forward point of the circle (v, r) on the line (o, m), or None when they miss."""
+    b = float(m @ (o - v))
+    disc = b * b - float((o - v) @ (o - v)) + r * r
+    if disc < 0:
+        return None
+    return o + (-b + math.sqrt(disc)) * m
+
+
+def _chord_node(net, side: list, i: int, t_prev: float, point: np.ndarray, direction: np.ndarray) -> float | None:
+    """t on side piece ``i`` where a chord crosses it, or None when it falls outside the piece or goes back."""
+    sp = side[i]
+    t = _hit(net, sp, point, direction)
+    length = _length(net, sp)
+    tol = 1e-9 * max(1.0, length)
+    if not math.isfinite(t) or t <= t_prev + tol or t >= length - tol:
+        return None
+    return t
+
+
+class _March:
+    """The sites and chord nodes of a corridor, laid out from start to end (see ``lay_out``)."""
+
+    def __init__(self, c: Corridor, net, field, aspect: float):
+        self.c, self.net, self.field, self.aspect = c, net, field, aspect
+        self.idx = [0] * len(c.sides)          # current piece of every side
+        self.last_t = [0.0] * len(c.sides)     # t of the last chord node on it
+        self.sites = []
+        self.nodes = [[] for _ in c.sides]     # per side: (side piece index, t) per chord
+
+    def spacing(self, point: np.ndarray, m: np.ndarray) -> float:
+        """L at ``point``: min(h on the sides, aspect x gap)."""
+        gap, h = _gap_and_h(self.c, self.net, self.field, self.idx, point, m)
+        return min(h, self.aspect * gap)
+
+    def vertices(self) -> list:
+        """(side, coordinates) of the next vertex of every side that has one."""
+        return [(k, self.net.hard_xy[side[self.idx[k]].end]) for k, side in enumerate(self.c.sides)
+                if self.idx[k] < len(side) - 1]
+
+    def add_chord(self, a: np.ndarray, b: np.ndarray, forced: dict) -> bool:
+        """Record the chord between sites a and b (its nodes on every side); False when it does not fit."""
+        mid, direction = 0.5 * (a + b), _rot90(_unit(b - a))
+        found = {}
+        for k, side in enumerate(self.c.sides):
+            i = self.idx[k]
+            found[k] = _length(self.net, side[i]) if k in forced else \
+                _chord_node(self.net, side, i, self.last_t[k], mid, direction)
+            if found[k] is None:
+                return False
+        for k, t in found.items():
+            self.nodes[k].append((self.idx[k], t))
+            self.last_t[k] = t
+            if k in forced:
+                self.idx[k] += 1
+                self.last_t[k] = 0.0
+        return True
+
+    def start(self) -> bool:
+        """The start chord's nodes and the first site."""
+        c, net = self.c, self.net
+        o, m = local_m(c, net, self.idx)
+        x0 = _end_position(c, net, 0, o, m)
+        point, direction = _end_chord(c, net, 0, self.idx)
+        for k, side in enumerate(c.sides):
+            if side[0].start in c.end_nodes[0]:
+                self.nodes[k].append((0, 0.0))
                 continue
-            if c.ends[end] == "stagger":
-                out.append(_on_chord(net, side, *_end_chord(c, net, end, float(x))))
+            t = _hit(net, side[0], point, direction)
+            if not 0.0 < t < _length(net, side[0]):
+                return False
+            self.nodes[k].append((0, t))
+            self.last_t[k] = t
+        target = min([float((v - o) @ m) for _, v in self.vertices()] + [_end_position(c, net, 1, o, m)])
+        if target <= x0:
+            return False
+        spacing = self.spacing(o + x0 * m, m)
+        count = max(1, int(round((target - x0) / spacing)))
+        self.sites.append(o + (x0 + 0.5 * (target - x0) / count) * m)
+        return True
+
+    def step(self) -> str:
+        """Place the next site: "more", "done" or "fail"."""
+        c, net = self.c, self.net
+        sigma = self.sites[-1]
+        o, m = local_m(c, net, self.idx)
+        s = float((sigma - o) @ m)
+        spacing = self.spacing(sigma, m)
+        if not spacing > 0:
+            return "fail"
+        end = _end_position(c, net, 1, o, m)
+        events = [(float((v - o) @ m), k, v) for k, v in self.vertices()]
+        events.append((end, None, None))
+        p, k, v = min(events, key=lambda e: e[0])
+        count = max(1, int(round((p - s) / spacing + 0.5)))
+        previous = self.last_step()
+        if previous is not None:  # grow by at most MAX_GROWTH per step
+            while (p - s) / max(count - 0.5, 0.5) > MAX_GROWTH * previous and count < MAX_STRIPS:
+                count += 1
+        if k is None and count <= 1:
+            return "done"
+        if k is not None and count <= 1:
+            return self.forced(k, v)
+        nxt = o + (s + (p - s) / (count - 0.5)) * m
+        for k2, v2 in self.vertices():
+            if np.hypot(*(v2 - sigma)) <= np.hypot(*(v2 - nxt)):
+                return self.forced(k2, v2)
+        return self.place(nxt, {})
+
+    def last_step(self) -> float | None:
+        """Distance between the last two sites, or None before the second site."""
+        if len(self.sites) >= 2:
+            return float(np.hypot(*(self.sites[-1] - self.sites[-2])))
+        return None
+
+    def forced(self, k: int, v: np.ndarray) -> str:
+        """The next site such that the chord passes through vertex ``v`` of side ``k``."""
+        sigma = self.sites[-1]
+        after = list(self.idx)
+        after[k] += 1
+        o, m = local_m(self.c, self.net, after)
+        nxt = _circle_on_line(v, float(np.hypot(*(v - sigma))), o, m)
+        if nxt is None:
+            return "fail"
+        forced = {k: v}
+        for k2, v2 in self.vertices():
+            if k2 != k and np.hypot(*(v2 - sigma)) <= np.hypot(*(v2 - nxt)):
+                nxt = _reflect(sigma, v, v2)
+                forced[k2] = v2
+        return self.place(nxt, forced)
+
+    def place(self, nxt: np.ndarray, forced: dict) -> str:
+        """Add site ``nxt`` after the last one, if the step is forward and in proportion."""
+        sigma = self.sites[-1]
+        o, m = local_m(self.c, self.net, self.idx)
+        step = float(np.hypot(*(nxt - sigma)))
+        if (nxt - sigma) @ m <= 0 or len(self.sites) > MAX_STRIPS:
+            return "fail"
+        previous = self.last_step()
+        if previous is not None and not 1.0 / MAX_STEP_RATIO <= step / previous <= MAX_STEP_RATIO:
+            return "fail"
+        if not self.add_chord(sigma, nxt, forced):
+            return "fail"
+        self.sites.append(nxt)
+        return "more"
+
+    def finish(self) -> bool:
+        """The end chord's nodes."""
+        c, net = self.c, self.net
+        point, direction = _end_chord(c, net, 1, self.idx)
+        for k, side in enumerate(c.sides):
+            i = self.idx[k]
+            if side[-1].end in c.end_nodes[1]:
+                if i != len(side) - 1:
+                    return False
+                self.nodes[k].append((i, _length(net, side[i])))
                 continue
-        out.append(side_point(net, c, side, float(x))[:2])
-    return out
+            t = _chord_node(net, side, i, self.last_t[k], point, direction)
+            if t is None:
+                return False
+            self.nodes[k].append((i, t))
+        return True
+
+
+MAX_STEP_RATIO = 2.5    # consecutive site spacings differ by at most this factor
+MAX_GROWTH = 1.5        # the march lengthens its steps by at most this factor
+MAX_STRIPS = 5000
+
+
+def march(c: Corridor, net, field, aspect: float = CORRIDOR_ASPECT) -> _March | None:
+    """Sites and chord nodes of ``c`` from its start to its end, or None when they do not fit.
+
+    From the start chord, each next site goes on M (the bisector of the
+    current side pieces) at the local spacing, evened out so that the sites
+    straddle the next event (a side vertex or the end) symmetrically. A side
+    vertex is a forced chord: the next site is where the circle about the
+    vertex through the last site meets the next M, so the perpendicular
+    bisector of the two sites passes through the vertex.
+    """
+    run = _March(c, net, field, aspect)
+    if not run.start():
+        return None
+    while True:
+        state = run.step()
+        if state == "fail":
+            return None
+        if state == "done":
+            return run if run.finish() else None
 
 
 def _runs_of_side(net, side: list, nodes: list, seg_sites: list) -> list:
@@ -637,22 +775,19 @@ def _stagger_node(net, side: list, node: tuple, tip: np.ndarray, at_start: bool)
 
 def lay_out(c: Corridor, net, field, aspect: float = CORRIDOR_ASPECT) -> CorridorLayout | None:
     """Fixed 1D nodes and explicit sites of a corridor from the current spacing, or None."""
-    spacing = _spacing_fn(c, net, field, aspect)
-    forced = _forced(c, net)
-    sites_x = strips(forced, spacing, 0.5 * float(spacing(np.array([c.x0]))[0]))
-    if sites_x is None:
+    run = march(c, net, field, aspect)
+    if run is None:
         return None
-    chords = np.concatenate([[forced[0]], 0.5 * (sites_x[1:] + sites_x[:-1]), [forced[-1]]])
-    sites = c.origin + np.outer(sites_x, c.m)
+    sites = run.sites
     runs = []
-    for side in c.sides:
-        nodes = _chord_nodes(net, c, side, chords)
+    for k, side in enumerate(c.sides):
+        nodes = list(run.nodes[k])
         seg_sites = list(sites)
         for end, kind in enumerate(c.ends):
             ending = {side[0].start, side[-1].end} & set(c.end_nodes[end])
             if kind != "stagger" or ending:
                 continue
-            point, direction = _end_chord(c, net, end, float(chords[0] if end == 0 else chords[-1]))
+            point, direction = _end_chord(c, net, end, [0] * len(c.sides) if end == 0 else run.idx)
             tip = _reflect(sites[0] if end == 0 else sites[-1], point, point + direction)
             new = _stagger_node(net, side, nodes[0] if end == 0 else nodes[-1], tip, end == 0)
             if new is None:

@@ -206,8 +206,21 @@ def build_layout(net: Network, field: SizeField) -> tuple:
     return np.array(xy), np.array(segments, dtype=int), np.array(seg_piece, dtype=int), explicit, single_ends, extra
 
 
+def covered_nodes(net: Network, segments: np.ndarray, explicit: dict) -> set:
+    """Hard nodes with two or more segments, all with explicit sites (inside a ladder or corridor run).
+
+    Their radius comes from those sites; they get no tip, fill or
+    prescribed sites of their own.
+    """
+    n = len(net.hard_xy)
+    total = np.bincount(segments[segments < n].ravel(), minlength=n) if len(segments) else np.zeros(n, int)
+    ends = segments[list(explicit)].ravel() if explicit else np.zeros(0, dtype=int)
+    fixed = np.bincount(ends[ends < n], minlength=n)
+    return {int(v) for v in np.flatnonzero((total >= 2) & (fixed == total))}
+
+
 def _node_radius(net: Network, field: SizeField, xy: np.ndarray, segments: np.ndarray,
-                 single_ends: list) -> dict:
+                 single_ends: list, covered: set) -> dict:
     """R_v of every prescribing hard node (ladder sigma_0, forced, or the smallest first segment allows)."""
     lengths = piece_lengths(net)
     out = {}
@@ -216,7 +229,7 @@ def _node_radius(net: Network, field: SizeField, xy: np.ndarray, segments: np.nd
     for seg, node, p, _ in single_ends:
         by_node.setdefault(node, []).append((seg, p))
     for v, plan in enumerate(net.plans):
-        if not plan.prescribes or plan.rung_end:
+        if not plan.prescribes or plan.rung_end or v in covered:
             continue
         r_v, forced = junction_radius(net, field, v, lengths)
         if v in field.radius or forced:
@@ -238,7 +251,8 @@ def _prescribed_sites(net: Network, xy: np.ndarray, segments: np.ndarray, seg_pi
     """Add the explicit site of every single and double segment."""
     by_seg = {}
     for seg, node, p, _ in single_ends:
-        by_seg.setdefault(seg, []).append((node, p))
+        if seg not in explicit:
+            by_seg.setdefault(seg, []).append((node, p))
     for seg, ends in by_seg.items():
         i, j = segments[seg]
         if len(ends) == 2:  # double: where the two prescribed rays meet
@@ -290,7 +304,8 @@ def construct(net: Network, field: SizeField) -> Layout:
     """Nodes, radii and sites of the whole barrier network."""
     xy, segments, seg_piece, explicit, single_ends, extra = build_layout(net, field)
     seg_len = np.hypot(*(xy[segments[:, 1]] - xy[segments[:, 0]]).T)
-    radius_v = _node_radius(net, field, xy, segments, single_ends)
+    covered = covered_nodes(net, segments, explicit)
+    radius_v = _node_radius(net, field, xy, segments, single_ends, covered)
     _prescribed_sites(net, xy, segments, seg_piece, single_ends, radius_v, explicit)
     n = len(xy)
     radius = np.full(n, np.nan)
@@ -307,7 +322,7 @@ def construct(net: Network, field: SizeField) -> Layout:
     regular = np.array([seg not in explicit for seg in range(len(segments))], dtype=bool)
     radius = np.sqrt(_consistent_q(initial ** 2, segments[regular], seg_len[regular], free))
     pairs, ok = _pairs(xy, radius, segments, seg_len, explicit)
-    extra_pts, extra_node = _tip_sites(net, xy, radius, field, extra)
+    extra_pts, extra_node = _tip_sites(net, xy, radius, field, extra, covered)
     sites = np.vstack([pairs.reshape(-1, 2), extra_pts])
     extent = float(max(np.ptp(xy, axis=0).max(), 1.0))
     unique = _unique_points(sites, UNIQUE_FRACTION * extent)
@@ -335,10 +350,13 @@ def _pairs(xy: np.ndarray, radius: np.ndarray, segments: np.ndarray, d: np.ndarr
     return np.stack([left, right], axis=1), ok
 
 
-def _tip_sites(net: Network, xy: np.ndarray, radius: np.ndarray, field: SizeField, extra: list) -> tuple:
+def _tip_sites(net: Network, xy: np.ndarray, radius: np.ndarray, field: SizeField, extra: list,
+               covered: set) -> tuple:
     """(points, node) of tip and fill sites on hard-node circles, plus the ladder and corridor extra sites."""
     pts, nodes = [], []
     for v, plan in enumerate(net.plans):
+        if v in covered:
+            continue
         dirs = ([plan.tip_direction] if plan.tip_direction is not None else []) + list(plan.fill_directions)
         for d in dirs:
             pts.append(xy[v] + radius[v] * d)

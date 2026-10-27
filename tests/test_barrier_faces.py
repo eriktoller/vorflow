@@ -607,10 +607,11 @@ def test_branch_within_its_tolerance_is_dropped_as_a_stub(length, tolerance):
     assert stubs[0]["length"] == pytest.approx(length)
 
 
-@pytest.mark.parametrize("y", [150.0, 150.05])
-def test_point_on_a_barrier_raises_a_clear_error(y):
-    well = {"geometry": Point(150, y), "point_id": "w", "resolution": 4.0}
-    with pytest.raises(vorflow.BarrierMeshError, match="point 'w' .* from barrier 'line0'.*Move it off the barrier"):
+@pytest.mark.parametrize("x, y", [(150, 150.0), (150, 150.05), (260, 150.0)], ids=["on", "next to", "at the end"])
+def test_point_on_a_barrier_raises_a_clear_error(x, y):
+    well = {"geometry": Point(x, y), "point_id": "w", "resolution": 4.0}
+    with pytest.raises(vorflow.BarrierMeshError,
+                       match="point 'w' .* from barrier 'line0'.*Move it off the barrier.*end the barrier"):
         _mesh(_model([([(40, 150), (260, 150)], B)], points=[well]))
 
 

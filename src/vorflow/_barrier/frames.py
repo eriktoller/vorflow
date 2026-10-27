@@ -163,7 +163,8 @@ def check_points_off_barriers(points, items: list, face_rows: dict, origin: np.n
                     raise planning.BarrierMeshError(
                         f"{label} at ({xy[0]:.2f}, {xy[1]:.2f}) is {d:.3g} from barrier {line_id!r}: a cell centre "
                         f"cannot sit on a barrier face. Move it off the barrier (at least {POINT_CLEARANCE * lc:.3g} "
-                        "away; the faces next to it get shorter the closer it is).")
+                        "away; the faces next to it get shorter the closer it is), or, where the point marks the "
+                        "barrier's end, end the barrier that far short of it.")
 
 
 def _obstacle(label: str, geometry, half_width: float, barriers, ends: np.ndarray, end_lc: np.ndarray,

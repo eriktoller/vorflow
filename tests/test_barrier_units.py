@@ -227,7 +227,20 @@ def test_straddle_width_warns_future_warning_at_the_caller():
         warnings.simplefilter("always")
         ConceptualMesh().add_line(LineString([(0, 0), (1, 1)]), line_id="s", resolution=1.0, straddle_width=1.0)
     assert [(w.category, w.filename) for w in record] == [(FutureWarning, __file__)]
-    assert "ignored" in str(record[0].message)
+    message = str(record[0].message)
+    assert "value is ignored" in message
+    assert "remove it there" in message  # on a barrier: nothing to do
+    assert "only way to get that without is_barrier=True" in message  # on another line: what still gives faces
+
+
+def test_barrier_without_resolution_is_cleaned_at_its_zone_resolution():
+    cm = ConceptualMesh()
+    cm.add_polygon(DOMAIN, zone_id=1, resolution=20.0)
+    cm.add_line(LineString([(40, 100), (150, 150), (150.3, 150.4), (260, 210)]), line_id="b", resolution=None,
+                is_barrier=True)
+    with pytest.warns(UserWarning, match="digitising noise"):
+        _, lines, _ = cm.generate()
+    assert len(lines.geometry.iloc[0].coords) == 3
 
 
 def test_ring_dropped_by_a_river_is_not_reported_as_near_a_barrier():

@@ -627,3 +627,85 @@ def test_warnings_point_at_the_caller_through_mesh_generator():
     assert any("digitising noise" in str(w.message) for w in record)
     assert any("spike tip" in str(w.message) for w in record)
     assert set(messages.values()) == {__file__}
+
+
+# ---------------------------------------------------------------------------
+# PR #73 review: crossings close together, sealing at the boundary, parallel
+# snapping, straddle_width, barriers on zone edges
+# ---------------------------------------------------------------------------
+def _sealed(mg: MeshGenerator, grid, a: tuple, b: tuple) -> bool:
+    """True when the cells at ``a`` and ``b`` are not connected through any face off the barrier faces."""
+    from scipy.sparse import coo_matrix
+    from scipy.sparse.csgraph import connected_components
+
+    tol = TOUCH * max(np.ptp(np.asarray(grid.total_bounds).reshape(2, 2), axis=0))
+    on, connectivity = _barrier_faces(grid, mg, tol)
+    open_faces = connectivity.drop(on.index)
+    i, j = open_faces["cell_id_1"].to_numpy(), open_faces["cell_id_2"].to_numpy()
+    _, label = connected_components(coo_matrix((np.ones(len(i)), (i, j)), shape=(len(grid),) * 2), directed=False)
+    cells = grid[["x", "y"]].to_numpy(dtype=float)
+    first, second = (label[int(np.argmin(np.hypot(*(cells - p).T)))] for p in (a, b))
+    return bool(first != second)
+
+
+@pytest.mark.parametrize("kind", ["standard", "barrier"])
+@pytest.mark.parametrize("gap", [0.5, 2.0, 5.0, 9.0])
+def test_two_lines_crossing_a_barrier_close_together_mesh_exactly(gap, kind):
+    other = {} if kind == "standard" else B
+    lines = [([(40, 150), (260, 150)], B), ([(150 - gap / 2, 100), (150 - gap / 2, 200)], other),
+             ([(150 + gap / 2, 100), (150 + gap / 2, 200)], other)]
+    mg, vt, grid = _mesh(_model(lines))
+    _assert_exact(mg, vt, grid)
+
+
+def test_t_junction_next_to_a_crossing_meshes_exactly():
+    lines = [([(40, 150), (260, 150)], B), ([(150, 150), (150, 260)], B), ([(153, 100), (153, 200)], {})]
+    mg, vt, grid = _mesh(_model(lines))
+    _assert_exact(mg, vt, grid)
+
+
+@pytest.mark.parametrize("tolerance, last_y", [(0.0, 298.0), (3.0, 298.0), (6.0, 295.0), (1.0, 299.5),
+                                               (3.0, 299.9), (3.0, 299.99)])
+def test_barrier_crossing_the_boundary_keeps_its_compartment_sealed(tolerance, last_y):
+    # A U closing a compartment against the top boundary; each leg's last vertex is just inside it.
+    coords = [(100, 320), (100, last_y), (100, 200), (200, 200), (200, last_y), (200, 320)]
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore", UserWarning)
+        mg, vt, grid = _mesh(_model([(coords, {**B, "simplify_tolerance": tolerance or None})]))
+    _assert_exact(mg, vt, grid)
+    ends = [line.coords[k] for line in mg.barrier_lines.geometry for k in (0, -1)]
+    assert sorted(ends) == [(100.0, 300.0), (200.0, 300.0)]
+    assert _sealed(mg, grid, (150, 250), (150, 100))
+
+
+@pytest.mark.parametrize("coords", [[(100, 154), (260, 154)], [(100, 154), (180, 154.5), (255, 154)]])
+def test_parallel_barrier_within_the_tolerance_is_not_merged_into_its_neighbour(coords):
+    lines = [([(40, 150), (260, 150)], B), (coords, {**B, "simplify_tolerance": 5.0})]
+    mg, vt, grid = _mesh(_model(lines))
+    _assert_exact(mg, vt, grid)
+    assert [e for e in mg.barrier_report["snaps"] if e["kind"] in ("snap", "trim")] == []
+    neighbour = mg.barrier_lines.geometry[mg.barrier_lines["line_id"] == "line1"].iloc[0]
+    assert shapely.hausdorff_distance(neighbour, LineString(coords)) < 0.98 * 5.0
+
+
+def test_straddle_width_value_does_not_change_the_mesh():
+    # A non-barrier face line crossed by a quad-buffer line: the value used to set the trimming width.
+    nodes = []
+    for width in (0.5, 20.0):
+        with pytest.warns(FutureWarning, match="straddle_width"):
+            cm = _model([([(40, 150), (260, 150)], {"straddle_width": width}),
+                         ([(150, 60), (150, 240)], {"quad_buffer": True})])
+        mg, _, _ = _mesh(cm)
+        nodes.append(mg.nodes)
+        assert mg.barrier_lines["is_barrier"].tolist() == [False]
+    assert np.array_equal(*nodes)
+
+
+def test_barrier_on_a_zone_edge_reports_no_fixed_nodes():
+    left = {"geometry": box(0, 0, 150, 300), "zone_id": 2, "resolution": BACKGROUND_LC, "z_order": 1}
+    with warnings.catch_warnings(record=True) as record:
+        warnings.simplefilter("always")
+        mg, vt, grid = _mesh(_model([([(150, 40), (150, 260)], B)], polygons=[left]))
+    _assert_exact(mg, vt, grid)
+    assert mg.barrier_report["fixed_nodes"] == []
+    assert not [w for w in record if "fixed" in str(w.message) or "removed" in str(w.message)]

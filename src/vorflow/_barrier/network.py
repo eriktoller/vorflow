@@ -50,6 +50,7 @@ import shapely
 from shapely.geometry import LineString, Point
 
 from .lines import BarrierLine
+from .wedge import collapse_wedges
 
 COLLINEAR_SIN = 1e-9
 PHI0 = math.radians(45.0)
@@ -124,6 +125,7 @@ class Network:
     lines: list          # the barrier polylines the faces follow (after stubs and spike tips)
     uncovered: list      # (kind, length, xy, line_id) of barrier parts left without faces
     corridors: list = dataclasses.field(default_factory=list)  # see ``corridor``
+    collapsed: list = dataclasses.field(default_factory=list)  # acute wedges merged (``wedge``)
 
 
 # ---------------------------------------------------------------------------
@@ -527,6 +529,7 @@ def build_network(lines: list, standard: list, domain, tol: float, sharp_angle: 
     lines = drop_stubs([dataclasses.replace(b, xy=b.xy.copy(), keep=b.keep.copy()) for b in lines],
                        domain, tol, uncovered)
     lines = [dataclasses.replace(b, **dict(zip(("xy", "keep"), drop_collinear(b.xy, b.keep)))) for b in lines]
+    lines, collapsed = collapse_wedges(lines, domain, tol, sharp_angle, lambda xy: _on_boundary(domain, xy, tol))
     lines, spikes = truncate_spikes(lines, standard, domain, tol, uncovered, sharp_angle)
     hard, pieces, lc = nodes_and_pieces(lines)
     rungs, rung_ends = [], set()
@@ -539,4 +542,4 @@ def build_network(lines: list, standard: list, domain, tol: float, sharp_angle: 
     used = {p for r in rungs for p in r.pieces}
     plans = [node_plan(v, hard, pieces, domain, standard, tol, v in rung_ends, used, rungs)
              for v in range(len(hard))]
-    return Network(hard, pieces, lc, plans, rungs, lines, uncovered)
+    return Network(hard, pieces, lc, plans, rungs, lines, uncovered, collapsed=collapsed)

@@ -46,7 +46,7 @@ from .._features import feature_lc, is_embedded, is_face_line, line_parts, row_b
 from .._log import warn_user
 from ..buffer import protection_epsilon
 from . import pipeline as planning
-from . import polish
+from . import polish, wedge
 from .sizing import FEATURE_CAP, Obstacle, near_crossing, size_function
 
 logger = logging.getLogger(__name__)
@@ -418,6 +418,14 @@ def _corridor_entry(c, plan, context) -> dict:
             'location': (float(mid[0]), float(mid[1])), 'length': float(c.x1 - c.x0)}
 
 
+def _collapse_entry(e: dict, context) -> dict:
+    """A merged acute wedge for ``barrier_report`` (see ``wedge``)."""
+    xy = e['location'] + context.origin
+    return {'kind': e['kind'], 'line_ids': [context.face_rows[k][0] for k in e['lines']],
+            'location': (float(xy[0]), float(xy[1])), 'angle': float(e['angle']), 'reach': float(e['reach']),
+            'deviation': float(e['deviation'])}
+
+
 def _clean_event(e: dict) -> dict:
     """A cleaning event for ``barrier_report``."""
     return {'line_id': e.get('line_id'), 'kind': e['kind'], 'distance': float(e['distance']),
@@ -447,6 +455,7 @@ def report(plan, context, fitted: dict) -> dict:
         (tips if kind == "spike tip" else stubs).append(entry)
     return {
         'corridors': [_corridor_entry(c, plan, context) for c in plan.net.corridors],
+        'collapsed': [_collapse_entry(e, context) for e in plan.net.collapsed],
         'tips': tips,
         'stubs': stubs,
         'snaps': cleaning['snaps'],
@@ -466,7 +475,7 @@ def dropped_report(lines) -> dict | None:
     events = list(lines.attrs.get('dropped_barrier_events', [])) if lines is not None else []
     if not events:
         return None
-    return {'corridors': [], 'tips': [], **_cleaning_entries(events), 'rings': [], 'fixed_nodes': [],
+    return {'corridors': [], 'collapsed': [], 'tips': [], **_cleaning_entries(events), 'rings': [], 'fixed_nodes': [],
             'repair_rounds': 0, 'sites': 0, 'removed_nodes': 0, 'polish': {}}
 
 
@@ -476,6 +485,13 @@ def report_warnings(report: dict, sharp_angle: float) -> list:
     Noise and boundary parts are warned about one by one when ConceptualMesh cleans the lines.
     """
     out = []
+    if report['collapsed']:
+        moved = max(e['deviation'] for e in report['collapsed'])
+        out.append(f"{len(report['collapsed'])} narrow barrier junction(s) or boundary exit(s) (legs closer than "
+                   f"sharp_angle={sharp_angle:g} degrees, or fans of legs closer than "
+                   f"{math.degrees(wedge.FAN_ANGLE):g} degrees) were merged over a short reach, so the barriers "
+                   f"there share one line of faces for a short stretch (moved at most {moved:.3g}, within "
+                   f"{wedge.DEVIATION:g} x resolution); see MeshGenerator.barrier_report['collapsed'].")
     if report['tips']:
         out.append(f"{len(report['tips'])} barrier spike tip(s) sharper than sharp_angle={sharp_angle:g} degrees "
                    f"are left without cell faces ({sum(t['length'] for t in report['tips']):.3g} of barrier "

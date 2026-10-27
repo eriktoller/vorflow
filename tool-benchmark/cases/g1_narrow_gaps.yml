@@ -1,0 +1,35 @@
+id: g1_narrow_gaps
+tier: 1
+description: >
+  Narrow gaps between features. Two parallel lines run 15 m apart (1.5 x their
+  10 m size), and a third line runs 10 m inside the top boundary (1 x its
+  size). With per-feature sizing alone, each gap holds only one or two cells.
+  The transects cross each gap at three places; the metrics count the cells
+  across them.
+source: new
+crs: EPSG:32610
+h_max: 40.0
+growth: 1.2
+target_ncpl: 3000
+domain: POLYGON ((0 0, 1000 0, 1000 600, 0 600, 0 0))
+features:
+  - id: lower
+    kind: line
+    h: 10.0
+    wkt: LINESTRING (150 280, 850 280)
+  - id: upper
+    kind: line
+    h: 10.0
+    wkt: LINESTRING (150 295, 850 295)
+  - id: edge
+    kind: line
+    h: 10.0
+    wkt: LINESTRING (150 590, 850 590)
+transects:
+  - LINESTRING (300 280, 300 295)
+  - LINESTRING (500 280, 500 295)
+  - LINESTRING (700 280, 700 295)
+  - LINESTRING (300 590, 300 600)
+  - LINESTRING (500 590, 500 600)
+  - LINESTRING (700 590, 700 600)
+mf6_problems: [linear]

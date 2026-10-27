@@ -37,6 +37,7 @@ Barriers are not densified: the barrier construction places its own nodes.
 from __future__ import annotations
 
 import dataclasses
+import heapq
 import math
 
 import numpy as np
@@ -48,6 +49,9 @@ from shapely.geometry import LineString, Point
 NOISE_FRACTION = 0.1      # x lc: vertices closer than this to a neighbour are digitising noise
 SIMPLIFY_MARGIN = 0.98    # simplification uses this x simplify_tolerance
 SHORT_PENALTY = 4.0       # simplification cost of a chord of length L: 1 + SHORT_PENALTY max(0, 1 - L/lc)^2
+MAX_SPAN = 512            # a simplified chord spans at most this many input vertices
+REACH_BLOCK = 32          # chords judged per block when looking back from a vertex (the blocks double)
+REACH_EPS = 1e-9          # relative margin below which a chord is judged by the exact distance check
 MERGE_FRACTION = 1e-9     # x extent: vertices closer than this are one vertex
 SNAP_PARALLEL_ANGLE = math.radians(12.0)  # an end segment this close to parallel with its snap target runs along it
 
@@ -380,23 +384,82 @@ def _chord_ok(xy: np.ndarray, i: int, j: int, tol: float) -> bool:
     return bool(np.hypot(*(pts - np.outer(t, ab)).T).max() <= tol)
 
 
+def _reach_block(xy: np.ndarray, j: int, idx: np.ndarray, state: dict, tol: float) -> tuple:
+    """(fast verdict, needs the exact check) of the chords (i, j) for ``idx`` (descending, below the last block).
+
+    The chord is within ``tol`` of every vertex k between i and j exactly
+    when it is within ``tol`` of the ray from j through each of them (the
+    direction to i lies in every wedge of half-width asin(tol / r_k) about
+    the direction to k, r_k = |k - j|) and no k lies beyond i (r_k > r_i).
+    The wedges are intersected incrementally (``state``: the bounds, the
+    reference direction, the largest r and whether a borderline vertex was
+    passed), so a chord is judged in O(1); borderline cases (within
+    REACH_EPS) are left to ``_chord_ok``.
+    """
+    v = xy[idx] - xy[j]
+    r = np.hypot(*v.T)
+    wide = r > tol * (1 + REACH_EPS)
+    if state["ref"] is None and wide.any():
+        state["ref"] = v[int(np.argmax(wide))] / r[int(np.argmax(wide))]
+    ref = state["ref"]
+    if ref is None:
+        theta = np.zeros(len(idx))
+    else:
+        theta = np.arctan2(ref[0] * v[:, 1] - ref[1] * v[:, 0], v @ ref)
+    half = np.arcsin(np.minimum(tol / np.where(wide, r, np.inf), 1.0))
+    lo_k = np.where(wide, theta - half, -np.inf)
+    hi_k = np.where(wide, theta + half, np.inf)
+    border = np.abs(r - tol) <= tol * REACH_EPS
+    # exclusive scans: chord (idx[p], j) sees the vertices of earlier blocks and idx[:p]
+    lo = np.maximum.accumulate(np.concatenate([[state["lo"]], lo_k]))
+    hi = np.minimum.accumulate(np.concatenate([[state["hi"]], hi_k]))
+    rmax = np.maximum.accumulate(np.concatenate([[state["rmax"]], r]))
+    risky = np.logical_or.accumulate(np.concatenate([[state["border"]], border]))
+    state.update(lo=lo[-1], hi=hi[-1], rmax=rmax[-1], border=bool(risky[-1]))
+    slack = np.minimum(hi[:-1] - theta, theta - lo[:-1])
+    exact = risky[:-1] | (rmax[:-1] > r * (1 - REACH_EPS)) | (np.abs(slack) <= REACH_EPS)
+    return slack > 0, exact
+
+
+def chord_reach(xy: np.ndarray, j: int, floor: int, tol: float) -> int:
+    """Smallest i >= ``floor`` with every chord (i', j), i <= i' < j, within ``tol``; scanning down from j - 1
+    and stopping at the first chord that is not (``_chord_ok``), in blocks of growing size."""
+    state = {"ref": None, "lo": -np.inf, "hi": np.inf, "rmax": 0.0, "border": False}
+    top, size = j - 1, REACH_BLOCK
+    while top >= floor:
+        idx = np.arange(top, max(floor, top - size + 1) - 1, -1)
+        fast, exact = _reach_block(xy, j, idx, state, tol)
+        for p in np.flatnonzero(exact | ~fast):
+            if not (_chord_ok(xy, int(idx[p]), j, tol) if exact[p] else fast[p]):
+                return int(idx[p]) + 1
+        top, size = int(idx[-1]) - 1, 2 * size
+    return floor
+
+
 def fewest_chords(xy: np.ndarray, keep: np.ndarray, tol: float, lc: float,
-                  short_penalty: float = SHORT_PENALTY) -> np.ndarray:
-    """Indices of the cheapest chain of chords within ``tol`` (shortest path; must-keep vertices kept)."""
+                  short_penalty: float = SHORT_PENALTY, max_span: int = MAX_SPAN) -> np.ndarray:
+    """Indices of the cheapest chain of chords within ``tol`` (shortest path; must-keep vertices kept).
+
+    Vertex j is reached from every i back to the first chord that is not
+    within ``tol``, the last must-keep vertex, or ``max_span`` vertices
+    (``chord_reach``), the cheapest i first among equals counting down from
+    j - 1. The span bound keeps the cost linear in the vertex count; it only
+    matters for a line that stays within the tolerance of a chord over more
+    than ``max_span`` vertices, which then keeps one vertex per span.
+    """
     n = len(xy)
     best = np.full(n, np.inf)
     prev = np.full(n, -1)
     best[0] = 0.0
+    last_keep = np.maximum.accumulate(np.where(keep, np.arange(n), 0))
     for j in range(1, n):
-        for i in range(j - 1, -1, -1):
-            if not _chord_ok(xy, i, j, tol):
-                break
-            length = np.hypot(*(xy[j] - xy[i]))
-            cost = best[i] + 1.0 + short_penalty * max(0.0, 1.0 - length / lc) ** 2
-            if cost < best[j]:
-                best[j], prev[j] = cost, i
-            if keep[i]:
-                break
+        start = chord_reach(xy, j, max(int(last_keep[j - 1]), j - max_span), tol)
+        i = np.arange(j - 1, start - 1, -1)
+        length = np.hypot(*(xy[j] - xy[i]).T)
+        short = np.maximum(0.0, 1.0 - length / lc)
+        cost = best[i] + 1.0 + short_penalty * (short * short)
+        k = int(np.argmin(cost))
+        best[j], prev[j] = cost[k], i[k]
     chain = [n - 1]
     while chain[-1] != 0:
         chain.append(prev[chain[-1]])
@@ -422,24 +485,63 @@ def _offset(p: np.ndarray, a: np.ndarray, c: np.ndarray) -> float:
     return float(np.hypot(*(p - a - t * ac)))
 
 
+def _noise_candidate(xy: np.ndarray, keep: np.ndarray, prev: np.ndarray, nxt: np.ndarray, v: int,
+                     short: float) -> float | None:
+    """The move of dropping vertex ``v`` if it may be dropped (inner, not must-keep, next to a segment shorter
+    than ``short``), else None."""
+    p, n = prev[v], nxt[v]
+    if p < 0 or n < 0 or keep[v]:
+        return None
+    if not (np.hypot(*(xy[v] - xy[p])) < short or np.hypot(*(xy[n] - xy[v])) < short):
+        return None
+    return _offset(xy[v], xy[p], xy[n])
+
+
+def drop_noise(xy: np.ndarray, keep: np.ndarray, short: float) -> tuple:
+    """(kept mask, vertices dropped, largest move, where): vertices next to a segment shorter than ``short``
+    dropped one at a time, least move first (ties: first along the line), until none is left or two remain.
+
+    A heap of the candidates with lazy invalidation: dropping a vertex only
+    changes its two neighbours.
+    """
+    n = len(xy)
+    prev, nxt = np.arange(-1, n - 1), np.arange(1, n + 1)
+    nxt[-1] = -1
+    version = np.zeros(n, dtype=np.int64)
+    alive = np.ones(n, dtype=bool)
+    heap = []
+    for v in range(n):
+        move = _noise_candidate(xy, keep, prev, nxt, v, short)
+        if move is not None:
+            heap.append((move, v, 0))
+    heapq.heapify(heap)
+    count, dropped, largest, where = n, 0, 0.0, None
+    while count > 2 and heap:
+        move, v, ver = heapq.heappop(heap)
+        if not alive[v] or ver != version[v]:
+            continue
+        if move >= largest:
+            largest, where = move, xy[v].copy()
+        alive[v] = False
+        p, q = prev[v], nxt[v]
+        nxt[p], prev[q] = q, p
+        count -= 1
+        dropped += 1
+        for u in (p, q):
+            version[u] += 1
+            move = _noise_candidate(xy, keep, prev, nxt, u, short)
+            if move is not None:
+                heapq.heappush(heap, (move, u, int(version[u])))
+    return alive, dropped, largest, where
+
+
 def clean_noise(barriers: list, fraction: float = NOISE_FRACTION) -> None:
-    """Drop vertices closer than ``fraction`` x lc to a neighbour, least move first (step 4)."""
+    """Drop vertices closer than ``fraction`` x lc to a neighbour, least move first (step 5)."""
     for b in barriers:
-        dropped, largest, where = 0, 0.0, None
-        while len(b.xy) > 2 and np.isfinite(b.lc):
-            seg = np.hypot(*np.diff(b.xy, axis=0).T)
-            options = []
-            for s in np.flatnonzero(seg < fraction * b.lc):
-                for v in (s, s + 1):
-                    if 0 < v < len(b.xy) - 1 and not b.keep[v]:
-                        options.append((_offset(b.xy[v], b.xy[v - 1], b.xy[v + 1]), v))
-            if not options:
-                break
-            move, v = min(options)
-            if move >= largest:
-                largest, where = move, b.xy[v].copy()
-            b.xy, b.keep = np.delete(b.xy, v, axis=0), np.delete(b.keep, v)
-            dropped += 1
+        if not np.isfinite(b.lc):
+            continue
+        alive, dropped, largest, where = drop_noise(b.xy, b.keep, fraction * b.lc)
+        b.xy, b.keep = b.xy[alive], b.keep[alive]
         if dropped:
             b.events.append(_event("noise", where, largest,
                                    f"dropped {dropped} vertices closer than {fraction:g} x lc to a neighbour "

@@ -101,8 +101,10 @@ def _straight_face(shared, centres, pair, tolerance):
         if np.max(np.abs(offsets @ normal)) > tolerance:
             raise ValueError(
                 f"Noncollinear shared face between cells {pair}: the cells meet along a "
-                "bent line, usually a barrier corner cut inside a cell. MFUSG export "
-                "needs straight shared faces; refine the mesh near the corner."
+                "bent line, which breaks the straight, perpendicular face that CVFD "
+                "connections assume (MF6 DISV would silently use only its first edge). "
+                "In vorflow grids this comes from cells cut along a barrier; check the "
+                "barrier warnings from generate()."
             )
         projected = offsets @ direction
         intervals.append((projected.min(), projected.max()))

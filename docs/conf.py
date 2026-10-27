@@ -70,7 +70,7 @@ autodoc_typehints = "description"
 napoleon_google_docstring = True
 napoleon_numpy_docstring = False
 napoleon_use_rtype = False
-napoleon_custom_sections = [("Deprecated parameters", "params_style")]
+napoleon_custom_sections = [("Deprecated parameters", "params_style"), ("Barrier results", "params_style")]
 
 intersphinx_mapping = {
     "python": ("https://docs.python.org/3", None),

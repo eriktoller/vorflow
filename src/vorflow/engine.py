@@ -868,8 +868,9 @@ class MeshGenerator:
             20. Independent of ``VoronoiTessellator(lloyd_iterations=...)``,
             which also respects the circles.
 
-    Barrier results (after ``generate()``):
-        barrier_report (dict): What the barrier construction did and gave
+    Barrier results:
+        barrier_report (dict): Set by ``generate()``, like the three
+            attributes below. What the barrier construction did and gave
             up, each entry with its ``location`` (global x, y): ``tips``
             (sharp spike tips left without faces, with ``length``),
             ``stubs`` (dangling pieces shorter than 0.1 x resolution past a

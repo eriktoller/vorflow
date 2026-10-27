@@ -873,15 +873,23 @@ class MeshGenerator:
             up, each entry with its ``location`` (global x, y): ``tips``
             (sharp spike tips left without faces, with ``length``),
             ``stubs`` (dangling pieces shorter than 0.1 x resolution past a
-            junction, dropped), ``snaps`` (barrier ends moved or trimmed
-            onto another barrier or the boundary, and simplifications),
-            ``noise`` (digitising-noise vertices dropped, with the largest
-            move), ``rings`` (hex rings dropped next to a barrier),
-            ``corridors`` (narrow gaps given one shared row of cells:
-            ``kind`` "barriers" between two close parallel barriers or
-            "boundary" along a boundary edge, ``line_ids``, ``length``),
-            plus ``repair_rounds``, ``sites``, ``removed_nodes`` and
-            ``polish``.
+            junction, and branches that snapping collapsed, dropped),
+            ``snaps`` (barrier ends moved or trimmed onto another barrier or
+            the boundary, and simplifications), ``noise`` (digitising-noise
+            vertices dropped, with the largest move), ``on_boundary``
+            (barrier parts dropped because they lie on the domain boundary,
+            ``distance`` the length dropped), ``rings`` (hex rings dropped
+            because a barrier is too close), ``fixed_nodes`` (per standard
+            line, zone edge or quad-buffer strip, the ``nodes`` that had to
+            be removed inside the circles), ``corridors`` (narrow gaps given
+            one shared row of cells: ``kind`` "barriers" between two close
+            parallel barriers or "boundary" along a boundary edge,
+            ``line_ids``, ``length``), plus ``repair_rounds``, ``sites``,
+            ``removed_nodes`` (Gmsh nodes removed for the sites, not counting
+            Gmsh's copies of the sites) and ``polish``. Tips, stubs, snapped
+            ends and fixed-line nodes each raise one UserWarning with their
+            count. When the cleaning dropped every barrier, the report holds
+            only what it dropped.
         barrier_lines (GeoDataFrame): The lines the barrier faces follow
             (after stubs and sharp tips are removed), with ``feature_id``
             (the clean-line index), ``line_id`` and ``is_barrier``.

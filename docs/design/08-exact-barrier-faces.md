@@ -64,10 +64,14 @@ is reported.
 
 **Face lengths** (`sizing.py`). The face length along the barrier follows
 vorflow's size field, read before Gmsh runs through `MeshField.python_size()`.
-It is capped by the distance to other barrier parts, to the domain boundary
-and to point features, so that no circle reaches them. It is then graded
-along the whole network at once (`barrier_gradation`, 0.3 by default), across
-junctions.
+It is capped by the distance to other barrier parts, to the domain boundary,
+to point features and to standard lines, zone edges and quad-buffer strips,
+so that no circle reaches them. A line that crosses a barrier is not capped
+within 7 face lengths of the crossing, which the crossing's own sites handle.
+It is then graded along the whole network at once (`barrier_gradation`, 0.3
+by default), across junctions. A point feature on or next to a barrier
+(closer than about 0.05 x `resolution`) raises `BarrierMeshError` naming the
+point and the barrier, since a cell centre cannot sit on a barrier face.
 
 **Narrow gaps** (`corridor.py`). Two nearly parallel barriers closer than
 1.2 x the face length share one row of cells, with sites on the midline. A
@@ -83,14 +87,18 @@ plan raises `BarrierMeshError`, a `ValueError` naming the place and suggesting
 **Meshing** (`frames.py`, `polish.py`, `engine.py`). Gmsh meshes a copy of the
 clean frames in which each barrier is a size field only, and the sites are
 embedded points. Afterwards the mesh nodes inside the circles are removed
-(feature nodes never are). The free nodes are then moved by Lloyd steps around
-the fixed sites, kept out of the circles (`barrier_polish_iterations`, 20 by
-default). The sites join `MeshGenerator.nodes`.
+(feature nodes never are). A removed node of a standard line, zone edge or
+quad-buffer strip away from where it crosses a barrier is reported in
+`barrier_report["fixed_nodes"]`, with a warning. The free nodes are then moved
+by Lloyd steps around the fixed sites, kept out of the circles
+(`barrier_polish_iterations`, 20 by default); a step pushed out of a circle is
+checked again against the embedded lines. The sites join
+`MeshGenerator.nodes`.
 
 **Tessellation.** The tessellator's barrier mirror generators and cell cutting
 stay as a safety net. They found nothing to do on any of the 73 cases. If they
 are ever needed on an exact barrier, `generate()` warns. With
-`VoronoiTessellator.strict_barriers = True`, as in the test suite, it raises
+`vorflow.tessellator.STRICT_BARRIERS = True`, as in the test suite, it raises
 instead. Quad buffers on barriers still go through this path.
 
 ## Line cleaning
@@ -101,15 +109,19 @@ like small ones:
 
 1. An end within `max(connectivity_tolerance, simplify_tolerance)` of another
    barrier, a barrier vertex or the domain boundary is snapped onto it. A
-   short overshoot past another barrier is trimmed back.
-2. Junctions and crossings with other barriers and with standard lines become
+   short overshoot past another barrier is trimmed back. A branch that
+   collapses onto the barrier it starts on is dropped as a stub.
+2. A part lying on the domain boundary (within the same distance) is dropped
+   with a warning: a barrier there separates nothing. A barrier lying wholly
+   on the boundary leaves no row in `clean_lines`.
+3. Junctions and crossings with other barriers and with standard lines become
    shared vertices.
-3. With `simplify_tolerance` above 0, the line is replaced by the fewest
+4. With `simplify_tolerance` above 0, the line is replaced by the fewest
    straight pieces between its own vertices that stay within the tolerance.
    Junctions, crossings and ends are kept. The old per-line Douglas-Peucker
    pass ran before junctions were joined and could pull a splay off its
    fault.
-4. A vertex closer than 0.1 x `resolution` to its neighbour is dropped as
+5. A vertex closer than 0.1 x `resolution` to its neighbour is dropped as
    digitising noise, with a warning, even when `simplify_tolerance` is 0.
 
 Barrier lines are no longer densified. Each change is recorded and passed on
@@ -123,12 +135,14 @@ to `MeshGenerator.barrier_report`.
 - `ConceptualMesh(keep_close_rings=False)`: keep a `hex_ring` next to a
   barrier by making the barrier faces there shorter.
 - After `generate()`: `MeshGenerator.barrier_report` (`snaps`, `noise`,
-  `stubs`, `tips`, `rings`, `corridors`, each entry with its place, plus
-  `repair_rounds`, `sites`, `removed_nodes` and `polish`),
-  `barrier_lines`, `barrier_circles` and `node_is_site`.
+  `stubs`, `tips`, `on_boundary`, `rings`, `fixed_nodes`, `corridors`, each
+  entry with its place, plus `repair_rounds`, `sites`, `removed_nodes` and
+  `polish`), `barrier_lines`, `barrier_circles` and `node_is_site`. Spike
+  tips, stubs, snapped ends and removed fixed-line nodes each raise one
+  `UserWarning` with their count.
 - `vorflow.BarrierMeshError(ValueError)`.
-- `add_line(straddle_width=...)` is deprecated, warns and is ignored on
-  barriers. The internal `vorflow._straddle` module was removed.
+- `add_line(straddle_width=...)` is deprecated with a `FutureWarning`, and
+  its value is ignored. The internal `vorflow._straddle` module was removed.
 
 ## Results
 
@@ -176,14 +190,20 @@ barrier.
 
 - `tests/test_barrier_faces.py` meshes each case end to end and checks the
   properties of the construction: no mirror generators and no cut cells, one
-  cell per mesh node, no other node inside an empty circle, no face crossing
-  a barrier, single-edge barrier faces with an orthogonality error below
-  1e-6, and faces that cover the barrier length. The cases are a straight
-  line, kinks, a zigzag, T, X and Y junctions, standard-line crossings and
-  ends, boundary and corner ends and a ring. Focused tests cover spike tips,
-  stubs, snapping, noise, corridors, options, the report, the deprecation,
-  the error and the safety net. A `slow` regression set holds the held-out
-  and adversarial shapes and a digitised relay-ramp fault network.
-- When this note was written the full suite gave 624 passed and 2 xfailed.
+  cell per mesh node, no other node or generator inside an empty circle, no
+  face crossing a barrier, one single-edge face per barrier segment running
+  from circle centre to circle centre with an orthogonality error below
+  1e-6, and faces that cover the cleaned barrier lines less the reported
+  tips and stubs. The cases are a straight line, kinks, a zigzag, T, X and Y
+  junctions, standard-line crossings and ends, boundary and corner ends and
+  a ring. Focused tests cover spike tips, stubs, snapping, noise, corridors,
+  options, the report, the deprecation, the errors, the safety net, the
+  deviation from the input line, x0.01 and x100 scale, the tessellator's
+  Lloyd, short-face and `inset_mirror` steps, standard lines, zone edges and
+  quad-buffer strips next to a barrier, barriers on the domain boundary and
+  warnings that point at the caller. A `slow` regression set holds the
+  held-out and adversarial shapes and a digitised relay-ramp fault network.
+  `tests/test_barrier_units.py` checks the helpers without Gmsh.
+- When this note was written the full suite gave 664 passed and 2 xfailed.
 - `examples/barrier_meshing.ipynb` shows the cases that used to be cut, the
   report and the remaining limits.

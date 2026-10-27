@@ -206,7 +206,11 @@ Before meshing, `ConceptualMesh.generate()` cleans the barrier lines:
 
 - an end within `max(connectivity_tolerance, simplify_tolerance)` of another
   barrier or of the domain boundary is snapped onto it, and a short
-  overshoot is trimmed back;
+  overshoot is trimmed back. A branch no longer than that distance, which
+  snaps onto the barrier it starts on, is dropped as a stub;
+- a part of a barrier that lies on the domain boundary (within the same
+  distance) is dropped with a warning, because a barrier there separates
+  nothing;
 - junctions and crossings become vertices shared by both lines;
 - with `simplify_tolerance` above 0, the line is simplified after the
   junctions are joined, so a splay stays on the fault it starts on;
@@ -216,10 +220,17 @@ Before meshing, `ConceptualMesh.generate()` cleans the barrier lines:
 `MeshGenerator.barrier_report` lists each of these changes with its place.
 It also lists what the construction gave up, such as the tip of a spike
 sharper than `sharp_angle` (18 degrees by default), which is left inside a
-few cells without faces. Two nearly parallel barriers closer than about
-1.2 x `resolution` share one row of cells, and so do a barrier and the
-domain boundary when they are closer than about 0.6 x `resolution`. Check
-the report before you build HFB input.
+few cells without faces. Spike tips, dropped stubs and snapped ends each
+raise one `UserWarning` with their count. Two nearly parallel barriers
+closer than about 1.2 x `resolution` share one row of cells, and so do a
+barrier and the domain boundary when they are closer than about
+0.6 x `resolution`. Check the report before you build HFB input.
+
+Standard lines, zone edges and quad-buffer strips next to a barrier keep
+their nodes: the barrier faces are made shorter there, so the circles do not
+reach them. Where such a line crosses a barrier, the crossing takes its
+nodes over. If a node of one is removed anyway, `generate()` warns and
+`barrier_report["fixed_nodes"]` names the line.
 
 ```python
 mesher = MeshGenerator(background_lc=100, conceptual_mesh=blueprint,
@@ -231,7 +242,9 @@ print(mesher.barrier_report["snaps"], mesher.barrier_report["tips"])
 When the faces would have to be far shorter than `resolution`, for example
 where two barrier parts nearly touch, `generate()` raises
 `vorflow.BarrierMeshError` with the place. Set `simplify_tolerance` on the
-barrier, or use a finer `resolution`. On the digitised fault networks we
+barrier, or use a finer `resolution`. A point feature, such as a well, on a
+barrier also raises it, naming the point and the barrier: a cell centre
+cannot sit on a barrier face, so move the point off the line. On the digitised fault networks we
 tested, `simplify_tolerance` of `resolution / 8` was enough. For example, a
 splay that leaves a fault at about 10 degrees raises at
 `simplify_tolerance=0` when the fault has a digitised vertex just past the
@@ -239,8 +252,9 @@ junction.
 
 Quad buffers on barriers (`quad_buffer=True`) do not use the exact faces
 yet. They still rely on mirrored generators and on cutting cells, so they
-can leave cut cells and bent faces. `straddle_width` is deprecated and
-ignored on barriers.
+can leave cut cells and bent faces. `straddle_width` is deprecated, with a
+`FutureWarning`, and its value is ignored. A non-barrier line that sets it
+still gets exact faces along it.
 
 [examples/barrier_meshing.ipynb](https://github.com/rhugman/vorflow/blob/main/examples/barrier_meshing.ipynb)
 shows each case, the report and these limits.

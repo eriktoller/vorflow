@@ -18,14 +18,21 @@ and the project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   cell face, for example where the faces would have to be far shorter than
   the barrier's `resolution`. The message gives the place (x, y) and
   suggests setting `simplify_tolerance` on the barrier or a finer
-  `resolution`.
+  `resolution`. A point feature (or a kept hex-ring seed) on a barrier
+  raises it too, naming the point and the barrier: the point must be moved
+  off the line.
 - `MeshGenerator.barrier_report`: a dict that lists, each with its place,
   what the barrier construction changed or gave up. The entries are ends
   snapped or trimmed onto another barrier or the boundary (`snaps`),
   vertices dropped as digitising noise (`noise`), short pieces dropped past
-  a junction (`stubs`), sharp spike tips left without faces (`tips`), hex
-  rings dropped next to a barrier (`rings`) and narrow gaps given one shared
-  row of cells (`corridors`). `MeshGenerator.barrier_lines` holds the lines
+  a junction or collapsed by snapping (`stubs`), sharp spike tips left
+  without faces (`tips`), barrier parts dropped because they lie on the
+  domain boundary (`on_boundary`), hex rings dropped because a barrier is
+  too close (`rings`), nodes of standard lines, zone edges or quad-buffer
+  strips that had to be removed (`fixed_nodes`) and narrow gaps given one
+  shared row of cells (`corridors`). `removed_nodes` counts the Gmsh nodes
+  removed for the barrier sites, not counting Gmsh's own copies of the
+  sites. `MeshGenerator.barrier_lines` holds the lines
   the faces follow, `barrier_circles` the empty circles and `node_is_site`
   marks the nodes placed on them.
 - `MeshGenerator(barrier_gradation=0.3, sharp_angle=18,
@@ -41,11 +48,12 @@ and the project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - `MeshField.python_size()`: the size a field asks for at a distance from
   its feature, evaluated before Gmsh runs. The barrier construction reads
   it to size the barrier faces. The built-in fields implement it. A custom
-  field without it is left out of that estimate, though Gmsh still applies
-  it.
-- `VoronoiTessellator.strict_barriers` (class attribute, default False):
-  with True, the tessellator raises `BarrierMeshError` instead of warning
-  when it has to mirror or cut a cell on a barrier (see Changed).
+  field without it is left out of that estimate, with a `UserWarning`
+  naming the field, though Gmsh still applies it.
+- `vorflow.tessellator.STRICT_BARRIERS` (module flag, default False): with
+  True, the tessellator raises `BarrierMeshError` instead of warning when it
+  has to mirror or cut a cell on a barrier (see Changed). The test suite
+  sets it.
 - The notebook `examples/barrier_meshing.ipynb` shows how barrier faces are
   placed, what `barrier_report` lists and the remaining limits. The README
   has a new "Barriers" section.
@@ -80,15 +88,25 @@ and the project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   crossings become shared vertices. A vertex closer than 0.1 x
   `resolution` to its neighbour is dropped as digitising noise, with a
   `UserWarning` giving the largest move, even when `simplify_tolerance` is
-  0. Barrier lines are no longer densified.
+  0. A branch that snapping collapses onto the barrier it starts on is
+  dropped as a stub. A barrier part lying on the domain boundary is dropped
+  with a `UserWarning`, since a barrier there separates nothing; a barrier
+  lying wholly on the boundary leaves no row in `clean_lines`. Barrier lines
+  are no longer densified.
 - `simplify_tolerance` on a barrier now simplifies after the junctions are
   joined, keeping junctions, crossings and ends, and uses the fewest
   straight pieces within the tolerance. Before, a per-line Douglas-Peucker
   pass ran first and could pull a splay off the fault it starts on.
 - A spike sharper than `sharp_angle` (18 degrees) leaves the last
   0.45 x `resolution` of each leg without faces, so the cells at the tip
-  stay regular. vorflow logs a warning and lists the tip in
-  `barrier_report["tips"]`.
+  stay regular. The tip is listed in `barrier_report["tips"]`.
+  `MeshGenerator.generate()` raises one `UserWarning` with the count of
+  spike tips, one for dropped stubs, one for snapped or trimmed ends and one
+  for removed nodes of fixed lines; the details are in `barrier_report`.
+- Next to a barrier, the barrier faces are made shorter so that the nodes of
+  standard lines, zone edges and quad-buffer strips stay outside the empty
+  circles. Where such a line crosses a barrier, the crossing's own sites
+  take over its nodes.
 - The tessellator's barrier mirror generators and cell cutting are now a
   safety net for barriers. They found nothing to do on any of the 73
   barrier benchmark cases. If they are ever needed on a barrier,
@@ -98,9 +116,9 @@ and the project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Deprecated
 
-- `add_line(straddle_width=...)` emits a `DeprecationWarning` and is
-  ignored on barriers: the barrier faces are now placed automatically. A
-  non-barrier line that sets it still gets cell faces along it, as before.
+- `add_line(straddle_width=...)` emits a `FutureWarning`, and its value is
+  ignored: the barrier faces are now placed automatically. A non-barrier
+  line that sets it still gets exact cell faces along it, as before.
 
 ### Removed
 

@@ -664,7 +664,9 @@ class ConceptualMesh:
             ``generate()`` cleans every barrier (embedded, no quad buffer) before
             meshing: an end within ``max(connectivity_tolerance, simplify_tolerance)``
             of another barrier, of its vertex or of the domain boundary is snapped
-            onto it (a short overshoot is trimmed); junctions and crossings become
+            onto it (a short overshoot is trimmed, and a branch that collapses onto
+            the barrier it starts on is dropped); parts lying on the domain boundary
+            are dropped with a warning; junctions and crossings become
             shared vertices; a ``simplify_tolerance`` simplifies by the fewest chords
             while keeping them; and vertices closer than 0.1 x resolution to a
             neighbour (digitising noise) are always dropped, with a warning giving
@@ -672,7 +674,8 @@ class ConceptualMesh:
             places the barrier's cell generators in closed form so each barrier
             segment is exactly one cell face (``MeshGenerator.barrier_report`` lists
             what it had to give up, such as the tip of a very sharp spike), and
-            raises ``vorflow.BarrierMeshError`` when it cannot.
+            raises ``vorflow.BarrierMeshError`` when it cannot, or when a point
+            feature lies on a barrier.
 
         Deprecated parameters:
             dist_min (float, optional): Distance from the line where the mesh size

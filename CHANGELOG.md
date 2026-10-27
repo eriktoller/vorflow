@@ -21,8 +21,9 @@ and the project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   ([#71](https://github.com/rhugman/vorflow/issues/71)). At a reflex boundary
   vertex (one bending into the domain) a mirror ghost outside the domain still
   owned part of it, and ghost cells are discarded before clipping. Such ghosts
-  are now dropped: the node stays inset and its cell is clipped
-  (`boundary_centering` is `"inset"` in its row).
+  are now dropped and their nodes clipped (`boundary_centering` is `"clip"` in
+  their row). Every vertex of a polygonised circular hole is reflex, so its
+  nodes are all clipped.
 
 ## [0.3.0] - 2026-10-15
 

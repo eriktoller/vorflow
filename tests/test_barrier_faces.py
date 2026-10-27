@@ -2,11 +2,14 @@
 
 Each model is meshed end to end and checked against the properties of the
 construction (``_assert_exact``): no mirror generators and no cut cells, one
-cell per mesh node, the barrier sites among the mesh nodes, no other node
-inside an empty circle, and the barrier lines covered by single-edge,
-orthogonal faces. The focused tests check one rule each (snapping, noise,
-stubs, spike tips, corridors, options, errors); ``REGRESSION_CASES`` are the
-held-out and stress shapes of the barrier benchmark.
+cell per mesh node, the barrier sites among the mesh nodes, no other node or
+generator inside an empty circle, one single-edge, orthogonal face per
+barrier segment (from circle centre to circle centre), and faces covering
+the cleaned barrier lines except the reported spike tips and stubs. The
+focused tests check one rule each (snapping, noise, stubs, spike tips,
+corridors, options, errors, fixed lines next to a barrier, the domain
+boundary, scale); ``REGRESSION_CASES`` are the held-out and stress shapes of
+the barrier benchmark.
 """
 import math
 import warnings
@@ -98,25 +101,58 @@ def _crossing_faces(connectivity, barriers, tol: float) -> int:
     return int((shapely.intersects(faces, barriers) & ends_off).sum())
 
 
+def _segment_count(mg: MeshGenerator, tol: float) -> int:
+    """Barrier segments: consecutive circle centres along each line the faces follow."""
+    centres = shapely.points(mg.barrier_circles[0])
+    count = 0
+    for line in mg.barrier_lines.geometry[mg.barrier_lines["is_barrier"].astype(bool)]:
+        on = int((shapely.distance(line, centres) < tol).sum())
+        count += on if line.is_closed else on - 1
+    return count
+
+
+def _cleaned_barrier_length(cm: ConceptualMesh) -> float:
+    """Length of the cleaned barrier input: the clean barrier rows plus the rows the cleaning dropped as stubs."""
+    lines = cm.clean_lines
+    barrier = lines["is_barrier"].fillna(False).astype(bool)
+    dropped = sum(e["distance"] for e in lines.attrs.get("dropped_barrier_events", []) if e["kind"] == "stub")
+    return float(lines.geometry[barrier].length.sum()) + dropped
+
+
+def _assert_clear_of_circles(mg: MeshGenerator, points: np.ndarray) -> None:
+    """No point other than a barrier site lies inside a circle."""
+    centres, radii = mg.barrier_circles
+    sites = mg.nodes[mg.node_is_site]
+    is_site = cKDTree(sites).query(points)[0] <= 1e-9 * max(1.0, float(np.abs(points).max()))
+    nearest = cKDTree(points[~is_site]).query(centres)[0]
+    assert (nearest >= radii * (1 - 1e-9)).all()
+
+
 def _assert_exact(mg: MeshGenerator, vt: VoronoiTessellator, grid) -> None:
     """The properties every exact barrier construction must have (module docstring)."""
     assert vt.n_barrier_mirrors == 0
     assert vt.n_exact_barrier_mirrors == 0 and vt.n_exact_barrier_cuts == 0
     assert len(grid) == len(mg.nodes)
     assert int(mg.node_is_site.sum()) == mg.barrier_report["sites"]
-    centres, radii = mg.barrier_circles
-    others = mg.nodes[~mg.node_is_site]
-    nearest = cKDTree(others).query(centres)[0]
-    assert (nearest >= radii * (1 - 1e-9)).all()
+    _assert_clear_of_circles(mg, mg.nodes)
+    _assert_clear_of_circles(mg, grid[["x", "y"]].to_numpy(dtype=float))  # after the tessellator's own moves
 
     tol = TOUCH * max(np.ptp(np.asarray(grid.total_bounds).reshape(2, 2), axis=0))
     on, connectivity = _barrier_faces(grid, mg, tol)
     assert _crossing_faces(connectivity, _barriers(mg), tol) == 0
     assert all(len(face.coords) == 2 for face in on.geometry)
     assert on["ortho_error"].max() < 1e-6
+    # One face per segment, each from one circle centre to the next.
+    ends = np.vstack([shapely.get_coordinates(shapely.get_point(on.geometry.to_numpy(), k)) for k in (0, -1)])
+    assert (cKDTree(mg.barrier_circles[0]).query(ends)[0] < tol).all()
+    assert len(on) == _segment_count(mg, tol)
     # Each pair of cells meets along at most one barrier face, and the faces cover the barriers.
     assert not on.duplicated(["cell_id_1", "cell_id_2"]).any()
     assert on.geometry.length.sum() == pytest.approx(_barriers(mg).length, rel=1e-6)
+    # ... which are the cleaned input lines less what the report says was left without faces.
+    report = mg.barrier_report
+    uncovered = sum(entry["length"] for entry in report["tips"] + report["stubs"])
+    assert on.geometry.length.sum() == pytest.approx(_cleaned_barrier_length(vt.cm) - uncovered, rel=1e-6)
 
 
 # ---------------------------------------------------------------------------
@@ -425,3 +461,169 @@ def test_relay_ramp_network_meshes_exactly():
     mg, vt, grid = _mesh(_model(lines, domain=domain, background_lc=background_lc), background_lc=background_lc)
     _assert_exact(mg, vt, grid)
     assert any(c["kind"] == "barriers" for c in mg.barrier_report["corridors"])
+
+
+# ---------------------------------------------------------------------------
+# Deviation, scale and the tessellator's own generator moves
+# ---------------------------------------------------------------------------
+def test_faces_stay_within_simplify_tolerance_of_the_input_line():
+    rng = np.random.default_rng(7)
+    raw = _digitised([(30, 60), (150, 180), (270, 230)], rng, (0.3 * LC, 1.5 * LC), 0.15 * LC)
+    tolerance = 1.5
+    mg, vt, grid = _mesh(_model([(raw, {**B, "simplify_tolerance": tolerance})]))
+    _assert_exact(mg, vt, grid)
+    assert mg.barrier_report["noise"] == []
+    on, _ = _barrier_faces(grid, mg, TOUCH * 300.0)
+    faces = shapely.union_all(on.geometry.to_numpy())
+    assert shapely.hausdorff_distance(LineString(raw), faces, densify=0.05) <= tolerance
+    assert len(mg.barrier_lines.geometry.iloc[0].coords) < len(raw)  # the tolerance did simplify it
+
+
+@pytest.mark.parametrize("factor", [0.01, 100.0])
+def test_scaled_model_has_the_same_barrier_topology(factor):
+    lines = EXACT_CASES["kink"] + [([(110, 280), K67[1]], B)]
+
+    def scaled(k):
+        coords = [([(x * k, y * k) for x, y in c], {**kw, "resolution": LC * k}) for c, kw in lines]
+        cm = _model(coords, domain=affinity.scale(DOMAIN, k, k, origin=(0, 0)), background_lc=BACKGROUND_LC * k)
+        return _mesh(cm, background_lc=BACKGROUND_LC * k)
+
+    base, _, base_grid = scaled(1.0)
+    mg, vt, grid = scaled(factor)
+    _assert_exact(mg, vt, grid)
+    assert mg.barrier_report["sites"] == base.barrier_report["sites"]
+    assert len(mg.barrier_circles[0]) == len(base.barrier_circles[0])
+    sites = np.sort(np.round(mg.nodes[mg.node_is_site] / factor, 6).view("f8,f8"), axis=0)
+    base_sites = np.sort(np.round(base.nodes[base.node_is_site], 6).view("f8,f8"), axis=0)
+    assert np.allclose(sites.view("f8").reshape(-1, 2), base_sites.view("f8").reshape(-1, 2), atol=1e-5)
+    on, _ = _barrier_faces(grid, mg, TOUCH * 300.0 * factor)
+    base_on, _ = _barrier_faces(base_grid, base, TOUCH * 300.0)
+    assert len(on) == len(base_on)
+
+
+def test_tessellator_lloyd_short_faces_and_inset_mirror_keep_the_circles_empty():
+    # One barrier ends on the boundary, where inset_mirror shifts generators and adds ghosts.
+    cm = _model([([(150, 150), (300, 200)], B), ([(0, 100), (120, 140)], B)])
+    mg = MeshGenerator(background_lc=BACKGROUND_LC, verbosity=0)
+    assert mg.generate(*cm.generate())
+    vt = VoronoiTessellator(mg, cm, lloyd_iterations=30, min_face_fraction=0.1, boundary_centering="inset_mirror")
+    grid = vt.generate()
+    assert vt.lloyd_report["iterations"] > 0 and vt.short_face_report["initial"] > 0
+    assert (grid["boundary_centering"] == "inset_mirror").any()
+    _assert_exact(mg, vt, grid)
+
+
+# ---------------------------------------------------------------------------
+# Fixed lines, points and the domain boundary next to a barrier
+# ---------------------------------------------------------------------------
+def _nodes_on(mg: MeshGenerator, line, x_range=(70.0, 230.0)) -> np.ndarray:
+    """Mesh nodes lying on ``line`` within ``x_range``."""
+    nodes = mg.nodes[(mg.nodes[:, 0] > x_range[0]) & (mg.nodes[:, 0] < x_range[1])]
+    return nodes[shapely.distance(line, shapely.points(nodes)) < 1e-6]
+
+
+@pytest.mark.parametrize("gap", [0.25 * LC, 0.5 * LC])
+def test_standard_line_next_to_a_barrier_keeps_its_nodes(gap):
+    river = LineString([(40, 150 + gap), (260, 150 + gap)])
+    mg, vt, grid = _mesh(_model([([(40, 150), (260, 150)], B), (list(river.coords), {})]))
+    _assert_exact(mg, vt, grid)
+    assert mg.barrier_report["fixed_nodes"] == []
+    xs = np.sort(_nodes_on(mg, river)[:, 0])
+    assert len(xs) > 0 and np.diff(np.r_[70.0, xs, 230.0]).max() <= LC
+
+
+@pytest.mark.parametrize("gap", [0.25 * LC, 0.5 * LC])
+def test_zone_edge_next_to_a_barrier_keeps_its_nodes(gap):
+    zone = box(60, 150 + gap, 240, 250)
+    mg, vt, grid = _mesh(_model([([(40, 150), (260, 150)], B)], polygons=[_zone(LC, zone.bounds)]))
+    _assert_exact(mg, vt, grid)
+    assert mg.barrier_report["fixed_nodes"] == []
+    edge = LineString([(60, 150 + gap), (240, 150 + gap)])
+    xs = np.sort(_nodes_on(mg, edge)[:, 0])
+    assert len(xs) > 0 and np.diff(np.r_[70.0, xs, 230.0]).max() <= LC
+
+
+def test_quad_buffer_strip_next_to_a_barrier_keeps_its_nodes():
+    lines = [([(40, 150), (260, 150)], B), ([(40, 156), (260, 156)], {"quad_buffer": True, "resolution": 6.0})]
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore", UserWarning)  # the strip is trimmed next to the barrier
+        mg, vt, grid = _mesh(_model(lines))
+    _assert_exact(mg, vt, grid)
+    assert mg.barrier_report["fixed_nodes"] == []
+    footprint = mg.buffer_footprints
+    lower = LineString([(40, footprint.bounds[1]), (260, footprint.bounds[1])])
+    assert len(_nodes_on(mg, lower)) >= 20
+
+
+def test_standard_line_crossing_a_barrier_is_not_reported():
+    mg, vt, grid = _mesh(_model(REGRESSION_CASES["std_cross10"]["lines"]))
+    _assert_exact(mg, vt, grid)
+    assert mg.barrier_report["fixed_nodes"] == []
+
+
+def test_barrier_ending_just_short_of_a_standard_line_meshes():
+    # The end is 0.1 m (0.0125 lc) from the line: as close as a crossing, so it is treated as one.
+    lines = [([(40, 150), (149.9, 150)], B), ([(150, 40), (150, 260)], {})]
+    mg, vt, grid = _mesh(_model(lines))
+    _assert_exact(mg, vt, grid)
+    assert mg.barrier_report["fixed_nodes"] == []
+
+
+def test_barrier_along_the_boundary_is_dropped_with_a_warning():
+    cm = _model([([(40, 0), (260, 0)], B)])
+    with pytest.warns(UserWarning, match="domain boundary"):
+        mg, vt, grid = _mesh(cm)
+    assert [e["line_id"] for e in mg.barrier_report["on_boundary"]] == ["line0"]
+    assert mg.barrier_report["on_boundary"][0]["distance"] == pytest.approx(220.0)
+    assert mg.barrier_circles is None and vt.n_barrier_mirrors == 0 and len(grid) == len(mg.nodes)
+
+
+def test_barrier_partly_on_the_boundary_keeps_the_part_inside():
+    cm = _model([([(40, 100), (150, 0), (260, 0)], B)])
+    with pytest.warns(UserWarning, match="domain boundary"):
+        mg, vt, grid = _mesh(cm)
+    _assert_exact(mg, vt, grid)
+    assert mg.barrier_report["on_boundary"][0]["distance"] == pytest.approx(110.0)
+    assert list(mg.barrier_lines.geometry.iloc[0].coords) == [(40.0, 100.0), (150.0, 0.0)]
+
+
+@pytest.mark.parametrize("length, tolerance", [(4.0, 5.0), (3.0, 3.5)])
+def test_branch_within_its_tolerance_is_dropped_as_a_stub(length, tolerance):
+    lines = [([(40, 150), (260, 150)], B), ([(150, 150), (150, 150 + length)], {**B, "simplify_tolerance": tolerance})]
+    with pytest.warns(UserWarning, match="stub"):
+        mg, vt, grid = _mesh(_model(lines))
+    _assert_exact(mg, vt, grid)
+    stubs = mg.barrier_report["stubs"]
+    assert len(stubs) == 1 and stubs[0]["line_id"] == "line1"
+    assert stubs[0]["length"] == pytest.approx(length)
+
+
+@pytest.mark.parametrize("y", [150.0, 150.05])
+def test_point_on_a_barrier_raises_a_clear_error(y):
+    well = {"geometry": Point(150, y), "point_id": "w", "resolution": 4.0}
+    with pytest.raises(vorflow.BarrierMeshError, match="point 'w' .* from barrier 'line0'.*Move it off the barrier"):
+        _mesh(_model([([(40, 150), (260, 150)], B)], points=[well]))
+
+
+def test_size_field_without_python_size_is_warned_about():
+    class OpaqueField(vorflow.fields.ThresholdField):
+        """A ThresholdField the barrier sizing cannot read."""
+
+        def python_size(self, distance, background_lc, feature_lc=None):
+            return None
+
+    river = ([(40, 170), (260, 170)], {"fields": [OpaqueField(size_min=4.0, dist_min=2.0, dist_max=20.0)]})
+    with pytest.warns(UserWarning, match="python_size.*OpaqueField"):
+        mg, vt, grid = _mesh(_model([([(40, 150), (260, 150)], B), river]))
+    _assert_exact(mg, vt, grid)
+
+
+def test_warnings_point_at_the_caller_through_mesh_generator():
+    cm = _model([(_spike(12.0), B), ([(40, 30), CENTRE, _ray(CENTRE, 60, 0.05 * LC), (260, 60)], B)])
+    with warnings.catch_warnings(record=True) as record:
+        warnings.simplefilter("always")
+        MeshGenerator(background_lc=BACKGROUND_LC, verbosity=0, conceptual_mesh=cm).generate()
+    messages = {str(w.message).split(":")[0]: w.filename for w in record if w.category is UserWarning}
+    assert any("digitising noise" in str(w.message) for w in record)
+    assert any("spike tip" in str(w.message) for w in record)
+    assert set(messages.values()) == {__file__}

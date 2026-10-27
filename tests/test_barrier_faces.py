@@ -874,3 +874,16 @@ def test_parallel_barriers_at_or_above_the_merge_gap_keep_their_corridor(gap, wa
     assert len(dense) == int(warned)
     if warned:
         assert f"{corridor['cells']} cells" in str(dense[0].message)
+
+
+def test_splay_crossing_a_bent_fault_just_past_the_junction_is_merged_onto_one_line():
+    # The fault bends 0.8 m towards the splay 1.5 m past the junction, so the splay crosses it again at 4.5 m.
+    junction = (100.0, 150.0)
+    fault = [(20, 150), junction, (101.52, 150.8), (280, 150)]
+    splay = [junction, _ray(junction, 10.0, 170.0)]
+    cm = _model([(fault, B), (splay, B)])
+    with pytest.warns(UserWarning, match="were merged over a short reach"):
+        mg, vt, grid = _mesh(cm)
+    _assert_exact(mg, vt, grid)
+    assert len(mg.barrier_report["collapsed"]) == 2  # the thin loop, then the 10 degree wedge past it
+    assert _moved(mg, cm, DOMAIN) <= DEVIATION * LC * (1 + 1e-3)

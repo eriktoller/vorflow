@@ -22,7 +22,9 @@ legs' lines, so their faces there are one row (``barrier_lines`` lists the
 stem under each line). Then the node is looked at again: a fan or a star
 of narrow legs becomes a short cascade of stems, and a crossing at a small
 angle gets a stem on both sides, so the two lines share a stretch through
-the crossing. A sector narrower than FAN_ANGLE next to another one (a leg
+the crossing. Two legs that run to the same next vertex (a thin loop,
+such as a splay crossing a fault just past a bend) both become the chord
+to it. A sector narrower than FAN_ANGLE next to another one (a leg
 with narrow sectors on both sides, as in a fan or a 16-leg star), or at a
 node merged already, is merged the same way, with FAN_ANGLE in place of
 ``sharp_angle``: the sector plan of ``network`` cannot fit sites into two
@@ -274,6 +276,8 @@ def _merge_pair(lines: list, originals: list, apex: np.ndarray, pair: tuple, sto
     if len(taken) != len(set(taken)):
         return None  # two legs of one line over the same vertices: a fold or a loop, not a wedge
     bound = DEVIATION * lc
+    if np.array_equal(paths[0][-1], paths[1][-1]):
+        return _merge_loop(lines, originals, apex, pair, paths, span, bound, tol)
     m = bound / math.sin(span / 2)
     m = min(m, min(caps) * math.cos(span / 2) / (1 + MIN_LEG))
     for _ in range(TRIES):
@@ -300,6 +304,21 @@ def _merge_pair(lines: list, originals: list, apex: np.ndarray, pair: tuple, sto
                         "lines": sorted({lines[leg.k].line_id for leg in members}, key=str)}
         m *= SHRINK
     return None
+
+
+def _merge_loop(lines: list, originals: list, apex: np.ndarray, pair: tuple, paths: list, span: float,
+                bound: float, tol: float) -> dict | None:
+    """Both legs of ``pair`` run to the same next stop (a thin loop): both become its chord, or None."""
+    end = paths[0][-1]
+    trial = _tentative(lines, [(leg.k, leg.i, leg.step, len(p) - 1, [end]) for g, p in zip(pair, paths) for leg in g])
+    radius = float(np.hypot(*(end - apex))) + 2 * bound
+    moved = _within_bound(trial, originals, apex, radius, bound)
+    if moved is None or not _clear_of_others(lines, set(trial), LineString([apex, end]), [apex, end], tol):
+        return None
+    for k, b in trial.items():
+        lines[k] = b
+    return {"kind": "junction", "location": apex.copy(), "angle": math.degrees(span), "reach": radius - 2 * bound,
+            "deviation": moved, "lines": sorted({lines[leg.k].line_id for g in pair for leg in g}, key=str)}
 
 
 def _boundary_ray(domain, xy: np.ndarray, leg_angle: float, tol: float) -> tuple | None:

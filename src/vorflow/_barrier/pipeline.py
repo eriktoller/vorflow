@@ -51,7 +51,7 @@ from .._features import HEX_RING_CLEARANCE
 from .lines import BarrierLine, must_keep
 from .network import SHARP_ANGLE, Network, build_network, replan_chord_nodes
 from .sites import Layout, construct
-from .sizing import CAUSES, GRADATION, SizeField, capped_field, grade_field
+from .sizing import BARRIER_CAP, CAUSES, GRADATION, SizeField, capped_field, grade_field
 from .validate import all_finite, defects
 
 REPAIR_ROUNDS = 8
@@ -158,7 +158,7 @@ def barrier_lines(items: list, standard: list, domain) -> list:
 def floor_cause(net: Network, field: SizeField, k: int, lc: float, gradation: float = GRADATION) -> str:
     """What set the face length of sample k (``sizing.CAUSES``): a corridor (its sides), the cap of the sample
     its grading came from, else (a junction or ladder size) the tightest cap within ``lc`` of it, else
-    "junction"."""
+    "junction". A barrier cap from parts of one line only is a fold of that line ("junction")."""
     point = shapely.Point(field.xy[k])
     for c in net.corridors:
         if c.region.distance(point) <= 0.5 * lc:
@@ -168,11 +168,24 @@ def floor_cause(net: Network, field: SizeField, k: int, lc: float, gradation: fl
     d = np.hypot(*(field.xy - field.xy[k]).T)
     j = int(np.argmin(field.capped + gradation * d))
     if field.capped[j] + gradation * d[j] <= field.h[k] * (1 + 1e-6):
-        return CAUSES[int(field.cause[j])]
-    near = np.flatnonzero((d <= lc) & (field.cause != CAUSES.index("size field")))
-    if len(near) == 0:
+        cause = CAUSES[int(field.cause[j])]
+    else:
+        near = np.flatnonzero((d <= lc) & (field.cause != CAUSES.index("size field")))
+        if len(near) == 0:
+            return "junction"
+        j = int(near[np.argmin(field.capped[near])])
+        cause = CAUSES[int(field.cause[j])]
+    if cause == "barrier" and not _other_line_near(net, field.xy[j], field.capped[j] / BARRIER_CAP):
         return "junction"
-    return CAUSES[int(field.cause[near[np.argmin(field.capped[near])]])]
+    return cause
+
+
+def _other_line_near(net: Network, xy: np.ndarray, reach: float) -> bool:
+    """True when a barrier line other than the one through ``xy`` comes within ``reach`` of it."""
+    point = shapely.Point(xy)
+    d = np.array([shapely.distance(LineString(b.xy), point) for b in net.lines])
+    own = int(np.argmin(d))
+    return bool(((d <= reach * (1 + 1e-6)) & (np.arange(len(d)) != own)).any())
 
 
 def check_floor(net: Network, field: SizeField, origin: np.ndarray) -> None:

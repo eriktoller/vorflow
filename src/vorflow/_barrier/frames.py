@@ -48,7 +48,7 @@ from .._features import feature_lc, is_embedded, is_face_line, line_parts, row_b
 from .._log import warn_user
 from ..buffer import protection_epsilon
 from . import pipeline as planning
-from . import polish, wedge
+from . import parallel, polish, wedge
 from .sizing import FEATURE_CAP, Obstacle, near_crossing, size_function
 
 logger = logging.getLogger(__name__)
@@ -60,6 +60,7 @@ ON_LINE_FRACTION = 1e-7   # x domain extent: a mesh node this close to a fixed l
 POLISH_BAND = 3.0         # x node size: the polish moves only the free nodes this close to a barrier circle
 POLISH_HALO = 2.0         # x node size beyond the band: the fixed nodes the moving nodes' cells can meet
 GAP_NEIGHBOURS = 16       # circles looked at for a node's distance to the nearest one
+CORRIDOR_WARN = 0.5       # x lc: a corridor with shorter cells is warned about (it adds many cells)
 
 
 @dataclasses.dataclass
@@ -437,16 +438,27 @@ def barrier_lines_frame(plan, context, crs) -> gpd.GeoDataFrame:
     return gpd.GeoDataFrame(rows, geometry='geometry', crs=crs)
 
 
-def _corridor_entry(c, plan, context) -> dict:
-    """A corridor for ``barrier_report``: kind, the barriers on its sides, where it is and how long."""
+def _corridor_entry(c, lay, plan, context) -> dict:
+    """A corridor for ``barrier_report``: kind, the barriers on its sides, where it is, how long, its cells
+    (one row) and the resolution of its barriers."""
     mid = c.origin + 0.5 * (c.x0 + c.x1) * c.m + context.origin
     line_ids = []
     for side in c.sides:
         piece = side[0].piece
         xy = 0.5 * (plan.net.hard_xy[plan.net.pieces[piece][0]] + plan.net.hard_xy[plan.net.pieces[piece][1]])
         line_ids.append(context.face_rows[_nearest_line(xy, plan)][0])
+    cells = len({tuple(np.round(site, 9)) for _, _, sites in lay.runs for site in sites})
+    lc = min(float(plan.net.piece_lc[side[0].piece]) for side in c.sides)
     return {'kind': 'boundary' if len(c.sides) == 1 else 'barriers', 'line_ids': line_ids,
-            'location': (float(mid[0]), float(mid[1])), 'length': float(c.x1 - c.x0)}
+            'location': (float(mid[0]), float(mid[1])), 'length': float(c.x1 - c.x0), 'cells': cells,
+            'resolution': lc}
+
+
+def _merge_entry(e: dict, context) -> dict:
+    """A merged pair of close parallel stretches for ``barrier_report`` (see ``parallel``)."""
+    xy = e['location'] + context.origin
+    return {'line_ids': [context.face_rows[k][0] for k in e['lines']], 'location': (float(xy[0]), float(xy[1])),
+            'gap': float(e['gap']), 'length': float(e['length']), 'deviation': float(e['deviation'])}
 
 
 def _collapse_entry(e: dict, context) -> dict:
@@ -485,7 +497,9 @@ def report(plan, context, fitted: dict) -> dict:
                  'location': (float(xy[0] + origin[0]), float(xy[1] + origin[1]))}
         (tips if kind == "spike tip" else stubs).append(entry)
     return {
-        'corridors': [_corridor_entry(c, plan, context) for c in plan.net.corridors],
+        'corridors': [_corridor_entry(c, lay, plan, context) for c, lay in zip(plan.net.corridors,
+                                                                                  plan.field.corridors)],
+        'merged': [_merge_entry(e, context) for e in plan.net.merged],
         'collapsed': [_collapse_entry(e, context) for e in plan.net.collapsed],
         'tips': tips,
         'stubs': stubs,
@@ -506,7 +520,7 @@ def dropped_report(lines) -> dict | None:
     events = list(lines.attrs.get('dropped_barrier_events', [])) if lines is not None else []
     if not events:
         return None
-    return {'corridors': [], 'collapsed': [], 'tips': [], **_cleaning_entries(events), 'rings': [], 'fixed_nodes': [],
+    return {'corridors': [], 'merged': [], 'collapsed': [], 'tips': [], **_cleaning_entries(events), 'rings': [], 'fixed_nodes': [],
             'repair_rounds': 0, 'sites': 0, 'removed_nodes': 0, 'polish': {}}
 
 
@@ -516,6 +530,24 @@ def report_warnings(report: dict, sharp_angle: float) -> list:
     Noise and boundary parts are warned about one by one when ConceptualMesh cleans the lines.
     """
     out = []
+    if report['merged']:
+        merged = report['merged']
+        out.append(f"{len(merged)} stretch(es) of two barriers closer than {parallel.MERGE_GAP:g} x resolution "
+                   f"({sum(e['length'] for e in merged):.3g} long in all) were merged onto their midline, so one "
+                   "line of faces carries both barriers there (moved at most "
+                   f"{max(e['deviation'] for e in merged):.3g}). MeshGenerator.barrier_lines lists those faces "
+                   "under both lines: give their HFB the combined properties of both barriers; see "
+                   "MeshGenerator.barrier_report['merged'].")
+    dense = [e for e in report['corridors'] if e['length'] / e['cells'] < CORRIDOR_WARN * e['resolution']]
+    if dense:
+        cells = sum(e['cells'] for e in dense)
+        usual = sum(e['length'] / e['resolution'] for e in dense)
+        out.append(f"{len(dense)} narrow gap(s) between close barriers, or a barrier and the boundary, get a row "
+                   f"of cells shorter than {CORRIDOR_WARN:g} x resolution: {cells} cells where the resolution "
+                   f"gives about {usual:.0f}, and the mesh around them is graded down too. Two barriers closer "
+                   f"than {parallel.MERGE_GAP:g} x resolution are merged onto one line of faces instead, and a "
+                   "barrier part within simplify_tolerance of the boundary is dropped; move them that close, or "
+                   "further apart, if that suits the model. See MeshGenerator.barrier_report['corridors'].")
     if report['collapsed']:
         moved = max(e['deviation'] for e in report['collapsed'])
         out.append(f"{len(report['collapsed'])} narrow barrier junction(s) or boundary exit(s) (legs closer than "

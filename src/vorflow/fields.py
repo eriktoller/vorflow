@@ -491,6 +491,13 @@ class GeometricGrowthField(MeshField):
             gmsh_api, f_math, tags_dict, cs, background_lc
         )
 
+    def python_size(self, distance, background_lc, feature_lc=None):
+        """Size at ``distance``: feature_lc + gradient x distance (the background lc without a finer feature_lc)."""
+        distance = np.asarray(distance, dtype=float)
+        if feature_lc is None or feature_lc >= background_lc:
+            return np.full(distance.shape, float(background_lc))
+        return float(feature_lc) + self.gradient * distance
+
 
 class _BorderGradingField(MeshField):
     """Fine polygon border graded up to the polygon resolution.

@@ -206,7 +206,7 @@ def test_defects_left_after_the_repair_rounds_raise(monkeypatch):
     monkeypatch.setattr(pipeline, "defects", always_bad)
     monkeypatch.setattr(pipeline, "SITE_GROWTH_CAP", 1e9)
     with pytest.raises(pipeline.BarrierMeshError,
-                       match=f"1 defects \\(pair\\) left after {pipeline.REPAIR_ROUNDS} local refinements"):
+                       match=f"1 defects \\(pair\\) are left after {pipeline.REPAIR_ROUNDS} local refinements"):
         _plan(STRAIGHT)
     assert len(calls) == pipeline.REPAIR_ROUNDS + 1
     assert calls[-1] > calls[0]  # each round refines the faces at the defect
@@ -269,6 +269,28 @@ def test_non_finite_sites_are_a_barrier_mesh_error(monkeypatch):
 def test_faces_below_the_floor_raise_before_grading():
     with pytest.raises(pipeline.BarrierMeshError, match="faces would have to be"):
         _plan([[(40, 150), (260, 150)], [(40, 150.01), (260, 150.01)]])
+
+
+@pytest.mark.parametrize("coords, features, cause", [
+    ([[(40, 150), (260, 150)], [(150, 270), (150, 150.1)]], None, "two barrier parts come that close"),
+    ([[(40, 0.05), (260, 0.05)]], None, "close to the domain boundary"),
+    ([[(40, 150), (260, 150)]], [(150, 150.1)], "a well, hex-ring seed or embedded point"),
+    ([[(150, 150), (40, 150)], [(150, 150), (40, 151.9)]], None, "legs meet or fold back"),
+], ids=["barrier", "boundary", "feature", "junction"])
+def test_floor_error_names_its_cause_and_a_remedy_for_it(coords, features, cause):
+    with pytest.raises(pipeline.BarrierMeshError, match="faces would have to be") as info:
+        _plan(coords, features=features)
+    message = str(info.value)
+    assert cause in message
+    assert ("simplify_tolerance" in message) == (cause in ("two barrier parts come that close",
+                                                            "close to the domain boundary", "legs meet or fold back"))
+    assert ("quad_buffer=True" in message) == (cause == "legs meet or fold back")
+
+
+def test_repair_failure_points_at_narrow_angles_and_the_quad_buffer(monkeypatch):
+    monkeypatch.setattr(pipeline, "defects", lambda layout, features, domain: [("pair", layout.xy[1])])
+    with pytest.raises(pipeline.BarrierMeshError, match="too narrow for cells.*quad_buffer=True"):
+        _plan(STRAIGHT)
 
 
 # ---------------------------------------------------------------------------

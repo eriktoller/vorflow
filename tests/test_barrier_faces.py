@@ -102,13 +102,18 @@ def _crossing_faces(connectivity, barriers, tol: float) -> int:
 
 
 def _segment_count(mg: MeshGenerator, tol: float) -> int:
-    """Barrier segments: consecutive circle centres along each line the faces follow."""
-    centres = shapely.points(mg.barrier_circles[0])
-    count = 0
+    """Barrier segments: pairs of consecutive circle centres along the pieces of the lines the faces follow
+    (a stretch shared by several lines, or crossed twice by one, counts once)."""
+    centres = mg.barrier_circles[0]
+    points = shapely.points(centres)
+    pairs = set()
     for line in mg.barrier_lines.geometry[mg.barrier_lines["is_barrier"].astype(bool)]:
-        on = int((shapely.distance(line, centres) < tol).sum())
-        count += on if line.is_closed else on - 1
-    return count
+        xy = np.asarray(line.coords)
+        for a, b in zip(xy[:-1], xy[1:]):
+            on = np.flatnonzero(shapely.distance(LineString([a, b]), points) < tol)
+            on = on[np.argsort(np.hypot(*(centres[on] - a).T))]
+            pairs.update(frozenset(pair) for pair in zip(on[:-1], on[1:]))
+    return len(pairs)
 
 
 def _cleaned_barrier_length(cm: ConceptualMesh) -> float:
@@ -149,8 +154,11 @@ def _assert_exact(mg: MeshGenerator, vt: VoronoiTessellator, grid) -> None:
     # Each pair of cells meets along at most one barrier face, and the faces cover the barriers.
     assert not on.duplicated(["cell_id_1", "cell_id_2"]).any()
     assert on.geometry.length.sum() == pytest.approx(_barriers(mg).length, rel=1e-6)
-    # ... which are the cleaned input lines less what the report says was left without faces.
+    # ... which are the cleaned input lines less what the report says was left without faces
+    # (merged acute wedges move the lines a little; see test_acute_wedges_are_merged_over_a_short_reach).
     report = mg.barrier_report
+    if report["collapsed"]:
+        return
     uncovered = sum(entry["length"] for entry in report["tips"] + report["stubs"])
     assert on.geometry.length.sum() == pytest.approx(_cleaned_barrier_length(vt.cm) - uncovered, rel=1e-6)
 
@@ -354,8 +362,8 @@ def test_hex_ring_next_to_a_barrier_is_dropped_unless_kept():
 
 def test_barrier_report_lists_every_entry():
     mg, _, _ = _mesh(_model(EXACT_CASES["t_junction"]))
-    assert set(mg.barrier_report) == {"corridors", "tips", "stubs", "snaps", "noise", "on_boundary", "rings",
-                                      "fixed_nodes", "repair_rounds", "sites", "removed_nodes", "polish"}
+    assert set(mg.barrier_report) == {"corridors", "collapsed", "tips", "stubs", "snaps", "noise", "on_boundary",
+                                      "rings", "fixed_nodes", "repair_rounds", "sites", "removed_nodes", "polish"}
     assert mg.barrier_report["sites"] > 0
 
 
@@ -709,3 +717,82 @@ def test_barrier_on_a_zone_edge_reports_no_fixed_nodes():
     _assert_exact(mg, vt, grid)
     assert mg.barrier_report["fixed_nodes"] == []
     assert not [w for w in record if "fixed" in str(w.message) or "removed" in str(w.message)]
+
+
+# ---------------------------------------------------------------------------
+# Acute wedges: legs meeting below sharp_angle are merged over a short reach
+# ---------------------------------------------------------------------------
+DEVIATION = 0.1  # x resolution: the largest move of a barrier by a merge
+
+
+def _wedge_cases() -> dict:
+    """(lines, probe points in separate compartments, domain) per acute shape and angle."""
+    out = {}
+    for angle in (3, 5, 8, 12):
+        j = (60.0, 150.0)
+        splay_end = (300.0, 150.0 + 240.0 * math.tan(math.radians(angle)))
+        out[f"splay{angle}"] = ([([(0, 150), j, (300, 150)], B), ([j, splay_end], B)],
+                                [(150, 100), (150, 200), _ray(j, angle / 2, 225)], DOMAIN)
+        h = angle / 2
+        out[f"x{angle}"] = ([([_ray(CENTRE, 180 - h, 300), _ray(CENTRE, -h, 300)], B),
+                             ([_ray(CENTRE, 180 + h, 300), _ray(CENTRE, h, 300)], B)],
+                            [(150, 220), (150, 80), _ray(CENTRE, 0, 140), _ray(CENTRE, 180, 140)], DOMAIN)
+        t = (100.0, 150.0)
+        out[f"t{angle}"] = ([([(0, 150), (300, 150)], B), ([t, _ray(t, angle, 400)], B)],
+                            [(150, 100), (60, 200), _ray(t, angle / 2, 190)], DOMAIN)
+        f = (40.0, 150.0)
+        fan = [([(0, 150), (300, 150)], B)] + [([f, _ray(f, angle * k, 400)], B) for k in (1, 2, 3)]
+        out[f"fan{angle}"] = (fan, [(150, 100), (40, 250)] + [_ray(f, angle * (k + 0.5), 250) for k in range(3)],
+                              DOMAIN)
+    for angle in (5, 10):
+        s = (40.0, 0.0)
+        out[f"boundary{angle}"] = ([([s, _ray(s, angle, 2000)], B)], [(250, 5), (100, 250)], DOMAIN)
+        hole = box(120, 120, 180, 180)
+        out[f"hole{angle}"] = ([([(180, 150), _ray((180, 150), 90 - angle, 400)], B),
+                                ([(120, 150), _ray((120, 150), 270 - angle, 400)], B)],
+                               [(260, 60), (40, 240)], DOMAIN.difference(hole))
+    return out
+
+
+WEDGE_CASES = _wedge_cases()
+
+
+def _moved(mg: MeshGenerator, cm: ConceptualMesh, domain) -> float:
+    """The largest distance between a barrier as cleaned and as its faces follow it (both ways; the input
+    may also be matched by the domain boundary it was merged onto)."""
+    cleaned = cm.clean_lines.set_index("line_id").geometry
+    out = 0.0
+    for line_id, line in zip(mg.barrier_lines["line_id"], mg.barrier_lines.geometry):
+        drawn = cleaned[line_id]
+        drawn = drawn if isinstance(drawn, LineString) else shapely.union_all(drawn.to_numpy())
+        new_points = shapely.points(shapely.get_coordinates(shapely.segmentize(line, 0.05)))
+        old_points = shapely.points(shapely.get_coordinates(shapely.segmentize(drawn, 0.05)))
+        out = max(out, float(shapely.distance(drawn, new_points).max()),
+                  float(shapely.distance(shapely.union(line, domain.boundary), old_points).max()))
+    return out
+
+
+@pytest.mark.parametrize("name", WEDGE_CASES)
+def test_acute_wedges_are_merged_over_a_short_reach(name):
+    lines, probes, domain = WEDGE_CASES[name]
+    cm = _model(lines, domain=domain)
+    with pytest.warns(UserWarning, match="were merged over a short reach"):
+        mg, vt, grid = _mesh(cm)
+    _assert_exact(mg, vt, grid)
+    report = mg.barrier_report
+    assert report["collapsed"] and report["tips"] == [] and report["stubs"] == []
+    assert all(e["deviation"] <= DEVIATION * LC * (1 + 1e-6) for e in report["collapsed"])
+    assert {i for e in report["collapsed"] for i in e["line_ids"]} <= set(mg.barrier_lines["line_id"])
+    assert _moved(mg, cm, domain) <= DEVIATION * LC * (1 + 1e-3)
+    for a, b in zip(probes[:-1], probes[1:]):
+        assert _sealed(mg, grid, a, b)
+
+
+def test_self_crossing_barrier_is_noded_where_it_crosses_itself():
+    coords = [(40, 100), (260, 200), (260, 100), (40, 200)]
+    mg, vt, grid = _mesh(_model([(coords, B)]))
+    _assert_exact(mg, vt, grid)
+    line = mg.barrier_lines.geometry.iloc[0]
+    assert (150.0, 150.0) in line.coords  # the crossing is a vertex, so its faces meet there
+    for outside in [(150, 120), (150, 180), (60, 150)]:  # the loop closed by the crossing is a compartment
+        assert _sealed(mg, grid, (250, 150), outside)

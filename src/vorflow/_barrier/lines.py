@@ -10,18 +10,25 @@ the output of the previous one:
    when one is within the tolerance); an end that overshoots another barrier
    by at most ``snap_tol`` is trimmed back to the crossing; an end within
    ``snap_tol`` of the domain boundary moves onto it. Every snap is recorded.
-2. **Node.** Crossings and junctions with other barriers and standard lines
+   A barrier that collapses to a point (a branch no longer than ``snap_tol``
+   whose free end snaps back onto the barrier it starts on) is dropped as a
+   stub.
+2. **Drop boundary parts.** Segments lying on the domain boundary (every
+   point within ``snap_tol``) are removed: a barrier there separates
+   nothing. A barrier with such a segment inside is split in two, one made
+   only of them is dropped. Recorded, with the length removed.
+3. **Node.** Crossings and junctions with other barriers and standard lines
    (and the projections of their ends within the tolerance) are inserted as
    vertices, and every vertex shared by several barriers gets exactly one
    coordinate. These vertices, the ends and points on the domain boundary
    must be kept by the next two steps.
-3. **Simplify** (only lines with ``simplify_tolerance > 0``): the fewest
+4. **Simplify** (only lines with ``simplify_tolerance > 0``): the fewest
    chords between the line's own vertices that keep every dropped vertex
    within SIMPLIFY_MARGIN x the tolerance. A chord of length L costs
    ``1 + SHORT_PENALTY max(0, 1 - L / lc)^2``, so short chords are avoided.
    Unlike a per-line Douglas-Peucker pass this runs after the junctions are
    joined, so it cannot pull a splay off the fault it starts on.
-4. **Clean digitising noise** (always): a vertex closer than NOISE_FRACTION x
+5. **Clean digitising noise** (always): a vertex closer than NOISE_FRACTION x
    lc to a neighbour is dropped (the one whose removal moves the line least),
    unless it must be kept. The largest move is recorded and warned about.
 
@@ -52,6 +59,7 @@ class BarrierLine:
     tol: float
     keep: np.ndarray | None = None  # must-keep vertices (ends, junctions, crossings, boundary points)
     events: list = dataclasses.field(default_factory=list)
+    source: int = -1                # the caller's index of the line this one came from
 
 
 def _dedupe(xy: np.ndarray) -> np.ndarray:
@@ -69,17 +77,20 @@ def _event(kind: str, xy: np.ndarray, distance: float, note: str) -> dict:
 # ---------------------------------------------------------------------------
 # Snapping
 # ---------------------------------------------------------------------------
-def _trim_overshoot(barrier: BarrierLine, end: int, others, tol: float) -> float | None:
+def _trim_overshoot(barrier: BarrierLine, end: int, others, tol: float, start_tol: float) -> float | None:
     """Trim ``end`` (0 or -1) back to its last crossing with ``others`` if it overshoots by at most ``tol``.
 
-    Returns the trimmed length, or None when nothing was trimmed.
+    A meeting at the other end (within ``start_tol`` of it: the junction a
+    branch starts on) is not a crossing. Returns the trimmed length, or None
+    when nothing was trimmed.
     """
     line = LineString(barrier.xy if end == -1 else barrier.xy[::-1])
     hits = line.intersection(others)
     pts = [g for g in getattr(hits, "geoms", [hits]) if not g.is_empty and g.geom_type == "Point"]
-    if not pts:
+    along = [d for d in (line.project(p) for p in pts) if d > start_tol]
+    if not along:
         return None
-    along = max(line.project(p) for p in pts)
+    along = max(along)
     overshoot = line.length - along
     if overshoot <= 0 or overshoot > tol:
         return None
@@ -109,7 +120,7 @@ def _snap_target(point: np.ndarray, others: list, tol: float) -> np.ndarray | No
     return best
 
 
-def snap_ends(barriers: list, domain, connectivity_tolerance: float) -> None:
+def snap_ends(barriers: list, domain, connectivity_tolerance: float, merge_tol: float) -> None:
     """Join barrier ends that nearly meet another barrier or the domain boundary (step 1)."""
     boundary = domain.boundary
     for k, barrier in enumerate(barriers):
@@ -123,7 +134,7 @@ def snap_ends(barriers: list, domain, connectivity_tolerance: float) -> None:
                 union = shapely.union_all([LineString(o) if len(o) > 1 else Point(o[0]) for o in others])
                 if union.distance(Point(point)) == 0:
                     continue
-                trimmed = _trim_overshoot(barrier, end, union, tol)
+                trimmed = _trim_overshoot(barrier, end, union, tol, merge_tol)
                 if trimmed is not None:
                     barrier.events.append(_event("trim", point, trimmed,
                                                  f"end trimmed back to the barrier it overshoots (tolerance {tol:.3g})"))
@@ -140,6 +151,68 @@ def snap_ends(barriers: list, domain, connectivity_tolerance: float) -> None:
                 barrier.events.append(_event("snap", point, d,
                                              f"end moved onto the domain boundary (tolerance {tol:.3g})"))
         barrier.xy = _dedupe(barrier.xy)
+
+
+def path_length(xy: np.ndarray) -> float:
+    """Length of the polyline ``xy``."""
+    return float(np.hypot(*np.diff(xy, axis=0).T).sum()) if len(xy) > 1 else 0.0
+
+
+def drop_collapsed(barriers: list, lengths: list, merge_tol: float) -> tuple:
+    """(kept, dropped): barriers that snapping left shorter than ``merge_tol`` are dropped as stubs (step 1).
+
+    ``lengths`` holds each barrier's length before snapping.
+    """
+    kept, dropped = [], []
+    for b, length in zip(barriers, lengths):
+        if len(b.xy) >= 2 and path_length(b.xy) > merge_tol:
+            kept.append(b)
+            continue
+        b.events.append(_event("stub", b.xy[0], length, f"dropped: the whole {length:.3g} long line snapped onto "
+                                                         "one point (shorter than its snap tolerance)"))
+        dropped.append(b)
+    return kept, dropped
+
+
+def _boundary_segments(xy: np.ndarray, boundary, tol: float, fractions=(0.0, 0.25, 0.5, 0.75, 1.0)) -> np.ndarray:
+    """Mask of the segments of ``xy`` lying on ``boundary``: every point at ``fractions`` of it within ``tol``."""
+    t = np.asarray(fractions)
+    a, b = xy[:-1], xy[1:]
+    pts = a[:, None, :] + t[None, :, None] * (b - a)[:, None, :]
+    d = shapely.distance(boundary, shapely.points(pts.reshape(-1, 2))).reshape(len(a), len(t))
+    return (d <= tol).all(axis=1)
+
+
+def _runs(mask: np.ndarray) -> list:
+    """(start, stop) of every run of True in ``mask``, stop exclusive."""
+    edges = np.flatnonzero(np.diff(np.concatenate([[0], mask.astype(int), [0]])))
+    return list(zip(edges[::2], edges[1::2]))
+
+
+def drop_boundary_parts(barriers: list, domain, connectivity_tolerance: float) -> tuple:
+    """(kept, dropped): barriers without their segments on the domain boundary (step 2).
+
+    A barrier keeps one part per run of segments off the boundary (its
+    events go with the first); one with no such segment is dropped.
+    """
+    kept, dropped = [], []
+    for b in barriers:
+        tol = max(connectivity_tolerance, b.tol)
+        on = _boundary_segments(b.xy, domain.boundary, tol)
+        if not on.any():
+            kept.append(b)
+            continue
+        seg = np.hypot(*np.diff(b.xy, axis=0).T)
+        k = int(np.argmax(np.where(on, seg, -1.0)))
+        b.events.append(_event("boundary", 0.5 * (b.xy[k] + b.xy[k + 1]), float(seg[on].sum()),
+                               f"dropped {float(seg[on].sum()):.3g} of it lying on the domain boundary "
+                               f"(tolerance {tol:.3g}): a barrier there separates nothing"))
+        parts = _runs(~on)
+        if not parts:
+            dropped.append(b)
+        for n, (start, stop) in enumerate(parts):
+            kept.append(dataclasses.replace(b, xy=b.xy[start:stop + 1].copy(), events=b.events if n == 0 else []))
+    return kept, dropped
 
 
 # ---------------------------------------------------------------------------
@@ -306,15 +379,25 @@ def clean_noise(barriers: list, fraction: float = NOISE_FRACTION) -> None:
                                    "(digitising noise)"))
 
 
-def clean_barrier_lines(barriers: list, standard: list, domain, connectivity_tolerance: float) -> None:
-    """Steps 1-4 of the module docstring, in place, on ``barriers`` (local coordinates)."""
+def clean_barrier_lines(barriers: list, standard: list, domain, connectivity_tolerance: float) -> tuple:
+    """(kept, dropped): steps 1-5 of the module docstring on ``barriers`` (local coordinates).
+
+    ``kept`` are the cleaned lines (a line split in step 2 gives several,
+    with the same ``source``); ``dropped`` the lines removed whole, with the
+    events saying why.
+    """
     if not barriers:
-        return
+        return [], []
     extent = float(max(np.ptp(np.asarray(domain.bounds).reshape(2, 2), axis=0)))
     merge_tol = max(MERGE_FRACTION * extent, 1e-12)
     for b in barriers:
         b.xy = _dedupe(np.asarray(b.xy, dtype=float)[:, :2])
-    snap_ends(barriers, domain, connectivity_tolerance)
-    node_lines(barriers, standard, domain, merge_tol)
-    simplify_lines(barriers)
-    clean_noise(barriers)
+    lengths = [path_length(b.xy) for b in barriers]
+    snap_ends(barriers, domain, connectivity_tolerance, merge_tol)
+    barriers, collapsed = drop_collapsed(barriers, lengths, merge_tol)
+    barriers, on_boundary = drop_boundary_parts(barriers, domain, connectivity_tolerance)
+    if barriers:
+        node_lines(barriers, standard, domain, merge_tol)
+        simplify_lines(barriers)
+        clean_noise(barriers)
+    return barriers, collapsed + on_boundary

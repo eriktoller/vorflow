@@ -1152,22 +1152,25 @@ class ConceptualMesh:
         Works in a local frame (origin at the lower-left corner of the
         domain). Each barrier row gets a ``barrier_events`` list recording
         what was done to it (global coordinates); ``MeshGenerator`` passes
-        them on in ``barrier_report``. Noise cleaning warns with the largest
-        move.
+        them on in ``barrier_report``. A row split where it runs along the
+        domain boundary becomes several rows; a row dropped whole (on the
+        boundary, or collapsed to a point) leaves the line and its events
+        are returned. Noise cleaning and dropped boundary parts warn.
         """
         members = [i for i, line in enumerate(self.raw_lines) if is_face_line(line)]
         for line in self.raw_lines:
             line['barrier_events'] = [] if is_face_line(line) else None
         if not members or self.clean_polygons.empty:
-            return
+            return []
         domain_global = make_valid(unary_union(self.clean_polygons.geometry))
         origin = np.asarray(domain_global.bounds[:2], dtype=float)
         domain = shapely.affinity.translate(domain_global, -origin[0], -origin[1])
         standard = [
-            shapely.affinity.translate(line['geometry'], -origin[0], -origin[1])
+            shapely.affinity.translate(part, -origin[0], -origin[1])
             for line in self.raw_lines
             if row_bool(line, 'embed', True) and not row_bool(line, 'quad_buffer', False)
-            and not is_face_line(line) and isinstance(line['geometry'], LineString)
+            and not is_face_line(line)
+            for part in _line_parts(line['geometry'])
         ]
         barriers = [
             _barrier_lines.BarrierLine(
@@ -1175,24 +1178,38 @@ class ConceptualMesh:
                 np.asarray(self.raw_lines[i]['geometry'].coords, dtype=float)[:, :2] - origin,
                 float(positive_number(self.raw_lines[i].get('lc')) or math.inf),
                 float(positive_number(self.raw_lines[i].get('simplify_tolerance')) or 0.0),
+                source=i,
             )
             for i in members
         ]
         tolerance = self._resolve_connectivity_tolerance(connectivity_tolerance)
-        _barrier_lines.clean_barrier_lines(barriers, standard, domain, tolerance)
-        for i, barrier in zip(members, barriers):
-            self.raw_lines[i]['geometry'] = LineString(barrier.xy + origin)
-            events = [dict(e, location=(float(e['location'][0] + origin[0]), float(e['location'][1] + origin[1])))
-                      for e in barrier.events]
-            self.raw_lines[i]['barrier_events'] = events
-            for e in events:
-                moved = f"; moved {e['distance']:.3g}" if e['distance'] > 0 else ""
-                message = (f"Barrier {barrier.line_id!r}: {e['note']}{moved} "
-                           f"near ({e['location'][0]:.2f}, {e['location'][1]:.2f}).")
-                if e['kind'] == 'noise':
-                    warnings.warn(message, UserWarning, stacklevel=5)
-                else:
-                    logger.info(message)
+        kept, dropped = _barrier_lines.clean_barrier_lines(barriers, standard, domain, tolerance)
+        rows = []
+        for i, line in enumerate(self.raw_lines):
+            if i not in members:
+                rows.append(line)
+                continue
+            for barrier in (b for b in kept if b.source == i):
+                rows.append(dict(line, geometry=LineString(barrier.xy + origin),
+                                 barrier_events=self._barrier_events(barrier, origin)))
+        self.raw_lines = rows
+        return [event for barrier in dropped for event in self._barrier_events(barrier, origin)]
+
+    @staticmethod
+    def _barrier_events(barrier, origin) -> list:
+        """The cleaning events of ``barrier`` in global coordinates, with its line_id; warns or logs each."""
+        events = [dict(e, line_id=barrier.line_id,
+                       location=(float(e['location'][0] + origin[0]), float(e['location'][1] + origin[1])))
+                  for e in barrier.events]
+        for e in events:
+            moved = f"; moved {e['distance']:.3g}" if e['distance'] > 0 and e['kind'] in ('snap', 'trim', 'noise') else ""
+            message = (f"Barrier {barrier.line_id!r}: {e['note']}{moved} "
+                       f"near ({e['location'][0]:.2f}, {e['location'][1]:.2f}).")
+            if e['kind'] in ('noise', 'boundary'):
+                warn_user(message)
+            else:
+                logger.info(message)
+        return events
 
     def _hex_ring_obstacles(self):
         """Embedded polygon boundaries and lines as ``(label, geometry, half_width)`` hex-ring obstacles.
@@ -1382,7 +1399,7 @@ class ConceptualMesh:
         logger.info("Joining line junctions...")
         self._join_line_junctions(connectivity_tolerance=connectivity_tolerance)
 
-        self._clean_barrier_lines(connectivity_tolerance=connectivity_tolerance)
+        dropped_barrier_events = self._clean_barrier_lines(connectivity_tolerance=connectivity_tolerance)
 
         # After snapping and clipping, so each ring is built about the final point.
         self._assign_hex_ring_seeds(field_only_polys)
@@ -1415,6 +1432,8 @@ class ConceptualMesh:
                 ],
                 crs=self.crs,
             )
+        # Barrier rows dropped whole by the cleaning have no row to carry their events.
+        self.clean_lines.attrs['dropped_barrier_events'] = dropped_barrier_events
 
         # Clean Points
         if self.raw_points:

@@ -16,8 +16,10 @@ and the project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - MODFLOW-USG-specific `to_mfusg_disu()` / `grid_to_mfusg_disu()` arrays and
   mapping/orthogonality diagnostics, plus optional `to_mfusgdisu()` FloPy
   package creation. These use USG DISU conventions, not MF6 DISU. Stacked
-  layers share one horizontal mesh; invalid geometry, unsupported shared
-  faces and nonpositive thickness are rejected.
+  layers share one horizontal mesh; invalid geometry, bent or disconnected
+  shared faces and nonpositive thickness are rejected. Coordinate roundoff
+  at clipped boundary centres and overlapping boundary slivers is accepted
+  without moving the input centres or polygons.
 - Original 3D GSF geometry export with `to_gsf()` / `grid_to_gsf()`, using
   the same centres, elevations and node numbering as USG DISU. FloPy and
   MFUSG executables remain optional.
@@ -26,19 +28,6 @@ and the project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - The Conda development environment includes FloPy and installs both the
   `dev` and `examples` extras in editable mode, so model experiments use the
   checkout selected when updating the environment.
-
-### Fixed
-
-- MFUSG exports allow coordinate roundoff at clipped boundary centres and
-  overlapping boundary slivers without moving input centres or polygons.
-  Sliver faces retain reciprocal connections; real overlaps remain errors.
-- MFUSG executable tests check analytical flow rates as well as heads and
-  cover a refined three-layer Vorflow mesh. Optional tests require FloPy 3.10.
-- The simple MFUSG notebook selects fixed-head generators at the domain
-  boundaries and checks analytical heads and total flow, with actionable
-  executable setup instructions and explicit result-to-cell mapping.
-- Clockwise ring orientation remains correct for small cells at large
-  projected coordinates, using upstream's vectorized ring handling.
 
 ## [0.3.0] - 2026-10-15
 

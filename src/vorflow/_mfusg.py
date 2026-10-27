@@ -95,7 +95,11 @@ def _straight_face(shared, centres, pair, tolerance):
     for part in parts:
         offsets = np.asarray(part.coords)[:, :2] - origin
         if np.max(np.abs(offsets @ normal)) > tolerance:
-            raise ValueError(f"Noncollinear shared face between cells {pair}.")
+            raise ValueError(
+                f"Noncollinear shared face between cells {pair}: the cells meet along a "
+                "bent line, usually a barrier corner cut inside a cell. MFUSG export "
+                "needs straight shared faces; refine the mesh near the corner."
+            )
         projected = offsets @ direction
         intervals.append((projected.min(), projected.max()))
     intervals.sort()

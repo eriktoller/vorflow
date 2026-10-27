@@ -10,13 +10,20 @@ the output of the previous one:
    when one is within the tolerance); an end that overshoots another barrier
    by at most ``snap_tol`` is trimmed back to the crossing; an end within
    ``snap_tol`` of the domain boundary moves onto it. Every snap is recorded.
-   A barrier that collapses to a point (a branch no longer than ``snap_tol``
-   whose free end snaps back onto the barrier it starts on) is dropped as a
-   stub.
+   An end does not snap onto a barrier it runs alongside (its end segment
+   within ``snap_tol`` of it and within SNAP_PARALLEL_ANGLE of parallel), and
+   when both ends of a barrier would snap onto the same other barrier that it
+   lies within ``snap_tol`` of, neither does: a close parallel barrier is not
+   folded onto its neighbour. A barrier that collapses to a point (a branch
+   no longer than ``snap_tol`` whose free end snaps back onto the barrier it
+   starts on) is dropped as a stub.
 2. **Drop boundary parts.** Segments lying on the domain boundary (every
    point within ``snap_tol``) are removed: a barrier there separates
    nothing. A barrier with such a segment inside is split in two, one made
-   only of them is dropped. Recorded, with the length removed.
+   only of them is dropped. Recorded, with the length removed. Where a part
+   along the boundary was cut off, the new end is moved onto the boundary,
+   so a barrier that ended on it still does and its compartment stays
+   sealed.
 3. **Node.** Crossings and junctions with other barriers, the line itself
    and standard lines (and the projections of their ends within the
    tolerance) are inserted as vertices, and every vertex shared by several
@@ -28,12 +35,18 @@ the output of the previous one:
    within SIMPLIFY_MARGIN x the tolerance. A chord of length L costs
    ``1 + SHORT_PENALTY max(0, 1 - L / lc)^2``, so short chords are avoided.
    Unlike a per-line Douglas-Peucker pass this runs after the junctions are
-   joined, so it cannot pull a splay off the fault it starts on.
+   joined, so it cannot pull a splay off the fault it starts on. A chord
+   spans at most MAX_SPAN input vertices, and the chords reachable from a
+   vertex are found block by block (the valid directions narrow as the
+   chord grows), so a trace of n vertices costs about n x MAX_SPAN, not n^2.
 5. **Clean digitising noise** (always): a vertex closer than NOISE_FRACTION x
-   lc to a neighbour is dropped (the one whose removal moves the line least),
-   unless it must be kept. The largest move is recorded and warned about.
+   lc to a neighbour is dropped (the one whose removal moves the line least,
+   kept in a heap), unless it must be kept. The largest move is recorded and
+   warned about.
 
-Barriers are not densified: the barrier construction places its own nodes.
+A barrier without its own ``resolution`` uses the finest resolution of the
+zones it crosses for lc here (with none, step 5 skips it). Barriers are not
+densified: the barrier construction places its own nodes.
 """
 from __future__ import annotations
 

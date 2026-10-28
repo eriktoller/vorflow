@@ -41,8 +41,10 @@ the output of the previous one:
    chord grows), so a trace of n vertices costs about n x MAX_SPAN, not n^2.
 5. **Clean digitising noise** (always): a vertex closer than NOISE_FRACTION x
    lc to a neighbour is dropped (the one whose removal moves the line least,
-   kept in a heap), unless it must be kept. The largest move is recorded and
-   warned about.
+   kept in a heap), unless it must be kept or dropping it would fold the
+   line back sharper than NOISE_FOLD where it did not fold before (the two
+   corners of a U-turn narrower than the noise length: dropping one would
+   leave a spike). The largest move is recorded and warned about.
 
 A barrier without its own ``resolution`` uses the finest resolution of the
 zones it crosses for lc here (with none, step 5 skips it). Barriers are not
@@ -61,6 +63,7 @@ from scipy.spatial import cKDTree
 from shapely.geometry import LineString, Point
 
 NOISE_FRACTION = 0.1      # x lc: vertices closer than this to a neighbour are digitising noise
+NOISE_FOLD = math.radians(18.0)  # ... unless dropping one folds the line back sharper than this (a narrow U-turn)
 SIMPLIFY_MARGIN = 0.98    # simplification uses this x simplify_tolerance
 SHORT_PENALTY = 4.0       # simplification cost of a chord of length L: 1 + SHORT_PENALTY max(0, 1 - L/lc)^2
 MAX_SPAN = 512            # a simplified chord spans at most this many input vertices
@@ -547,7 +550,27 @@ def _noise_candidate(xy: np.ndarray, keep: np.ndarray, prev: np.ndarray, nxt: np
         return None
     if not (np.hypot(*(xy[v] - xy[p])) < short or np.hypot(*(xy[n] - xy[v])) < short):
         return None
+    if folds(xy, prev[p], p, v, n, nxt[n]):
+        return None
     return _offset(xy[v], xy[p], xy[n])
+
+
+def _interior(xy: np.ndarray, u: int, a: int, b: int) -> float:
+    """Angle at vertex u between its legs to a and b."""
+    da, db = xy[a] - xy[u], xy[b] - xy[u]
+    return math.acos(float(np.clip(da @ db / (np.hypot(*da) * np.hypot(*db)), -1.0, 1.0)))
+
+
+def folds(xy: np.ndarray, before: int, p: int, v: int, n: int, after: int) -> bool:
+    """True when dropping vertex v (between p and n; ``before`` and ``after`` their other neighbours, -1 for
+    none), which is not a fold itself, would fold the line back at p or n sharper than NOISE_FOLD: a U-turn
+    narrower than the noise length would become a spike."""
+    if _interior(xy, v, p, n) < NOISE_FOLD:
+        return False
+    for u, other, beyond in ((p, n, before), (n, p, after)):
+        if beyond >= 0 and _interior(xy, u, beyond, other) < NOISE_FOLD <= _interior(xy, u, beyond, v):
+            return True
+    return False
 
 
 def drop_noise(xy: np.ndarray, keep: np.ndarray, short: float) -> tuple:
@@ -555,7 +578,7 @@ def drop_noise(xy: np.ndarray, keep: np.ndarray, short: float) -> tuple:
     dropped one at a time, least move first (ties: first along the line), until none is left or two remain.
 
     A heap of the candidates with lazy invalidation: dropping a vertex only
-    changes its two neighbours.
+    changes the two vertices on either side of it (``folds`` looks two ahead).
     """
     n = len(xy)
     prev, nxt = np.arange(-1, n - 1), np.arange(1, n + 1)
@@ -580,7 +603,9 @@ def drop_noise(xy: np.ndarray, keep: np.ndarray, short: float) -> tuple:
         nxt[p], prev[q] = q, p
         count -= 1
         dropped += 1
-        for u in (p, q):
+        for u in (prev[p] if p >= 0 else -1, p, q, nxt[q] if q >= 0 else -1):
+            if u < 0:
+                continue
             version[u] += 1
             move = _noise_candidate(xy, keep, prev, nxt, u, short)
             if move is not None:

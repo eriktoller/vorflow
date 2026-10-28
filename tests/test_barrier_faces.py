@@ -959,7 +959,9 @@ def test_gap_field_puts_its_cells_across_gaps_next_to_barriers(name):
         _assert_exact(mg, vt, grid)
         assert _components(mg, grid) == 1
     (mg_off, _, grid_off), (mg_on, _, grid_on) = off, on
-    assert mg_on.barrier_report["removed_nodes"] <= mg_off.barrier_report["removed_nodes"]
+    # Sizing that ignored GapField removed hundreds of Gmsh nodes (861 for the single barrier); a few stray
+    # ones depend on the Gmsh version (0 with Gmsh 4.14, 1-2 with 4.15).
+    assert mg_on.barrier_report["removed_nodes"] <= mg_off.barrier_report["removed_nodes"] + 5
     if span is None:
         assert not mg_on.diagnostics["gap_field"]["field_created"]
         assert np.array_equal(grid_on[["x", "y"]].to_numpy(), grid_off[["x", "y"]].to_numpy())

@@ -79,6 +79,21 @@ and the project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - The notebook `examples/barrier_meshing.ipynb` shows how barrier faces are
   placed, what `barrier_report` lists and the remaining limits. The README
   has a new "Barriers" section.
+- `GapField(cells_across=3, growth_factor=None, min_size=None)`, passed as
+  `MeshGenerator(gap_field=...)`, refines narrow gaps between embedded
+  features to about `cells_across` cells. The gap is read off an approximate
+  medial axis of the feature linework (shapely + SciPy, `vorflow._gap`), with
+  separation measured along the noded linework so junctions are not gaps, and
+  a polygon's own narrow neck counts. The size is gap / `cells_across`,
+  graded at `growth_factor`, and combined with the model's own fields under
+  the usual `Min`. Where no gap is narrower than `cells_across` times the
+  local size, no field is created and the mesh is unchanged. `min_size` (in
+  model units, default 0.1 x `background_lc`) floors the size, with a warning
+  that names each place where it leaves fewer than `cells_across` cells.
+  `MeshGenerator.diagnostics["gap_field"]` summarises the estimate.
+- `gap_wall=` on `ConceptualMesh.add_polygon`, `add_line` and `add_point`
+  (default True): with `gap_wall=False` the feature is never a side of a gap
+  for `GapField`, e.g. a boundary-condition line just inside the domain edge.
 
 ### Changed
 
@@ -188,6 +203,15 @@ and the project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   sites are fitted. Quad buffers on barriers
   (`quad_buffer=True`) still use the mirror generators and the cut, so they
   can still leave cut cells and faces of several edges.
+- Embedding points (point features, hex-ring seeds, barrier straddle pairs)
+  now scales linearly with their number. Each point's owning surface was
+  found with one `gmsh.model.isInside` call, whose cost grows with the points
+  already in the surface, so the step was quadratic: 2.1 s of a 4.8 s
+  `generate()` at 10⁴ points. The owner now comes from the fragmented
+  topology (the surface holding the point as an interior vertex), with
+  `isInside` kept for points on a boundary or in no surface, and points are
+  embedded with one `embed` call per surface. Meshes are unchanged: nodes and
+  `node_tags` are identical on all benchmark cases.
 
 ### Deprecated
 
@@ -214,21 +238,6 @@ and the project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   two benchmark cases the flow through an HFB on these faces was 42-56%
   lower than on a 4 x finer grid. With exact faces it is within 1% of the
   finer grid (24.84 against 24.97 on `real_faults`).
-
-### Changed
-
-- Embedding points (point features, hex-ring seeds, barrier straddle pairs)
-  now scales linearly with their number. Each point's owning surface was
-  found with one `gmsh.model.isInside` call, whose cost grows with the points
-  already in the surface, so the step was quadratic: 2.1 s of a 4.8 s
-  `generate()` at 10⁴ points. The owner now comes from the fragmented
-  topology (the surface holding the point as an interior vertex), with
-  `isInside` kept for points on a boundary or in no surface, and points are
-  embedded with one `embed` call per surface. Meshes are unchanged: nodes and
-  `node_tags` are identical on all benchmark cases.
-
-### Fixed
-
 - `boundary_centering="inset_mirror"` no longer leaves uncovered strips (and
   MODFLOW 6 disconnected faces) along irregular boundaries
   ([#71](https://github.com/rhugman/vorflow/issues/71)). At a reflex boundary

@@ -47,6 +47,7 @@ from scipy.spatial import cKDTree
 from .fields import (
     DEFAULT_GROWTH_FACTOR,
     ConstantField,
+    GapField,
     GeometricGrowthField,
     MeshField,
     ThresholdField,
@@ -60,6 +61,7 @@ from ._barrier import frames as _barrier_frames
 from ._barrier import network as _barrier_network
 from ._barrier import polish as _barrier_polish
 from ._barrier import sizing as _barrier_sizing
+from ._gap import GapWalls, SizeSource
 from ._features import (
     feature_lc,
     is_embedded,
@@ -615,6 +617,51 @@ def _activate_size_fields(field_ids):
     gmsh.option.setNumber("Mesh.MeshSizeFromCurvature", 0)
 
 
+def _embedded_rows(gdf):
+    """Rows of an embedded feature frame with a non-empty geometry."""
+    if gdf is None or gdf.empty:
+        return []
+    return [row for _, row in gdf.iterrows()
+            if is_embedded(row) and row.geometry is not None and not row.geometry.is_empty]
+
+
+def _gap_walls(polygons_gdf, lines_gdf, points_gdf):
+    """Embedded geometry GapField measures gaps between; ``gap_wall=False`` features are exempt."""
+    polygons, lines = _embedded_rows(polygons_gdf), _embedded_rows(lines_gdf)
+    exempt = [row.geometry.boundary for row in polygons if not row_bool(row, 'gap_wall', True)]
+    exempt += [row.geometry for row in lines if not row_bool(row, 'gap_wall', True)]
+    return GapWalls(
+        polygons=[row.geometry for row in polygons],
+        lines=[row.geometry for row in lines],
+        points=[row.geometry for row in _embedded_rows(points_gdf) if row_bool(row, 'gap_wall', True)],
+        exempt=exempt,
+    )
+
+
+def _gap_size_sources(polygons_gdf, lines_gdf, points_gdf, background_lc):
+    """Each feature's default growth field as a SizeSource, for GapField's no-op test.
+
+    Only features sized by the default GeometricGrowthField (no explicit
+    ``fields``, no legacy dist_min/dist_max, no border grading) are listed.
+    Leaving the others out can only keep a gap sample GapField might not
+    need, never drop one it does.
+    """
+    sources = []
+    for gdf in (points_gdf, lines_gdf, polygons_gdf):
+        if gdf is None or gdf.empty:
+            continue
+        for _, row in gdf.iterrows():
+            lc = _optional_float(row, 'lc')
+            if lc is None or lc >= background_lc or row.geometry is None or row.geometry.is_empty:
+                continue
+            legacy = any(_optional_float(row, key) is not None for key in ('dist_min', 'dist_max', 'border_lc'))
+            if legacy or _explicit_fields(row.get('fields', None)):
+                continue
+            growth = _optional_float(row, 'growth_factor', DEFAULT_GROWTH_FACTOR)
+            sources.append(SizeSource(row.geometry, lc, growth - 1.0))
+    return sources
+
+
 # --- Explicit embedding helpers (used by MeshGenerator._embed_features) ---
 
 @dataclasses.dataclass
@@ -879,6 +926,10 @@ class MeshGenerator:
             mesh. When given, ``generate()`` can be called without arguments:
             it runs ``conceptual_mesh.generate()`` itself, and
             ``VoronoiTessellator(mesher)`` picks the model up from here.
+        gap_field (GapField, optional): Model-wide field that refines narrow
+            gaps between embedded features to ``cells_across`` cells. It
+            adds no Gmsh field where no gap needs refining. The estimate is
+            summarised in ``diagnostics['gap_field']``.
         barrier_gradation (float): Largest change of the barrier face length
             per unit length along the barrier network (0.3: a face is at most
             30% of the distance longer than one a unit away). The faces are
@@ -959,9 +1010,12 @@ class MeshGenerator:
                  heal_shapes=False, heal_tolerance=1e-8,
                  heal_fix_degenerated=True, heal_fix_small_edges=True,
                  heal_fix_small_faces=True, diagnose=False,
-                 conceptual_mesh=None, barrier_gradation=_barrier_sizing.GRADATION,
+                 conceptual_mesh=None, gap_field=None, barrier_gradation=_barrier_sizing.GRADATION,
                  sharp_angle=math.degrees(_barrier_network.SHARP_ANGLE),
                  barrier_polish_iterations=_barrier_polish.ITERATIONS):
+        if gap_field is not None and not isinstance(gap_field, GapField):
+            raise ValueError(f"gap_field must be a GapField or None. Got {gap_field!r}.")
+        self.gap_field = gap_field
         self.conceptual_mesh = conceptual_mesh
         self.background_lc = background_lc
         self.verbosity = verbosity
@@ -2603,6 +2657,7 @@ class MeshGenerator:
                 field_ids.append(f_id)
 
         field_ids.extend(self._add_crossing_fields(crossings, background_lc))
+        field_ids.extend(self._add_gap_field(polygons_gdf, lines_gdf, points_gdf, background_lc))
         field_ids.append(ConstantField(size=self.background_lc).create(
             gmsh_api=gmsh, tags_dict={}, background_lc=self.background_lc, feature_lc=None,
         ))
@@ -2621,6 +2676,30 @@ class MeshGenerator:
             logger.debug(f"[DIAG]   first polygon index {first_idx!r} ({type(first_idx).__name__}), "
                          f"first map key {first_key!r} ({type(first_key).__name__}), "
                          f"match={first_idx in surfaces}")
+
+    def _add_gap_field(self, polygons_gdf, lines_gdf, points_gdf, background_lc):
+        """The GapField's Gmsh field id as a list (empty without a field); records diagnostics['gap_field']."""
+        if self.gap_field is None:
+            return []
+        tags_dict = {
+            'gap_walls': _gap_walls(polygons_gdf, lines_gdf, points_gdf),
+            'size_sources': _gap_size_sources(polygons_gdf, lines_gdf, points_gdf, background_lc),
+        }
+        f_id = self.gap_field.create(gmsh, tags_dict, background_lc)
+        est = tags_dict['gap_estimate']
+        active = est.active
+        self.diagnostics['gap_field'] = {
+            'field_created': f_id is not None,
+            'n_wall_samples': int(est.n_wall_samples),
+            'n_active': int(active.sum()),
+            'min_gap': float(est.gap[active].min()) if active.any() else None,
+            'min_size': float(est.min_size),
+            'n_floor_bound': int(est.floor_bound.sum()),
+        }
+        if f_id is not None:
+            logger.info(f"Gap field: {int(active.sum())} medial samples, narrowest gap "
+                        f"{self.diagnostics['gap_field']['min_gap']:.3g}.")
+        return [] if f_id is None else [f_id]
 
     @staticmethod
     def _add_crossing_fields(crossings, background_lc):

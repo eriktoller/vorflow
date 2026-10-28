@@ -7,6 +7,8 @@ import operator
 import numpy as np
 import shapely
 
+from . import _gap
+
 logger = logging.getLogger(__name__)
 
 
@@ -558,3 +560,124 @@ class _BorderGradingField(MeshField):
     def python_size(self, distance, background_lc, feature_lc=None):
         """Size at ``distance`` outside the polygon (the border size inside, a conservative estimate)."""
         return self.border_size + (DEFAULT_GROWTH_FACTOR - 1.0) * np.asarray(distance, dtype=float)
+
+
+# --- Model-wide fields ---
+
+
+class GapField(MeshField):
+    """Cap the mesh size at gap / ``cells_across`` in narrow gaps between features.
+
+    The gap is the local distance between embedded features (polygon
+    boundaries, lines and points), measured on an approximate medial axis of
+    their linework. Separation is measured along the noded linework, so a
+    junction or corner wider than about 30 degrees is not a gap, while a
+    polygon's own narrow neck is. Field-only (``embed=False``) features and
+    features added with ``gap_wall=False`` are never a side of a gap.
+    Barrier, straddle and quad-buffered lines count as plain lines.
+
+    Near a gap of width w the size is ``max(min_size, w / cells_across)``,
+    held across the gap and graded away from it at ``growth_factor``; the
+    model's own fields still apply, since Gmsh takes the smallest size. Only
+    gaps narrower than ``cells_across`` times the local size (the background
+    size, or a feature's default size field where it is finer) are
+    refined. Where there is none, no Gmsh field is created and the mesh is
+    unchanged.
+
+    The field is model-wide: pass it as ``MeshGenerator(gap_field=...)``, not
+    in a feature's ``fields``.
+
+    Args:
+        cells_across (float): Cells wanted across every gap (k). Gmsh rows
+            are about 0.87 h apart, so k is roughly the number of cells
+            strictly between the two walls.
+        growth_factor (float, optional): Cell-to-cell growth ratio (> 1.0)
+            away from the gap, as for ``GeometricGrowthField``. None uses
+            the default 1.2.
+        min_size (float, optional): Smallest size the field asks for, in
+            model units. None uses 0.1 x ``background_lc``. Wherever gap /
+            ``cells_across`` is below it (very narrow gaps, shallow wedges)
+            a warning names the location and the cells across achieved.
+            The estimate samples the linework every ``min_size / 2``, so its
+            cost grows as ``min_size`` falls.
+    """
+
+    def __init__(self, cells_across=3, growth_factor=None, min_size=None):
+        if isinstance(cells_across, bool):
+            raise ValueError(f"cells_across must be a positive finite number. Got {cells_across!r}.")
+        self.cells_across = _positive_finite(cells_across, "cells_across")
+        self.growth_factor, self.gradient = _growth_gradient(
+            DEFAULT_GROWTH_FACTOR if growth_factor is None else growth_factor, "edge_ratio"
+        )
+        self.min_size = None if min_size is None else _positive_finite(min_size, "min_size")
+
+    def resolved_min_size(self, background_lc) -> float:
+        """``min_size``, or 0.1 x ``background_lc`` when unset; must be below ``background_lc``."""
+        background_lc = _positive_finite(background_lc, "background_lc")
+        min_size = 0.1 * background_lc if self.min_size is None else self.min_size
+        if min_size >= background_lc:
+            raise ValueError(
+                f"GapField min_size ({min_size:g}) must be smaller than background_lc ({background_lc:g})."
+            )
+        return min_size
+
+    def estimate(self, walls, background_lc, size_sources=()):
+        """Gap estimate (``vorflow._gap.GapEstimate``) for the given ``_gap.GapWalls``."""
+        return _gap.estimate_gaps(
+            walls, float(background_lc), self.cells_across, self.gradient,
+            self.resolved_min_size(background_lc), size_sources=list(size_sources),
+        )
+
+    def create(self, gmsh_api, tags_dict, background_lc, feature_lc=None):
+        """PostView field holding the gap sizes, or None when no gap needs refining.
+
+        ``tags_dict`` must hold ``'gap_walls'`` (a ``_gap.GapWalls``) and may
+        hold ``'size_sources'``; ``MeshGenerator`` builds both. The estimate
+        is left in ``tags_dict['gap_estimate']``.
+        """
+        if "gap_walls" not in tags_dict:
+            raise ValueError(
+                "GapField is model-wide: pass it as MeshGenerator(gap_field=GapField(...)), "
+                "not in a feature's fields."
+            )
+        est = self.estimate(tags_dict["gap_walls"], background_lc, tags_dict.get("size_sources", ()))
+        tags_dict["gap_estimate"] = est
+        if not est.active.any():
+            return None
+        _warn_where_floor_binds(est)
+        xmin, ymin, _, xmax, ymax, _ = gmsh_api.model.getBoundingBox(-1, -1)
+        margin = 0.01 * math.hypot(xmax - xmin, ymax - ymin) + float(background_lc)
+        xy, triangles, values = _gap.view_triangles(est, (xmin, ymin, xmax, ymax), margin)
+        return _list_view_field(gmsh_api, xy, triangles, values, "vorflow gap field")
+
+
+def _warn_where_floor_binds(est):
+    """Warn where min_size is above gap / cells_across, naming the narrowest places."""
+    n_places, places = _gap.floor_locations(est, separation=est.background_lc)
+    if n_places == 0:
+        return
+    where = "; ".join(
+        f"({x:.6g}, {y:.6g}): gap {gap:.3g}, {gap / est.min_size:.2g} cells across"
+        for x, y, gap in places
+    )
+    logger.warning(
+        f"GapField: min_size={est.min_size:g} is above gap / {est.cells_across:g} in {n_places} "
+        f"place(s), so those gaps get fewer than {est.cells_across:g} cells across. "
+        f"Narrowest: {where}. Lower min_size, or add the features with gap_wall=False "
+        f"if those gaps should not be refined."
+    )
+
+
+def _list_view_field(gmsh_api, xy, triangles, values, name):
+    """PostView field on a list-data ("ST") view of values on a triangulation."""
+    p = xy[triangles]
+    v = values[triangles]
+    data = np.concatenate([p[:, :, 0], p[:, :, 1], np.zeros_like(v), v], axis=1).ravel().tolist()
+    view = gmsh_api.view.add(name)
+    gmsh_api.view.addListData(view, "ST", len(triangles), data)
+    field = gmsh_api.model.mesh.field
+    f_view = field.add("PostView")
+    field.setNumber(f_view, "ViewTag", view)
+    field.setNumber(f_view, "CropNegativeValues", 1)
+    field.setNumber(f_view, "UseClosest", 0)
+    return f_view

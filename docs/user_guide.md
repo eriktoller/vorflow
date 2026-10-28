@@ -60,7 +60,10 @@ What is checked:
   points or edges, so they are not checked; they still set `h`.
 - Barrier, straddle and quad-buffer features as the plain lines and
   polygons they are drawn from. The extra nodes and quad strips the mesher
-  builds around them are not modelled.
+  builds around them are not modelled. One exception: a barrier end that
+  runs alongside another barrier, or along the domain outline, is not a near
+  miss. The mesher gives that gap one row of cells, so it is reported as a
+  narrow gap.
 
 `check()` changes nothing: the registered features and any earlier
 `generate()` result are left as they were. It does not catch every bad cell.

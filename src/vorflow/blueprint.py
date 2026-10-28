@@ -1457,7 +1457,10 @@ class ConceptualMesh:
         are vorflow's own and are not reported. Only embedded features are
         checked; field-only (``embed=False``) features only set ``h``.
         Barrier, straddle and quad-buffer features are checked as the plain
-        lines and polygons they are drawn from.
+        lines and polygons they are drawn from, except that a barrier end
+        running alongside another barrier or the domain outline is not a
+        near miss: the barrier construction gives that gap one row of cells,
+        and it is reported as a ``narrow_gap``.
 
         One defect often trips several checks. Findings whose geometries lie
         within ``2 * h`` of each other are treated as one site, and only the most

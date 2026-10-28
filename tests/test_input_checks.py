@@ -95,6 +95,46 @@ def test_line_end_within_connectivity_tolerance_is_snapped_not_reported():
     assert cm.check(background_lc=BACKGROUND_LC).empty
 
 
+BARRIER = dict(is_barrier=True, resolution=LC)
+CORRIDOR_CASES = {
+    # Barrier ends that run alongside another barrier or the outline: the barrier construction
+    # gives the gap one row of cells, so they are a narrow gap, not a near miss.
+    "pair": [[(100, 500), (500, 500)], [(100, 501), (500, 501)]],
+    "staggered pair": [[(100, 500), (500, 500)], [(150, 501), (550, 501)]],
+    "u_turn": [[(100, 500), (500, 500), (500, 501), (100, 501)]],
+    "along the boundary": [[(100, 3), (500, 3)]],
+}
+
+
+@pytest.mark.parametrize("name", CORRIDOR_CASES)
+def test_barrier_ends_beside_a_corridor_are_a_narrow_gap(name):
+    cm = _domain_mesh()
+    for k, coords in enumerate(CORRIDOR_CASES[name]):
+        cm.add_line(LineString(coords), line_id=f"b{k}", **BARRIER)
+
+    findings = cm.check(background_lc=BACKGROUND_LC)
+
+    assert not (findings["severity"] == "error").any(), findings.drop(columns="geometry")
+    assert set(findings["kind"]) <= {"narrow_gap", "short_segment"}
+
+
+@pytest.mark.parametrize("is_barrier", [True, False])
+def test_other_line_ends_near_a_line_stay_near_misses(is_barrier):
+    # Only barriers side by side get a corridor: standard lines side by side, and a barrier end
+    # pointing at a barrier, are still near misses.
+    cm = _domain_mesh()
+    cm.add_line(LineString([(100, 500), (500, 500)]), line_id="a", is_barrier=is_barrier, resolution=LC)
+    if is_barrier:
+        cm.add_line(LineString([(300, 800), (300, 503)]), line_id="b", **BARRIER)
+    else:
+        cm.add_line(LineString([(100, 501), (500, 501)]), line_id="b", resolution=LC)
+
+    findings = cm.check(background_lc=BACKGROUND_LC)
+
+    errors = findings[findings["severity"] == "error"]
+    assert not errors.empty and "line_end_near_miss" in ",".join(errors["site_kinds"])
+
+
 @pytest.mark.parametrize("ratio, expected", [(0.3, "error"), (0.8, "warning"), (1.2, None)])
 def test_point_near_miss(ratio, expected):
     cm = _domain_mesh()

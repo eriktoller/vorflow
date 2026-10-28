@@ -16,9 +16,11 @@ and the project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   polygons and narrow gaps. Each is measured against the local mesh size `h`
   as `ratio = distance / h` and graded `"error"` or `"warning"`; one defect
   site gives one row of a GeoDataFrame. Only embedded features are checked,
-  on the cleaned features before densification. The registered features and
-  earlier `generate()` results are left unchanged. See "Checking inputs
-  before meshing" in the user guide.
+  on the cleaned features before densification. A barrier end that runs
+  alongside another barrier or the domain outline is reported as a narrow
+  gap, not a near miss, since the barrier construction gives that gap one
+  row of cells. The registered features and earlier `generate()` results are
+  left unchanged. See "Checking inputs before meshing" in the user guide.
 - The release workflow creates the GitHub Release for each final tag once it
   is on PyPI, with notes from the tag's changelog section and the wheel and
   sdist attached (`scripts/release_notes.py`). A tag without a changelog

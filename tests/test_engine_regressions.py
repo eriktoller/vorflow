@@ -13,6 +13,7 @@ from shapely.geometry import LineString, MultiPoint, Point, Polygon, box
 
 import vorflow
 from vorflow.blueprint import ConceptualMesh
+from vorflow import engine
 from vorflow.engine import MeshGenerator, _SurvivorIndex, _match_heal_survivors
 
 pytestmark = pytest.mark.slow  # gmsh-heavy end-to-end tests
@@ -357,8 +358,29 @@ def test_dedup_keeps_renumbered_curves_in_the_feature_map():
     assert total_length == pytest.approx(clean_river.length, abs=1e-6)
 
 
+def test_many_embedded_points_all_become_mesh_nodes():
+    # Points are embedded with one embed() call per surface; their owner comes
+    # from the fragmented topology instead of one isInside() per point, which
+    # made embedding quadratic in the number of points.
+    cm = ConceptualMesh()
+    cm.add_polygon(box(0, 0, 200, 200), zone_id=1)
+    cm.add_polygon(box(50, 50, 150, 150), zone_id=2, resolution=5.0, z_order=1)
+    coords = [(x, y) for x in np.arange(4.0, 200.0, 8.0) for y in np.arange(4.0, 200.0, 8.0)]
+    for i, xy in enumerate(coords):
+        cm.add_point(Point(xy), point_id=f"p{i}", resolution=None)
+    mg = MeshGenerator(background_lc=10.0, verbosity=0, diagnose=True)
+    assert mg.generate(*cm.generate())
+    embedding = mg.diagnostics["embedding"]
+    assert embedding["ok"] == len(coords) == 625
+    assert embedding["failed"] == embedding["skip_no_match"] == embedding["multi_match"] == 0
+    assert len({record["surface"] for record in embedding["records"]}) == 2
+    nodes = {tuple(xy) for xy in np.round(mg.nodes, 9)}
+    assert all(xy in nodes for xy in coords)
+
+
 def test_unembedded_entities_are_reported_with_a_warning(monkeypatch, caplog):
     monkeypatch.setattr(MeshGenerator, "_surfaces_containing", staticmethod(lambda *args: []))
+    monkeypatch.setattr(engine, "_interior_point_owners", lambda surface_tags: {})
     vorflow.set_verbosity(1, console=False)
     try:
         with caplog.at_level(logging.WARNING, logger="vorflow"):

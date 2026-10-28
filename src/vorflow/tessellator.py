@@ -56,6 +56,15 @@ _STRICT_BARRIERS = False
 # zero-length edge; MODFLOW 6 can crash on those.
 VERTEX_MERGE_FRACTION = 1e-12
 
+# A boundary ghost whose Voronoi cell covers more of the domain than this
+# fraction of its inset squared is dropped and its node clipped instead:
+# ghost cells are discarded before clipping, so that area would be left
+# uncovered. Leaks below the threshold stay. Along a straight boundary they
+# are roundoff (~1e-6 m2 on a 20 km domain, ~1e-9 of inset^2); kinks of
+# ~1e-5 m in a boundary leave slivers of ~1e-4 m2 (coverage error ~1e-10,
+# no disconnected faces).
+GHOST_LEAK_FRACTION = 1e-6
+
 
 def _merged_vertex_index(vertices: np.ndarray, tolerance: float) -> np.ndarray:
     """Map each vertex index to the lowest index in its cluster of vertices chained within tolerance."""
@@ -408,6 +417,33 @@ def _join_unmatched_to_nearest_zone(joined, pts_gdf, zones):
     return pd.concat([joined[matched], nearest])
 
 
+def _far_ghost_nodes(nodes):
+    """Return four ghost nodes far outside the bounding box of nodes, so every node's Voronoi cell is finite."""
+    minx, miny = np.min(nodes, axis=0)
+    maxx, maxy = np.max(nodes, axis=0)
+    buffer = max(maxx - minx, maxy - miny) * 10
+    return np.array([
+        [minx - buffer, miny - buffer],
+        [maxx + buffer, miny - buffer],
+        [maxx + buffer, maxy + buffer],
+        [minx - buffer, maxy + buffer]
+    ])
+
+
+def _ghost_cell_domain_areas(nodes, ghosts, domain_geom):
+    """Return the area of the domain inside each ghost's Voronoi cell (nodes and ghosts as generators)."""
+    generators = np.vstack([nodes, ghosts, _far_ghost_nodes(nodes)])
+    origin = (generators.min(axis=0) + generators.max(axis=0)) / 2.0
+    vor = Voronoi(generators - origin)
+    regions = [vor.regions[vor.point_region[len(nodes) + i]] for i in range(len(ghosts))]
+    # The far ghosts enclose the boundary ghosts, so their cells are finite.
+    assert all(region and -1 not in region for region in regions), "boundary ghost cell is unbounded"
+    ring_of = np.repeat(np.arange(len(regions)), [len(region) for region in regions])
+    rings = shapely.linearrings(vor.vertices[np.concatenate(regions)] + origin, indices=ring_of)
+    cells = shapely.make_valid(shapely.polygons(rings))
+    return shapely.area(shapely.intersection(cells, domain_geom))
+
+
 def _mirror_metadata(tags, mirrors):
     """Return node metadata rows for barrier mirror generators (never boundary-centred)."""
     return pd.DataFrame(
@@ -475,7 +511,13 @@ class VoronoiTessellator:
             centroid-to-centroid orthogonality error of boundary
             connections from about 6 to under 2 degrees. Nodes at sharp
             corners stay in place, so the worst connections next to
-            corners do not improve.
+            corners do not improve. Nodes whose ghost would land inside
+            the domain, or whose ghost's cell would cover part of it (at
+            reflex vertices, where the boundary bends into the domain),
+            also stay in place and are clipped. Every hole vertex of a
+            polygonised circle is reflex, so its nodes are all clipped.
+            Each output cell's mode is in its ``boundary_centering``
+            column (``"inset_mirror"`` or ``"clip"``).
         boundary_inset_fraction (float): Fraction of local boundary-node
             spacing used for the inward shift in ``"inset_mirror"`` mode.
             A boundary cell reaches about halfway to the first interior
@@ -769,7 +811,9 @@ class VoronoiTessellator:
         Shift non-corner boundary nodes inward and add mirrored outside ghosts.
 
         A node whose mirror ghost would land inside the domain (e.g. across
-        a narrow hole) keeps its original position and gets no ghost.
+        a narrow hole), or whose ghost's Voronoi cell would cover part of
+        the domain (at a reflex boundary vertex), keeps its original
+        position and gets no ghost; its metadata row says ``"clip"``.
 
         Returns prepared nodes, prepared tags, and a metadata frame keyed by
         node_id. Tags only cover real nodes; appended ghosts receive -1 in
@@ -830,9 +874,30 @@ class VoronoiTessellator:
         if ghost_inside.any():
             logger.info(f"  -> Left {int(ghost_inside.sum())} boundary nodes in place: mirror ghost inside domain")
 
-        centered_indices = candidates[keep]
-        prepared = nodes.astype(float, copy=True)
-        prepared[centered_indices] = nodes[centered_indices] + normals[keep] * inset[keep, None]
+        # A ghost outside the domain can still own part of it: at a reflex
+        # boundary vertex (one bending into the domain) the ghost's face
+        # runs along the averaged tangent, which cuts into the domain on
+        # both sides of the vertex. Ghost cells are discarded, so drop such
+        # ghosts until no ghost cell covers the domain, and put their nodes
+        # back on the boundary (plain clip). Leaving them inset without a
+        # ghost also covers the domain but gives worse face skewness on
+        # finely faceted curves. Reverting a node can open another ghost's
+        # cell, hence the loop.
+        n_leaking = 0
+        while True:
+            centered_indices = candidates[keep]
+            prepared = nodes.astype(float, copy=True)
+            prepared[centered_indices] = nodes[centered_indices] + normals[keep] * inset[keep, None]
+            if not keep.any():
+                break
+            leak = _ghost_cell_domain_areas(prepared, ghosts[keep], domain_geom)
+            leaking = leak > GHOST_LEAK_FRACTION * inset[keep] ** 2
+            if not leaking.any():
+                break
+            n_leaking += int(leaking.sum())
+            keep[np.flatnonzero(keep)[leaking]] = False
+        if n_leaking:
+            logger.info(f"  -> Left {n_leaking} boundary nodes in place: mirror ghost cell covers the domain")
 
         centered = np.zeros(len(nodes), dtype=bool)
         centered[centered_indices] = True
@@ -1269,17 +1334,7 @@ class VoronoiTessellator:
         # To create a bounded Voronoi diagram from a finite set of points, a common
         # technique is to add "ghost" nodes far outside the area of interest. The
         # large, unwanted cells generated by these ghosts can then be clipped away.
-        minx, miny = np.min(nodes, axis=0)
-        maxx, maxy = np.max(nodes, axis=0)
-        w, h = maxx - minx, maxy - miny
-        buffer = max(w, h) * 10
-        
-        ghost_nodes = np.array([
-            [minx - buffer, miny - buffer],
-            [maxx + buffer, miny - buffer],
-            [maxx + buffer, maxy + buffer],
-            [minx - buffer, maxy + buffer]
-        ])
+        ghost_nodes = _far_ghost_nodes(nodes)
         
         logger.info("Computing Mathematical Voronoi...")
         raw_gdf, node_metadata = self._build_barrier_conforming_voronoi(

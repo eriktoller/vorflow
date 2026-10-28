@@ -9,6 +9,16 @@ and the project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- `ConceptualMesh.check(background_lc=None)` reports input defects that tend
+  to produce bad Voronoi cells, before meshing and without Gmsh: short
+  segments, close vertices (including a line crossing a polygon edge beside a
+  vertex), line ends and points that just miss another feature, sliver
+  polygons and narrow gaps. Each is measured against the local mesh size `h`
+  as `ratio = distance / h` and graded `"error"` or `"warning"`; one defect
+  site gives one row of a GeoDataFrame. Only embedded features are checked,
+  on the cleaned features before densification. The registered features and
+  earlier `generate()` results are left unchanged. See "Checking inputs
+  before meshing" in the user guide.
 - The release workflow creates the GitHub Release for each final tag once it
   is on PyPI, with notes from the tag's changelog section and the wheel and
   sdist attached (`scripts/release_notes.py`). A tag without a changelog
@@ -172,6 +182,29 @@ and the project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   MODFLOW 6 DISV takes the connection width from its first edge only, so on
   two benchmark cases the flow through an HFB on these faces was 40-60%
   lower than on a finer reference grid.
+
+### Changed
+
+- Embedding points (point features, hex-ring seeds, barrier straddle pairs)
+  now scales linearly with their number. Each point's owning surface was
+  found with one `gmsh.model.isInside` call, whose cost grows with the points
+  already in the surface, so the step was quadratic: 2.1 s of a 4.8 s
+  `generate()` at 10⁴ points. The owner now comes from the fragmented
+  topology (the surface holding the point as an interior vertex), with
+  `isInside` kept for points on a boundary or in no surface, and points are
+  embedded with one `embed` call per surface. Meshes are unchanged: nodes and
+  `node_tags` are identical on all benchmark cases.
+
+### Fixed
+
+- `boundary_centering="inset_mirror"` no longer leaves uncovered strips (and
+  MODFLOW 6 disconnected faces) along irregular boundaries
+  ([#71](https://github.com/rhugman/vorflow/issues/71)). At a reflex boundary
+  vertex (one bending into the domain) a mirror ghost outside the domain still
+  owned part of it, and ghost cells are discarded before clipping. Such ghosts
+  are now dropped and their nodes clipped (`boundary_centering` is `"clip"` in
+  their row). Every vertex of a polygonised circular hole is reflex, so its
+  nodes are all clipped.
 
 ## [0.3.0] - 2026-10-15
 

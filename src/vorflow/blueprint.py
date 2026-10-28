@@ -3,6 +3,8 @@ from __future__ import annotations
 import logging
 import math
 import warnings
+from contextlib import contextmanager
+
 import geopandas as gpd
 import shapely
 import shapely.affinity
@@ -13,8 +15,8 @@ from shapely.ops import unary_union, snap, polygonize
 from shapely.prepared import prep
 from shapely.validation import make_valid
 
-from . import _junctions
-from ._log import warn_user
+from . import _checks, _junctions
+from ._log import verbosity_scope, warn_user
 from ._features import line_parts as _line_parts
 from ._features import HEX_RING_CLEARANCE, is_face_line, positive_number, row_bool
 from ._plot import features_frame, get_ax, plot_features
@@ -320,6 +322,26 @@ def _hex_ring_size_conflict(ring, lc: float, sources) -> str | None:
                 f"(needs >= {min_size:.6g})"
             )
     return None
+
+
+def _check_background_lc(background_lc, clean_frames) -> float:
+    """``background_lc`` for check(): the given value, else the coarsest feature resolution."""
+    if background_lc is None:
+        resolutions = [
+            lc for frame in clean_frames if 'lc' in frame.columns
+            for lc in (positive_number(value) for value in frame['lc']) if lc is not None
+        ]
+        if not resolutions:
+            raise ValueError(
+                "check() needs background_lc when no feature has a resolution."
+            )
+        return max(resolutions)
+    value = None if isinstance(background_lc, bool) else positive_number(background_lc)
+    if value is None or not math.isfinite(value):
+        raise ValueError(
+            f"background_lc must be a positive finite number. Got {background_lc!r}."
+        )
+    return value
 
 
 def _warn_deprecated(message):
@@ -1392,6 +1414,109 @@ class ConceptualMesh:
             connectivity_tolerance (float, optional): Override for the instance's
                 default topology snapping tolerance during this preprocessing run.
         """
+        with self._working_copies():
+            return self._generate_working_features(connectivity_tolerance)
+
+    def check(self, background_lc=None):
+        """
+        Reports input defects that tend to produce bad Voronoi cells, before meshing.
+
+        Each defect is measured against the local mesh size ``h`` at its
+        location: the size field the mesher will aim for there, i.e.
+        ``background_lc`` capped by every feature's size transition (by
+        default ``resolution + (growth_factor - 1) * distance``, zero distance
+        inside a polygon). ``ratio = distance / h`` sets the severity:
+
+        ====================  ================  ===================
+        kind                  error if ratio <  warning if ratio <
+        ====================  ================  ===================
+        short_segment         0.1               0.25
+        close_vertices        0.1               0.5
+        line_end_near_miss    0.5               1.0 (inclusive)
+        point_near_miss       0.5               1.0 (inclusive)
+        sliver_polygon        0.5               1.0
+        narrow_gap            never             1.0 (inclusive)
+        ====================  ================  ===================
+
+        - ``short_segment``: two consecutive vertices of a polygon ring or line.
+        - ``close_vertices``: two distinct mesh points (vertices, points, or
+          where a line crosses another line or a polygon edge), e.g. a line
+          crossing a polygon edge just beside one of its vertices.
+        - ``line_end_near_miss`` / ``point_near_miss``: a line end or point
+          that touches no other feature (it is further than
+          ``connectivity_tolerance`` from all of them) but lies close to one.
+        - ``sliver_polygon``: a polygon part, or a strip of one, narrower than
+          the local size, often left over by overlap resolution.
+        - ``narrow_gap``: a stretch of line running close to another feature
+          (or to itself), away from where they meet. The grid there has only
+          one or two cells across, which may be acceptable.
+
+        The checks run on the features as ``generate()`` cleans them
+        (simplification, overlap resolution, snapping, clipping and line
+        junctions), but before densification: the vertices densification adds
+        are vorflow's own and are not reported. Only embedded features are
+        checked; field-only (``embed=False``) features only set ``h``.
+        Barrier, straddle and quad-buffer features are checked as the plain
+        lines and polygons they are drawn from.
+
+        One defect often trips several checks. Findings whose geometries lie
+        within ``2 * h`` of each other are treated as one site, and only the most
+        severe (then the lowest ratio) is returned; its ``site_kinds`` lists
+        every kind found there, so a site may need more than one fix.
+
+        The registered features and the results of an earlier ``generate()``
+        are left unchanged.
+
+        Args:
+            background_lc (float, optional): The background mesh size you
+                will pass to ``MeshGenerator``. If None, the coarsest feature
+                ``resolution`` is used, which caps ``h`` lower than a coarser
+                background would: defects in coarse areas far from any
+                feature may then go unreported.
+
+        Returns:
+            geopandas.GeoDataFrame: One row per defect site, errors first and
+            then by ratio, with columns ``feature_type`` (``"polygon"``,
+            ``"line"`` or ``"point"``), ``feature_id`` (the ``zone_id``,
+            ``line_id`` or ``point_id``), ``other_type`` and ``other_id``
+            (the other feature involved, or None), ``kind``,
+            ``site_kinds`` (comma-separated kinds found at the site),
+            ``severity``
+            (``"error"`` or ``"warning"``), ``distance``, ``h``, ``ratio``,
+            ``x`` and ``y`` (where the defect is narrowest) and ``geometry``
+            (the segment, gap or polygon part that shows it). Empty when no
+            defect is found.
+
+        Raises:
+            ValueError: If ``background_lc`` is not a positive number, or is
+                None and no feature has a resolution.
+        """
+        saved_state = (self.clean_polygons, self.clean_lines, self.clean_points,
+                       self.junction_diagnostics)
+        try:
+            with verbosity_scope(0), self._working_copies():
+                clean = self._generate_working_features(None, densify=False)
+        finally:
+            (self.clean_polygons, self.clean_lines, self.clean_points,
+             self.junction_diagnostics) = saved_state
+        background_lc = _check_background_lc(background_lc, clean)
+        sources = [
+            (row.geometry, ramp)
+            for frame in clean
+            for _, row in frame.iterrows()
+            for ramp in _size_ramps(row)
+        ]
+        size = _checks.size_field(sources, background_lc, DEFAULT_GROWTH_FACTOR - 1.0)
+        findings = _checks.find_defects(*clean, size, self.connectivity_tolerance, crs=self.crs)
+        n_errors = int((findings["severity"] == "error").sum())
+        logger.info(
+            "Input check: %d error(s), %d warning(s).", n_errors, len(findings) - n_errors
+        )
+        return findings
+
+    @contextmanager
+    def _working_copies(self):
+        """Run preprocessing on per-run copies of the raw feature records, then restore them."""
         raw_inputs = self.raw_polygons, self.raw_lines, self.raw_points
         # Preprocessing replaces geometries and filters feature records, but does
         # not modify their nested field objects. Copy each record for this run.
@@ -1400,11 +1525,11 @@ class ConceptualMesh:
             for raw_features in raw_inputs
         )
         try:
-            return self._generate_working_features(connectivity_tolerance)
+            yield
         finally:
             self.raw_polygons, self.raw_lines, self.raw_points = raw_inputs
 
-    def _generate_working_features(self, connectivity_tolerance):
+    def _generate_working_features(self, connectivity_tolerance, densify=True):
         logger.info("Applying optional geometry simplification...")
         self._apply_simplification()
 
@@ -1554,8 +1679,9 @@ class ConceptualMesh:
                     crs=self.crs,
                 )
 
-        logger.info("Densifying geometry...")
-        self._apply_densification()
+        if densify:
+            logger.info("Densifying geometry...")
+            self._apply_densification()
         
         return self.clean_polygons, self.clean_lines, self.clean_points
 

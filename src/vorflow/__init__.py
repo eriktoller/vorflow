@@ -16,6 +16,7 @@ from .engine import MeshGenerator
 from .tessellator import VoronoiTessellator
 from .fields import (
     ExponentialField,
+    GapField,
     GeometricGrowthField,
     MeshField,
     ThresholdField,
@@ -23,5 +24,5 @@ from .fields import (
 
 __all__ = ["ConceptualMesh", "MeshGenerator", "VoronoiTessellator",
            "MeshField", "ThresholdField", "ExponentialField",
-           "GeometricGrowthField",
+           "GeometricGrowthField", "GapField",
            "set_verbosity"]

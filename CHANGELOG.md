@@ -23,6 +23,21 @@ and the project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   is on PyPI, with notes from the tag's changelog section and the wheel and
   sdist attached (`scripts/release_notes.py`). A tag without a changelog
   section now fails the build before anything is uploaded.
+- `GapField(cells_across=3, growth_factor=None, min_size=None)`, passed as
+  `MeshGenerator(gap_field=...)`, refines narrow gaps between embedded
+  features to about `cells_across` cells. The gap is read off an approximate
+  medial axis of the feature linework (shapely + SciPy, `vorflow._gap`), with
+  separation measured along the noded linework so junctions are not gaps, and
+  a polygon's own narrow neck counts. The size is gap / `cells_across`,
+  graded at `growth_factor`, and combined with the model's own fields under
+  the usual `Min`. Where no gap is narrower than `cells_across` times the
+  local size, no field is created and the mesh is unchanged. `min_size` (in
+  model units, default 0.1 x `background_lc`) floors the size, with a warning
+  that names each place where it leaves fewer than `cells_across` cells.
+  `MeshGenerator.diagnostics["gap_field"]` summarises the estimate.
+- `gap_wall=` on `ConceptualMesh.add_polygon`, `add_line` and `add_point`
+  (default True): with `gap_wall=False` the feature is never a side of a gap
+  for `GapField`, e.g. a boundary-condition line just inside the domain edge.
 
 ### Changed
 

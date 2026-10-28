@@ -19,7 +19,7 @@ from ._features import positive_number, row_bool
 from ._log import verbosity_scope
 from ._plot import features_frame, get_ax, plot_features
 from ._straddle import is_straddle_line, straddle_epsilon
-from .fields import DEFAULT_GROWTH_FACTOR, GeometricGrowthField, MeshField, ThresholdField
+from .fields import DEFAULT_GROWTH_FACTOR, GapField, GeometricGrowthField, MeshField, ThresholdField
 from shapely.strtree import STRtree
 
 logger = logging.getLogger(__name__)
@@ -56,6 +56,22 @@ def _validate_growth_factor(value):
     if value <= 1.0:
         raise ValueError(f"growth_factor must be greater than 1.0. Got {value}.")
     return float(value)
+
+
+def _feature_options(fields, gap_wall):
+    """Validated ``fields`` (None becomes []) and ``gap_wall`` for an add_* call."""
+    if not isinstance(gap_wall, (bool, np.bool_)):
+        raise ValueError(f"gap_wall must be True or False. Got {gap_wall!r}.")
+    if fields is None:
+        fields = []
+    items = fields if isinstance(fields, (list, tuple, set)) else [fields]
+    if any(isinstance(f, GapField) for f in items):
+        raise ValueError(
+            "GapField is model-wide: pass it as MeshGenerator(gap_field=GapField(...)), "
+            "not in a feature's fields."
+        )
+    return fields, bool(gap_wall)
+
 
 def _coerce_line_junction_fraction(value):
     if isinstance(value, bool) or not isinstance(value, (int, float)):
@@ -487,6 +503,7 @@ class ConceptualMesh:
         dist_max_in=None,
         dist_max_out=None,
         label=None,
+        gap_wall=True,
     ):
         """
         Adds a polygon feature, such as a model boundary or a refinement zone.
@@ -540,6 +557,11 @@ class ConceptualMesh:
                 Supported values are 1 and 2.
             label (str, optional): Legend label for ``plot()``. Features sharing a
                 label share one legend entry; unlabelled features get none.
+            gap_wall (bool): If True (default), the polygon is a wall that
+                ``GapField`` measures gaps against. Set False for features whose
+                narrow gaps should not be refined, e.g. a sliver polygon. Its whole
+                boundary, including edges shared with other polygons, is then
+                exempt.
 
         Deprecated parameters:
             dist_min (float, optional): Distance from the polygon boundary where
@@ -594,8 +616,7 @@ class ConceptualMesh:
 
         growth_factor = _validate_growth_factor(growth_factor)
 
-        if fields is None:
-            fields = []
+        fields, gap_wall = _feature_options(fields, gap_wall)
 
         self.raw_polygons.append(
             {
@@ -615,13 +636,14 @@ class ConceptualMesh:
                 'border_lc': border_lc,
                 'dist_max_in': dist_max_in if border_lc is not None else None,
                 'label': label,
+                'gap_wall': gap_wall,
             }
         )
 
     def add_line(self, geometry, line_id, resolution, snap_to_polygons=True, is_barrier=False,
                   dist_min=None, dist_max=None, straddle_width=None, fields=None, embed=True, densify=True,
                   simplify_tolerance=None, quad_buffer=False, quad_buffer_thickness=1, z_order=0,
-                  growth_factor=None, label=None, color=None):
+                  growth_factor=None, label=None, color=None, gap_wall=True):
         """
         Adds a line feature, such as a river, fault, or other linear boundary.
 
@@ -673,6 +695,10 @@ class ConceptualMesh:
                 label share one legend entry; unlabelled features get none.
             color (optional): Matplotlib colour for the line in ``plot()``. None
                 (default) draws barriers red and other lines blue.
+            gap_wall (bool): If True (default), the line is a wall that
+                ``GapField`` measures gaps against. Set False for features whose
+                narrow gaps should not be refined, e.g. a boundary-condition line
+                digitised just inside the domain edge.
 
         Deprecated parameters:
             dist_min (float, optional): Distance from the line where the mesh size
@@ -703,8 +729,7 @@ class ConceptualMesh:
 
         growth_factor = _validate_growth_factor(growth_factor)
 
-        if fields is None:
-            fields = []
+        fields, gap_wall = _feature_options(fields, gap_wall)
 
         self.raw_lines.append({
             'geometry': geometry,
@@ -725,11 +750,12 @@ class ConceptualMesh:
             'growth_factor': growth_factor,
             'label': label,
             'color': color,
+            'gap_wall': gap_wall,
         })
 
     def add_point(self, geometry, point_id, resolution, dist_min=None, dist_max=None, fields=None,
                   embed=True, simplify_tolerance=None, growth_factor=None, hex_ring=False,
-                  label=None):
+                  label=None, gap_wall=True):
         """
         Adds a point feature, such as a well or an observation point.
 
@@ -768,6 +794,10 @@ class ConceptualMesh:
                 ``diagnostics['hex_rings']``.
             label (str, optional): Legend label for ``plot()``. Features sharing a
                 label share one legend entry; unlabelled features get none.
+            gap_wall (bool): If True (default), the point is a wall that
+                ``GapField`` measures gaps against. Set False for features whose
+                narrow gaps should not be refined, e.g. an observation point close to
+                a line.
 
         Deprecated parameters:
             dist_min (float, optional): Distance from the point where the mesh size
@@ -795,8 +825,7 @@ class ConceptualMesh:
 
         growth_factor = _validate_growth_factor(growth_factor)
 
-        if fields is None:
-            fields = []
+        fields, gap_wall = _feature_options(fields, gap_wall)
         self.raw_points.append({
             'geometry': geometry,
             'point_id': point_id,
@@ -809,6 +838,7 @@ class ConceptualMesh:
             'growth_factor': growth_factor,
             'hex_ring': bool(hex_ring),
             'label': label,
+            'gap_wall': gap_wall,
         })
 
     def _apply_simplification(self):
@@ -911,6 +941,7 @@ class ConceptualMesh:
                     "border_lc",
                     "dist_max_in",
                     "label",
+                    "gap_wall",
                 ],
                 crs=self.crs,
             )
@@ -1446,6 +1477,7 @@ class ConceptualMesh:
                     'growth_factor',
                     'label',
                     'color',
+                    'gap_wall',
                 ],
                 crs=self.crs,
             )
@@ -1468,6 +1500,7 @@ class ConceptualMesh:
                     'hex_ring',
                     'label',
                     'ring_seeds',
+                    'gap_wall',
                 ],
                 crs=self.crs,
             )
@@ -1522,6 +1555,7 @@ class ConceptualMesh:
                     'quad_buffer_thickness',
                     'growth_factor',
                     'label',
+                    'gap_wall',
                 ]
                 self.clean_polygons = self.clean_polygons.reindex(columns=polygon_columns)
                 field_only_gdf = field_only_gdf.reindex(columns=polygon_columns)

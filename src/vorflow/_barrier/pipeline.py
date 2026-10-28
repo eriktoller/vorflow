@@ -66,6 +66,8 @@ FINE_BLEND = 0.5         # fine field size = face^(1 - FINE_BLEND) x target^FINE
 CORRIDOR_BLEND = 0.0     # ... along a corridor, whose outer cells should match its row
 EMBED_GAP = 0.05         # x spacing: sites this close to an edge, line or feature are not Gmsh points
 CIRCLE_MARGIN = 0.02     # Gmsh nodes within R (1 + CIRCLE_MARGIN) of a circle centre are removed
+FINER_MARGIN = 0.9       # an advised finer resolution is this x the one at which the faces just fit
+FOLD_MARGIN = 1.25       # an advised simplify_tolerance is this x the shortest piece of the fold
 CLEAR_FRACTION = 0.5     # ... and those within this x the local spacing of a site
 
 
@@ -104,9 +106,39 @@ QUAD_BUFFER_ADVICE = ("quad_buffer=True on the barrier meshes it with a structur
                       "faces are then not exact)")
 
 
-def advice(cause: str, h: float) -> str:
-    """What makes the faces there possible, for a face length ``h`` set by ``cause`` (``sizing.CAUSES``)."""
-    finer = f"a barrier resolution of {h / MIN_H_FRACTION:.3g} or finer there"
+def round_down(x: float, digits: int = 2) -> float:
+    """``x`` rounded down to ``digits`` significant digits."""
+    scale = 10.0 ** (math.floor(math.log10(x)) - digits + 1)
+    return math.floor(x / scale + 1e-9) * scale
+
+
+def round_up(x: float, digits: int = 2) -> float:
+    """``x`` rounded up to ``digits`` significant digits."""
+    scale = 10.0 ** (math.floor(math.log10(x)) - digits + 1)
+    return math.ceil(x / scale - 1e-9) * scale
+
+
+def fold_tolerance(net: Network, points: np.ndarray) -> float | None:
+    """simplify_tolerance that removes a short fold near ``points``: FOLD_MARGIN x the shortest piece within
+    lc of them, if one is shorter than lc (else None: the legs are long, a tolerance does not help)."""
+    pts = shapely.points(np.asarray(points, dtype=float).reshape(-1, 2))
+    best = None
+    for (a, b), lc in zip(net.pieces, net.piece_lc):
+        seg = LineString(net.hard_xy[[a, b]])
+        length = float(seg.length)
+        if length < lc and float(shapely.distance(seg, pts).min()) <= lc:
+            best = length if best is None else min(best, length)
+    return None if best is None else round_up(FOLD_MARGIN * best)
+
+
+def advice(cause: str, h: float, fold: float | None = None) -> str:
+    """What makes the faces there possible, for a face length ``h`` set by ``cause`` (``sizing.CAUSES``);
+    ``fold`` is the simplify_tolerance that removes a short fold there (``fold_tolerance``)."""
+    finer = (f"a barrier resolution of {round_down(FINER_MARGIN * h / MIN_H_FRACTION):.3g} or finer there"
+             if h > 0 else "a finer barrier resolution there")
+    remedy = (f"If that is digitising noise, simplify_tolerance of at least {fold:.3g} on the barrier removes it; "
+              f"otherwise {QUAD_BUFFER_ADVICE}") if fold is not None else \
+        f"The legs there are long, so simplify_tolerance does not help; {QUAD_BUFFER_ADVICE}"
     return {
         "barrier": "two barrier parts come that close without meeting (a near-miss end, or two barriers side by "
                    "side). If one should end on the other, set simplify_tolerance on it to at least the gap, which "
@@ -120,11 +152,13 @@ def advice(cause: str, h: float) -> str:
                       f"without crossing it. Move it away from the barrier, or use {finer}",
         "short piece": "the barrier has vertices that close together (a densely digitised line or a short "
                        "zigzag). Set simplify_tolerance on the barrier, at least that distance, to remove them",
+        "merge": "merging a narrow junction or boundary exit there (MeshGenerator.barrier_report['collapsed']) "
+                 f"left barrier pieces that short; the input is not at fault. Until that is fixed, "
+                 f"{QUAD_BUFFER_ADVICE}; please report the case",
         "size field": "the size field is that fine there (a finer zone, line or point next to the barrier). Use a "
                       "barrier resolution closer to it",
     }.get(cause, "barrier legs meet or fold back there at angles too narrow for cells between them (a narrow "
-                 "spike or zigzag, or many legs at one point). If that is digitising noise, simplify_tolerance of "
-                 f"about resolution / 8 removes it; otherwise {QUAD_BUFFER_ADVICE}")
+                 f"spike or zigzag, or many legs at one point). {remedy}")
 
 
 def _fail(reason: str, points: np.ndarray, origin: np.ndarray) -> None:
@@ -188,14 +222,21 @@ def _other_line_near(net: Network, xy: np.ndarray, reach: float) -> bool:
     return bool(((d <= reach * (1 + 1e-6)) & (np.arange(len(d)) != own)).any())
 
 
-def check_floor(net: Network, field: SizeField, origin: np.ndarray) -> None:
-    """Fail when the target face length is below MIN_H_FRACTION x lc somewhere."""
+def check_floor(net: Network, field: SizeField, origin: np.ndarray, drawn: set = frozenset()) -> None:
+    """Fail when the target face length is below MIN_H_FRACTION x lc somewhere.
+
+    ``drawn`` holds the vertices of the lines as they came in: a short piece
+    that is not between two of them was made by a merge (``wedge``).
+    """
     lc = net.piece_lc[field.piece]
     tiny = field.h < MIN_H_FRACTION * lc
     if tiny.any():
         k = int(np.argmin(field.h / lc))
+        cause = floor_cause(net, field, k, lc[k])
+        if cause == "short piece" and drawn and not {tuple(net.hard_xy[v]) for v in net.pieces[field.piece[k]]} <= drawn:
+            cause = "merge"
         _fail(f"the faces would have to be {field.h[k]:.3g} long ({field.h[k] / lc[k]:.2g} x lc), because "
-              f"{advice(floor_cause(net, field, k, lc[k]), field.h[k])}", field.xy[tiny], origin)
+              f"{advice(cause, field.h[k], fold_tolerance(net, field.xy[[k]]))}", field.xy[tiny], origin)
 
 
 def repair_bounds(field: SizeField, layout: Layout, bad: list, refine: np.ndarray | None) -> np.ndarray:
@@ -257,19 +298,20 @@ def _repair_loop(lines: list, standard: list, domain, features: np.ndarray, size
     """``plan``'s steps 1-4 with corridor drops and local repair rounds (module docstring)."""
     skip = set()
     tol = touch_tolerance(domain)
+    drawn = {tuple(p) for b in lines for p in b.xy}
     fixed = [o.geometry.buffer(o.half_width) if o.half_width > 0 else o.geometry for o in obstacles]
     net = network_with_corridors(lines, standard, domain, features, size_fn, sharp_angle, skip, fixed)
     refine, first, rounds = None, None, 0
     while True:
         field = capped_field(net, size_fn, domain, features, obstacles, refine, tol)
-        check_floor(net, field, origin)
+        check_floor(net, field, origin, drawn)
         field = grade_field(net, field, gradation)
         if field.failed:
             skip |= set(field.failed)
             net = network_with_corridors(lines, standard, domain, features, size_fn, sharp_angle, skip, fixed)
             refine = None
             continue
-        check_floor(net, field, origin)
+        check_floor(net, field, origin, drawn)
         layout = construct(net, field)
         if not all_finite(layout):
             raise internal_failure("construction", FloatingPointError("non-finite radii or sites"))
@@ -285,8 +327,9 @@ def _repair_loop(lines: list, standard: list, domain, features: np.ndarray, size
         first = first or len(layout.sites)
         if rounds == REPAIR_ROUNDS or len(layout.sites) > SITE_GROWTH_CAP * first:
             kinds = sorted({k for k, _ in bad})
+            points = np.array([p for _, p in bad])
             _fail(f"{len(bad)} defects ({', '.join(kinds)}) are left after {rounds} local refinements, because "
-                  f"{advice('repair', 0.0)}", np.array([p for _, p in bad]), origin)
+                  f"{advice('repair', 0.0, fold_tolerance(net, points))}", points, origin)
         refine = repair_bounds(field, layout, bad, refine)
         rounds += 1
 

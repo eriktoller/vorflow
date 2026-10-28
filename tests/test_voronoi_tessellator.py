@@ -841,3 +841,21 @@ def test_real_mesh_on_slanted_domain_assigns_every_cell_a_zone():
     assert mesher.generate(*clean)
     grid = VoronoiTessellator(mesher, cm).generate()
     assert grid["zone_id"].eq("dom").all()
+
+
+def test_cell_spanning_a_zone_edge_takes_the_zone_holding_most_of_it():
+    # Node 2 sits on the corner of the inner zone, so its cell is about a quarter inside it: it goes to the
+    # outer zone, which holds most of it. Node 3, on a straight stretch of the edge, splits evenly and keeps
+    # the z_order zone, as before.
+    cm = ConceptualMesh()
+    cm.add_polygon(Polygon([(0, 0), (4, 0), (4, 4), (0, 4)]), zone_id="outer")
+    cm.add_polygon(Polygon([(0, 0), (2, 0), (2, 2), (0, 2)]), zone_id="inner", z_order=1)
+    clean_polys, _, _ = cm.generate()
+    nodes = np.array([[1.0, 1.0], [2.0, 2.0], [2.0, 1.0], [3.0, 3.0], [3.0, 1.0], [1.0, 3.0]])
+    mesh_gen = DummyMeshGenerator(nodes=nodes, tags=np.arange(1, len(nodes) + 1), zones_gdf=clean_polys)
+
+    grid = VoronoiTessellator(mesh_gen, cm, clip_to_boundary=True).generate().set_index("node_id")
+
+    assert grid.loc[1, "zone_id"] == "inner"
+    assert grid.loc[2, "zone_id"] == "outer"
+    assert grid.loc[3, "zone_id"] == "inner"

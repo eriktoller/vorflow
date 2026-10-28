@@ -173,6 +173,22 @@ are ever needed on an exact barrier, `generate()` warns. The test suite sets
 a private hook so that it raises instead. Quad buffers on barriers still go
 through this path.
 
+**Zones next to barriers** (`tessellator.py`). A zone edge is an embedded line,
+so its nodes have cells that span it, and the generator join gives each the
+zone of highest `z_order`. Next to a barrier such a cell is lopsided: the
+barrier sites bound it on one side, and a site placed close to the edge has a
+cell reaching across it. With a barrier 0.8 m (0.1 x `resolution`) from a
+zone edge, 77 cells held less than a quarter of their area in their zone, and
+the least held 6% (0.3.0: 6 cells, least 21%). A cell whose generator lies on
+a zone edge now takes the zone (of those its generator lies on) holding most
+of its area, when it holds at least 0.1 more of the cell than the `z_order`
+zone. Such cells then hold at least 45% of their area in their zone. The
+least share left in these cases is 38%: a barrier site just inside one zone
+whose cell reaches across the edge keeps its generator's zone, so no cell
+takes a zone its generator is not in. Cells about a straight edge split about
+evenly and keep the `z_order` rule, so grids without barriers change only at
+zone corners.
+
 ## Line cleaning
 
 `ConceptualMesh.generate()` cleans the barrier lines before meshing
@@ -286,6 +302,11 @@ barrier.
   has 2.3-2.7 x the cells of the same shape as a standard line. At a gap of
   1.2 x `resolution` the corridor stops and the count rises by about 10%
   (488 to 540), since the faces are then capped by the gap.
+- **Barriers close to a zone edge or standard line** get no corridor, since
+  the line's nodes must stay outside the circles. The faces are capped by the
+  distance instead: a 220 m barrier 0.8 m from a zone edge at `resolution` 8
+  gives 1597 cells, against 572 in 0.3.0 (0.5 x `resolution`: 633 against
+  536).
 - **Lenses and loops with junction ends.** Two lines that part at one
   junction and meet again at another (a fault lens, a box lens, a thin loop
   from a junction) get no corridor, since a corridor can only turn round the

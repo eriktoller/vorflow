@@ -82,6 +82,15 @@ and the project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Changed
 
+- A cell whose generator lies on the edge between zones now takes the one
+  of those zones holding most of its area, when it holds at least 0.1 more of
+  the cell than the zone of highest `z_order`. Before, `z_order` alone
+  decided, so a cell at a zone corner, or a lopsided cell next to a barrier
+  close to a zone edge, could take a zone holding as little as 5% of it.
+  Cells about a straight zone edge split about evenly and keep the `z_order`
+  zone, so grids without barriers change only at zone corners (6-13 cells in
+  a 300 m model with one inner zone). A cell still never takes a zone its
+  generator is not in.
 - Barriers (`add_line(..., is_barrier=True)`) are now meshed so that every
   barrier segment is exactly one Voronoi cell face. vorflow cuts each
   barrier into segments and draws a circle around each segment end. It

@@ -55,6 +55,11 @@ _STRICT_BARRIERS = False
 # wherever a Voronoi face meets the boundary there, which leaves a
 # zero-length edge; MODFLOW 6 can crash on those.
 VERTEX_MERGE_FRACTION = 1e-12
+# A generator within this fraction of the model extent of a zone lies on it.
+ZONE_EDGE_FRACTION = 1e-9
+# A cell centred on a zone edge keeps its z_order zone unless another zone its generator
+# lies on holds at least this much more of its area (straight edges stay as before).
+ZONE_SHARE_MARGIN = 0.1
 
 # A boundary ghost whose Voronoi cell covers more of the domain than this
 # fraction of its inset squared is dropped and its node clipped instead:
@@ -415,6 +420,46 @@ def _join_unmatched_to_nearest_zone(joined, pts_gdf, zones):
     logger.debug(f"  -> {len(missing)} generator(s) outside every zone; using the nearest zone.")
     nearest = gpd.sjoin_nearest(missing, zones, how='left')
     return pd.concat([joined[matched], nearest])
+
+
+def _edge_cells_to_majority_zone(grid, zones, margin: float = ZONE_SHARE_MARGIN):
+    """Give each cell whose generator lies on an edge between zones the one of them holding most of its area.
+
+    The generator join gives such a cell the zone of highest ``z_order``. Next
+    to a barrier, the cell of a node on a zone edge is lopsided (the barrier
+    sites bound it on one side), so it could take a zone it barely touches.
+    Among the zones its generator lies on, the cell keeps the ``z_order`` zone
+    unless another holds at least ``margin`` more of its area, so cells about
+    a straight edge, which split about evenly, keep the ``z_order`` rule. A
+    cell never takes a zone its generator is not in.
+    """
+    if grid.empty or len(zones) < 2:
+        return grid
+    extent = float(max(np.ptp(np.asarray(zones.total_bounds).reshape(2, 2), axis=0)))
+    tol = max(ZONE_EDGE_FRACTION * extent, 1e-12)
+    generators = shapely.points(grid["x"].to_numpy(), grid["y"].to_numpy())
+    on = np.stack([shapely.dwithin(z, generators, tol) for z in zones.geometry.to_numpy()], axis=1)
+    rows = np.flatnonzero(on.sum(axis=1) >= 2)
+    if len(rows) == 0:
+        return grid
+    cells = grid.geometry.to_numpy()[rows]
+    shares = np.stack([shapely.area(shapely.intersection(cells, z)) for z in zones.geometry.to_numpy()], axis=1)
+    shares = np.where(on[rows], shares / np.maximum(shapely.area(cells), 1e-300)[:, None], -1.0)
+    zone_ids = zones["zone_id"].to_numpy()
+    z_orders = zones["z_order"].to_numpy() if "z_order" in zones else None
+    current = grid["zone_id"].to_numpy()[rows]
+    own = np.array([share[zone_ids == zone].max(initial=0.0) for share, zone in zip(shares, current)])
+    best = np.argmax(shares, axis=1)
+    moved = shares[np.arange(len(rows)), best] - own >= margin
+    if not moved.any():
+        return grid
+    grid = grid.copy()
+    index = grid.index[rows[moved]]
+    grid.loc[index, "zone_id"] = zone_ids[best[moved]]
+    if z_orders is not None and "z_order" in grid:
+        grid.loc[index, "z_order"] = z_orders[best[moved]]
+    logger.debug(f"  -> {int(moved.sum())} cell(s) on a zone edge given the zone holding most of their area.")
+    return grid
 
 
 def _far_ghost_nodes(nodes):
@@ -1418,6 +1463,7 @@ class VoronoiTessellator:
                 how="left",
             )
         
+        zoned_grid = _edge_cells_to_majority_zone(zoned_grid, zones)
         logger.info(f"  -> Zones Assigned: {len(zoned_grid)}")
         
         # Clipping can create MultiPolygons; explode them into single parts

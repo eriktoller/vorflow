@@ -789,7 +789,8 @@ def test_lloyd_keeps_cells_fixed_nodes_and_zones(well_case):
     # Every generator stays in its zone, so zone counts do not change.
     assert relaxed["zone_id"].value_counts().to_dict() == baseline["zone_id"].value_counts().to_dict()
     inner = relaxed[relaxed["zone_id"] == 2]
-    assert shapely.covered_by(shapely.points(inner[["x", "y"]].to_numpy()), INNER_ZONE).all()
+    # A node on a slanted zone edge can lie a float hair off it (its cell may take either zone).
+    assert shapely.dwithin(INNER_ZONE, shapely.points(inner[["x", "y"]].to_numpy()), 1e-9).all()
 
 
 @pytest.mark.slow

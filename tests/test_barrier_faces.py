@@ -955,6 +955,37 @@ def test_zone_edge_between_two_close_barriers_keeps_its_nodes():
     assert mg.barrier_report["corridors"] == [] and mg.barrier_report["fixed_nodes"] == []
 
 
+EDGE_Y = 150.0
+ZONE_SHARE = 0.35  # the least share of a cell's area in its zone; develop: 0.05-0.34 in these cases
+ZONE_EDGE_CASES = {
+    **{f"{f} lc from the edge": [([(40, EDGE_Y - f * LC), (260, EDGE_Y - f * LC)], B)] for f in (0.1, 0.25, 0.5, 1.0)},
+    "on the edge": [([(40, EDGE_Y), (260, EDGE_Y)], B)],
+    "along the whole edge": [([(0, EDGE_Y), (300, EDGE_Y)], B)],
+    "crossing the edge": [([(100, 100), (200, 200)], B)],
+    "pair about the edge": [([(40, EDGE_Y - 0.8), (260, EDGE_Y - 0.8)], B), ([(40, EDGE_Y + 0.8), (260, EDGE_Y + 0.8)], B)],
+}
+
+
+@pytest.mark.parametrize("name", ZONE_EDGE_CASES)
+def test_cells_near_a_barrier_take_the_zone_holding_most_of_them(name):
+    # The barrier sites bound the cell of a zone-edge node on one side, so the z_order rule alone could give
+    # it a zone it barely touches. Develop's generator rule left cells holding as little as 0.05-0.34 of
+    # their area in their zone in these cases (aa946f8: 0.06-0.28). Now a cell centred on the edge holds at
+    # least 0.45; the least, 0.38, is a barrier site just inside the zone, which keeps its generator's zone.
+    zone = box(0, 0, 300, EDGE_Y)
+    with warnings.catch_warnings(record=True) as record:
+        warnings.simplefilter("always")
+        mg, vt, grid = _mesh(_model(ZONE_EDGE_CASES[name], polygons=[
+            {"geometry": zone, "zone_id": 2, "resolution": BACKGROUND_LC, "z_order": 1}]))
+    _assert_exact(mg, vt, grid)
+    cells = grid.geometry.to_numpy()
+    share = shapely.area(shapely.intersection(cells, zone)) / shapely.area(cells)
+    own = np.where(grid["zone_id"].to_numpy() == 2, share, 1 - share)
+    assert own.min() >= ZONE_SHARE
+    assert mg.barrier_report["fixed_nodes"] == []
+    assert not [w for w in record if "lie inside the barrier circles" in str(w.message)]
+
+
 def _hairpin_shapes(gap: float) -> dict:
     """Joined near-parallel legs ``gap`` apart: a U-turn, a thin closed loop and a closed lens with tapered ends."""
     half, taper = gap / 2.0, gap / math.tan(math.radians(40.0))

@@ -429,6 +429,8 @@ def test_boundary_inset_mirror_offsets_scale_with_local_spacing():
     # Default fraction 0.25 of the nearest boundary-node spacing (0.5 and 0.2).
     assert np.isclose(coarse_inset, 0.125)
     assert np.isclose(fine_inset, 0.05)
+    # One ghost per centred node on any domain: a node whose ghost is
+    # dropped (lands inside, or its cell leaks) is not centred either.
     assert len(ghosts) == int(metadata["boundary_centered"].sum())
     assert not np.allclose(prepared, nodes)
 
@@ -487,6 +489,90 @@ def test_boundary_inset_mirror_keeps_node_when_ghost_lands_inside_domain():
     grid = tessellator.generate()
     assert grid["node_id"].is_unique
     assert grid.geometry.area.sum() == pytest.approx(domain.area)
+
+
+def _unshared_interior_edges(grid, domain):
+    """Return cell edges used by one cell only that do not lie on the domain boundary (MF6 disconnected faces)."""
+    counts = {}
+    for geom in grid.geometry:
+        coords = np.round(np.asarray(geom.exterior.coords), 9)
+        for a, b in zip(map(tuple, coords[:-1]), map(tuple, coords[1:])):
+            key = (min(a, b), max(a, b))
+            counts[key] = counts.get(key, 0) + 1
+    boundary = domain.boundary.buffer(1e-9)
+    return [edge for edge, count in counts.items() if count == 1 and not boundary.covers(LineString(edge))]
+
+
+def test_boundary_inset_mirror_covers_domain_around_irregular_hole():
+    """Catches ghost cells that reach into the domain at the reflex vertices of an irregular hole (issue #71)."""
+    hole = [(3, 3), (7, 3.5), (6, 5), (7.5, 7), (4, 6.5), (4.5, 5)]
+    domain = Polygon([(0, 0), (10, 0), (10, 10), (0, 10)], [hole])
+    cm = ConceptualMesh()
+    cm.add_polygon(domain, zone_id=1, densify=False)
+    clean_polys, _, _ = cm.generate()
+
+    # Every hole vertex is reflex seen from the domain; there a mirror
+    # ghost's face cuts into the domain. Hole nodes alternate short and
+    # long gaps, so neighbouring insets differ and those strips are wide.
+    ring = domain.interiors[0]
+    distances = np.cumsum(np.r_[0.0, np.tile([0.25, 0.25, 1.2, 0.6], 20)])
+    hole_nodes = [ring.interpolate(d).coords[0] for d in distances[distances < ring.length]]
+    outer_nodes = [domain.exterior.interpolate(d).coords[0] for d in np.arange(0.0, 40.0, 1.0)]
+    lattice = np.mgrid[0.5:10:1.0, 0.5:10:1.0].reshape(2, -1).T
+    inner = domain.buffer(-0.3)
+    interior_nodes = lattice[shapely.contains_xy(inner, lattice[:, 0], lattice[:, 1])]
+    nodes = np.vstack([hole_nodes, outer_nodes, interior_nodes])
+    tags = np.arange(1, len(nodes) + 1)
+    mesh_gen = DummyMeshGenerator(nodes=nodes, tags=tags, zones_gdf=clean_polys)
+
+    grid = VoronoiTessellator(mesh_gen, cm, boundary_centering="inset_mirror").generate()
+
+    covered = unary_union(list(grid.geometry))
+    assert domain.difference(covered).area < 1e-9
+    assert grid.geometry.area.sum() == pytest.approx(domain.area, rel=1e-12)
+    assert _unshared_interior_edges(grid, domain) == []
+    # Nodes whose ghost leaked go back on the boundary and are clipped; the
+    # rest keep their mirror ghost.
+    hole_rows = grid["source_x"].round(9).isin(np.round(np.asarray(hole_nodes)[:, 0], 9))
+    hole_modes = grid.loc[hole_rows, "boundary_centering"]
+    assert (hole_modes == "clip").any()
+    assert (hole_modes == "inset_mirror").mean() > 0.5
+    # Detached parts of a clipped cell get fresh node_ids and their own centroid.
+    clipped = grid[(grid["boundary_centering"] == "clip") & grid["node_id"].isin(tags)]
+    assert not clipped["boundary_centered"].any()
+    assert np.allclose(clipped[["x", "y"]].to_numpy(), clipped[["source_x", "source_y"]].to_numpy())
+
+
+def test_boundary_inset_mirror_clips_every_node_on_a_circular_hole():
+    """Catches ghost cells leaking at a circular hole, whose vertices are all reflex (issue #71)."""
+    angles = np.linspace(0.0, 2 * np.pi, 32, endpoint=False)
+    hole_nodes = np.c_[5 + 2.5 * np.cos(angles), 5 + 2.5 * np.sin(angles)]
+    domain = Polygon([(0, 0), (10, 0), (10, 10), (0, 10)], [hole_nodes])
+    cm = ConceptualMesh()
+    cm.add_polygon(domain, zone_id=1, densify=False)
+    clean_polys, _, _ = cm.generate()
+
+    outer_nodes = [domain.exterior.interpolate(d).coords[0] for d in np.arange(0.0, 40.0, 0.5)]
+    lattice = np.mgrid[0.25:10:0.5, 0.25:10:0.5].reshape(2, -1).T
+    inner = domain.buffer(-0.3)
+    interior_nodes = lattice[shapely.contains_xy(inner, lattice[:, 0], lattice[:, 1])]
+    nodes = np.vstack([hole_nodes, outer_nodes, interior_nodes])
+    tags = np.arange(1, len(nodes) + 1)
+    mesh_gen = DummyMeshGenerator(nodes=nodes, tags=tags, zones_gdf=clean_polys)
+
+    grid = VoronoiTessellator(mesh_gen, cm, boundary_centering="inset_mirror").generate()
+
+    covered = unary_union(list(grid.geometry))
+    assert domain.difference(covered).area < 1e-9
+    assert grid.geometry.area.sum() == pytest.approx(domain.area, rel=1e-12)
+    assert _unshared_interior_edges(grid, domain) == []
+    on_hole = np.isclose(np.hypot(grid["source_x"] - 5, grid["source_y"] - 5), 2.5)
+    assert on_hole.sum() == len(hole_nodes)
+    assert (grid.loc[on_hole, "boundary_centering"] == "clip").all()
+    # The straight outer edges keep their mirror ghosts (corners excepted).
+    on_outer = ~on_hole & grid["source_x"].notna() & (grid["boundary_inset"] > 0)
+    assert on_outer.sum() == len(outer_nodes) - 4
+    assert (grid.loc[on_outer, "boundary_centering"] == "inset_mirror").all()
 
 
 def _staggered_lattice_nodes():

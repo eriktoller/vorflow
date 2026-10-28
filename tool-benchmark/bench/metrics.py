@@ -22,9 +22,16 @@ zero length (two distinct vertices at one point) are counted separately; MF6
 
 Per cell: size h = sqrt(2 A / sqrt(3)) (the spacing of a regular hexagon of
 area A, i.e. generator spacing), its ratio to the spec size at the centre,
-compactness 4 pi A / P^2, and the centre offset |generator - xc| / sqrt(A).
-Size and shape statistics use interior cells only: boundary cells are clipped
-(half-cells where generators sit on the boundary).
+compactness 4 pi A / P^2, convexity A / A(convex hull), and the centre offset
+|generator - xc| / sqrt(A). Size and shape statistics use interior cells only:
+boundary cells are clipped (half-cells where generators sit on the boundary).
+Face statistics are also split into faces of two interior cells (``_inner``)
+and faces with a boundary cell on either side (``_bnd``), where the worst
+faces usually are.
+
+A case's transects (lines across narrow gaps between features) report how
+many cells each one passes through; the minimum is the number of cells across
+the narrowest gap.
 """
 
 import numpy as np
@@ -35,6 +42,8 @@ from .grid import Grid, cell_polygons, open_rings
 
 SHORT_FACE = 0.01
 NEAR_DUPLICATE = 1e-9
+CONCAVE = 1e-6          # a cell is concave when its convexity is below 1 - CONCAVE
+TRANSECT_MIN_FRACTION = 1e-6  # a cell counts as crossed when it holds this fraction of the transect
 
 
 def face_table(grid: Grid) -> dict:
@@ -128,6 +137,7 @@ def cell_metrics(grid: Grid, case: Case, scale: float) -> dict:
         "h": h_cell,
         "h_ratio": h_cell / size_field(case, grid.xc, scale),
         "compactness": 4.0 * np.pi * area / perimeter**2,
+        "convexity": area / shapely.area(shapely.convex_hull(polys)),
         "valid": shapely.is_valid(polys),
         "clockwise": np.array([not p.exterior.is_ccw for p in polys]),
         "centre_inside": shapely.intersects_xy(polys, grid.xc[:, 0], grid.xc[:, 1]),
@@ -135,6 +145,17 @@ def cell_metrics(grid: Grid, case: Case, scale: float) -> dict:
     if grid.generators is not None:
         metrics["centre_offset"] = np.hypot(*(grid.generators - grid.xc).T) / np.sqrt(area)
     return metrics
+
+
+def cells_across(grid: Grid, transects: list) -> np.ndarray:
+    """Number of cells each transect passes through (ignoring touches at its ends)."""
+    polys = np.asarray(cell_polygons(grid), dtype=object)
+    counts = []
+    for line in transects:
+        candidates = np.flatnonzero(shapely.intersects(polys, line))
+        lengths = shapely.length(shapely.intersection(polys[candidates], line))
+        counts.append(int(np.sum(lengths > TRANSECT_MIN_FRACTION * line.length)))
+    return np.array(counts, dtype=int)
 
 
 def summarize(grid: Grid, case: Case, scale: float) -> dict:
@@ -155,16 +176,25 @@ def summarize(grid: Grid, case: Case, scale: float) -> dict:
         "n_near_duplicate_vertices": near_duplicate_vertices(grid),
         "n_zero_length_edges": zero_length_edges(grid),
         "h_ratio_p05": np.quantile(cells["h_ratio"][inner], 0.05),
+        "h_ratio_p25": np.quantile(cells["h_ratio"][inner], 0.25),
         "h_ratio_p50": np.median(cells["h_ratio"][inner]),
+        "h_ratio_p75": np.quantile(cells["h_ratio"][inner], 0.75),
         "h_ratio_p95": np.quantile(cells["h_ratio"][inner], 0.95),
         "compactness_p05": np.quantile(cells["compactness"][inner], 0.05),
+        "convexity_min": cells["convexity"].min(),
+        "n_concave_cells": int(np.sum(cells["convexity"] < 1.0 - CONCAVE)),
     }
+    if case.transects:
+        across = cells_across(grid, case.transects)
+        row["cells_across_min"] = int(across.min())
+        row["cells_across_mean"] = float(across.mean())
     if "centre_offset" in cells:
         row["centre_offset_p50"] = np.median(cells["centre_offset"])
         row["centre_offset_p95"] = np.quantile(cells["centre_offset"], 0.95)
     tags = {"written": "mf6", "centroid": "cen"}
     if grid.generators is not None:
         tags["generator"] = "gen"
+    inner_face = inner[faces["ci"]] & inner[faces["cj"]]
     for centres, tag in tags.items():
         fm = face_metrics(grid, faces, centres)
         row[f"ortho_{tag}_p50"] = np.median(fm["ortho_deg"])
@@ -173,4 +203,8 @@ def summarize(grid: Grid, case: Case, scale: float) -> dict:
         row[f"skew_{tag}_p50"] = np.nanmedian(fm["skewness"])
         row[f"skew_{tag}_p95"] = np.nanquantile(fm["skewness"], 0.95)
         row[f"frac_short_faces_{tag}"] = float(np.mean(fm["short"]))
+        for part, mask in (("inner", inner_face), ("bnd", ~inner_face)):
+            if mask.any():
+                row[f"ortho_{tag}_p95_{part}"] = np.quantile(fm["ortho_deg"][mask], 0.95)
+                row[f"skew_{tag}_p95_{part}"] = np.nanquantile(fm["skewness"][mask], 0.95)
     return row

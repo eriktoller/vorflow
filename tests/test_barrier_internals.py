@@ -273,7 +273,7 @@ def test_faces_below_the_floor_raise_before_grading():
 
 @pytest.mark.parametrize("coords, features, cause", [
     ([[(40, 150), (260, 150)], [(150, 270), (150, 150.1)]], None, "two barrier parts come that close"),
-    ([[(40, 0.05), (260, 0.05)]], None, "close to the domain boundary"),
+    ([[(40, 0.02), (260, 0.02)]], None, "close to the domain boundary"),
     ([[(40, 150), (260, 150)]], [(150, 150.1)], "a well, hex-ring seed or embedded point"),
     ([[(150, 150), (40, 150)], [(150, 150), (40, 151.9)]], None, "legs meet or fold back"),
 ], ids=["barrier", "boundary", "feature", "junction"])
@@ -282,14 +282,61 @@ def test_floor_error_names_its_cause_and_a_remedy_for_it(coords, features, cause
         _plan(coords, features=features)
     message = str(info.value)
     assert cause in message
-    assert ("simplify_tolerance" in message) == (cause in ("two barrier parts come that close",
-                                                            "close to the domain boundary", "legs meet or fold back"))
-    assert ("quad_buffer=True" in message) == (cause == "legs meet or fold back")
+    # Two long legs at 1 degree: no tolerance opens the angle, so only the quad buffer is advised there.
+    fold = cause == "legs meet or fold back"
+    assert ("simplify_tolerance" in message) == (fold or cause in ("two barrier parts come that close",
+                                                                    "close to the domain boundary"))
+    assert ("simplify_tolerance does not help; quad_buffer=True" in message) == fold
+    assert ("quad_buffer=True" in message) == fold
+
+
+def _advised(message: str, what: str) -> float:
+    """The number the error advises for ``what`` ("resolution of" or "simplify_tolerance of at least")."""
+    return float(message.split(what + " ")[1].split()[0])
+
+
+def test_advised_finer_resolution_is_below_the_limit_and_works():
+    # A fixed line (an embedded river) 0.16 from the barrier caps the faces at 0.136: the floor at lc 8.
+    river = LineString([(40, 150.16), (260, 150.16)])
+    fixed = [sizing.Obstacle("line 'r'", river, 0.0, np.empty((0, 2)), np.empty((0, 2)))]
+    items = [(0, np.asarray(STRAIGHT[0], dtype=float), LC)]
+
+    def plan(lc):
+        barriers = pipeline.barrier_lines([(0, xy, lc) for _, xy, _ in items], [], DOMAIN)
+        return pipeline.plan(barriers, [], DOMAIN, np.empty((0, 2)), sizing.size_function([], 20.0), ORIGIN,
+                             obstacles=fixed)
+
+    with pytest.raises(pipeline.BarrierMeshError, match="resolution of") as info:
+        plan(LC)
+    advised = _advised(str(info.value), "resolution of")
+    limit = 0.16 * sizing.OBSTACLE_CAP / pipeline.MIN_H_FRACTION  # where the faces just reach the floor: 6.8
+    assert advised < limit and advised == pytest.approx(pipeline.round_down(pipeline.FINER_MARGIN * limit))
+    plan(advised)
+
+
+def test_advised_tolerance_for_a_short_fold_is_its_length_and_works():
+    # A 1.6 m (0.2 lc) leg doubling back at 160 degrees; resolution / 8 = 1 does not remove it.
+    turn = (150 + 1.6 * math.cos(math.radians(160)), 150 + 1.6 * math.sin(math.radians(160)))
+    zigzag = [(40, 150), (150, 150), turn, (turn[0] + 110, turn[1])]
+    with pytest.raises(pipeline.BarrierMeshError, match="simplify_tolerance of at least") as info:
+        _plan([zigzag])
+    advised = _advised(str(info.value), "simplify_tolerance of at least")
+    assert advised == pytest.approx(pipeline.FOLD_MARGIN * 1.6)
+    simplified = lines.BarrierLine("z", np.array(zigzag, dtype=float), LC, advised,
+                                   np.array([True, False, False, True]))
+    lines.simplify_lines([simplified])
+    assert len(simplified.xy) == 2
+    with pytest.raises(pipeline.BarrierMeshError):
+        simplified = lines.BarrierLine("z", np.array(zigzag, dtype=float), LC, LC / 8,
+                                       np.array([True, False, False, True]))
+        lines.simplify_lines([simplified])
+        _plan([simplified.xy])
 
 
 def test_repair_failure_points_at_narrow_angles_and_the_quad_buffer(monkeypatch):
     monkeypatch.setattr(pipeline, "defects", lambda layout, features, domain: [("pair", layout.xy[1])])
-    with pytest.raises(pipeline.BarrierMeshError, match="too narrow for cells.*quad_buffer=True"):
+    with pytest.raises(pipeline.BarrierMeshError, match="too narrow for cells.*long, so simplify_tolerance does "
+                                                        "not help; quad_buffer=True"):
         _plan(STRAIGHT)
 
 
@@ -379,7 +426,8 @@ def _clean_noise_quadratic(xy, keep, lc, fraction=lines.NOISE_FRACTION):
         seg = np.hypot(*np.diff(xy, axis=0).T)
         options = [(lines._offset(xy[v], xy[v - 1], xy[v + 1]), v)
                    for s in np.flatnonzero(seg < fraction * lc) for v in (s, s + 1)
-                   if 0 < v < len(xy) - 1 and not keep[v]]
+                   if 0 < v < len(xy) - 1 and not keep[v]
+                   and not lines.folds(xy, v - 2, v - 1, v, v + 1, v + 2 if v + 2 < len(xy) else -1)]
         if not options:
             break
         move, v = min(options)
@@ -441,22 +489,67 @@ def test_clean_noise_equals_the_repeated_scan(lc):
 
 
 # ---------------------------------------------------------------------------
-# parallel: close parallel stretches merged onto their midline
+# corridor: strands, bends and forks
 # ---------------------------------------------------------------------------
-def test_parallel_merge_moves_both_lines_onto_their_midline():
-    net = _network([[(40, 150), (260, 150)], [(40, 151), (260, 151)]])
-    [merge] = net.merged
-    assert merge["gap"] == pytest.approx(1.0) and merge["length"] == pytest.approx(220.0)
-    assert np.array_equal(net.lines[0].xy, net.lines[1].xy)
-    assert np.allclose(net.lines[0].xy[:, 1], 150.5)
+def _corridors(coords: list, standard: list = (), features=None) -> list:
+    """The corridors ``pair_corridors`` finds in a network of coordinate lists."""
+    net = _network(coords, standard)
+    features = np.empty((0, 2)) if features is None else np.asarray(features, dtype=float)
+    std = [LineString(s) for s in standard]
+    return corridor.find_corridors(net, sizing.size_function([], 20.0), DOMAIN, std, features, set())
 
 
-@pytest.mark.parametrize("coords", [
-    [[(40, 150), (260, 150)], [(40, 152), (260, 152)]],                  # at the merge gap: a corridor
-    [[(40, 150), (260, 150)], [(40, 151), (45, 151)]],                   # shorter than MIN_STRETCH x lc
-    [[(40, 150), (260, 150)], [(40, 150.5), (150, 150), (260, 150.5)]],  # touching: a junction
-    [[(40, 150), (260, 150)], [(40, 151), (260, 151)], [(150, 100), (150, 200)]],  # crossed by a third line
-], ids=["gap", "short", "touching", "crossed"])
-def test_parallel_merge_leaves_what_it_must_not_move(coords):
-    net = _network(coords)
-    assert net.merged == []
+def test_a_wavy_strand_faces_a_straight_barrier_in_one_corridor():
+    xs = np.linspace(40, 260, 56)
+    [c] = _corridors([[(40, 150), (260, 150)], [(x, 152 + 0.5 * math.sin(x / 9)) for x in xs]])
+    assert sorted(len(side) for side in c.sides) == [1, 55] and c.ends == ("tip", "tip")
+    assert c.gap == pytest.approx(1.5, abs=0.01)
+
+
+@pytest.mark.parametrize("coords, ends", [
+    ([[(40, 149), (260, 149), (260, 151), (40, 151)]], ("tip", "bend")),                       # U-turn
+    ([[(40, 149), (260, 149), (260, 151), (40, 151), (40, 149)]], ("bend", "bend")),           # thin loop
+    ([[(40, 150), (260, 150)], [(40, 152), (60, 152), (240, 152), (260, 160)]], ("tip", "mouth")),
+    ([[(40, 160), (60, 152), (240, 152), (260, 160)], [(40, 140), (60, 150), (240, 150), (260, 140)]],
+     ("fork", "fork")),                                                                         # lens middle
+], ids=["u_turn", "thin_loop", "mouth", "fork"])
+def test_corridor_ends(coords, ends):
+    [c] = _corridors(coords)
+    assert c.ends == ends
+    assert all(len(path) == (1 if kind == "bend" else 0) for kind, path in zip(c.ends, c.paths))
+    assert all(len(fork) == (2 if kind == "fork" else 0) for kind, fork in zip(c.ends, c.forks))
+
+
+def test_a_lens_bend_replaces_the_ladders_at_its_tapered_ends():
+    lens = [(60, 150), (61.19, 150.5), (238.81, 150.5), (240, 150), (238.81, 149.5), (61.19, 149.5), (60, 150)]
+    assert len(_network([lens]).rungs) == 2
+    plan = _plan([lens])
+    [c] = plan.net.corridors
+    assert c.ends == ("bend", "bend") and plan.net.rungs == []
+    assert validate.defects(plan.layout, np.empty((0, 2)), DOMAIN) == []
+
+
+@pytest.mark.parametrize("inside", ["well", "standard"])
+def test_no_corridor_across_a_well_or_a_line_in_the_gap(inside):
+    pair = [[(40, 150), (260, 150)], [(40, 152), (260, 152)]]
+    if inside == "well":
+        assert _corridors(pair, features=[(150, 151)]) == []
+    else:
+        assert _corridors(pair, standard=[[(40, 151), (260, 151)]]) == []
+
+
+def test_corridor_pieces_of_a_dropped_corridor_get_no_other_corridor():
+    pair = [[(40, 150), (100, 150.2), (260, 150)], [(40, 152), (260, 152)]]
+    [c] = _corridors(pair)
+    net = _network(pair)
+    again = corridor.find_corridors(net, sizing.size_function([], 20.0), DOMAIN, [], np.empty((0, 2)), {c.key})
+    assert again == []
+
+
+def test_noise_cleaning_keeps_both_corners_of_a_narrow_u_turn():
+    u = np.array([(40, 150), (260, 150), (260, 150.4), (40, 150.4)], dtype=float)  # 0.05 lc wide
+    alive, dropped, _, _ = lines.drop_noise(u, np.array([True, False, False, True]), lines.NOISE_FRACTION * LC)
+    assert alive.all() and dropped == 0
+    spike = np.array([(40, 150), (150, 150), (150.3, 150.2), (150.5, 150), (260, 150)], dtype=float)
+    alive, dropped, _, _ = lines.drop_noise(spike, np.array([True, False, False, False, True]), 0.8)
+    assert dropped > 0  # a zigzag is still noise

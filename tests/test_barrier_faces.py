@@ -154,13 +154,17 @@ def _assert_exact(mg: MeshGenerator, vt: VoronoiTessellator, grid) -> None:
     # Each pair of cells meets along at most one barrier face, and the faces cover the barriers.
     assert not on.duplicated(["cell_id_1", "cell_id_2"]).any()
     assert on.geometry.length.sum() == pytest.approx(_barriers(mg).length, rel=1e-6)
-    # ... which are the cleaned input lines less what the report says was left without faces
-    # (merged wedges and parallel stretches move the lines a little and share faces; their own tests check them).
+    # ... which are the cleaned input lines less what the report says was left without faces. A merged
+    # wedge moves its legs (by at most its reported deviation) and they share a stem, so there the faces
+    # are checked against the input by distance, both ways, instead of by length.
     report = mg.barrier_report
-    if report["collapsed"] or report["merged"]:
-        return
     uncovered = sum(entry["length"] for entry in report["tips"] + report["stubs"])
-    assert on.geometry.length.sum() == pytest.approx(_cleaned_barrier_length(vt.cm) - uncovered, rel=1e-6)
+    if report["collapsed"]:
+        domain = shapely.union_all(vt.cm.clean_polygons.geometry.to_numpy())
+        bound = max(entry["deviation"] for entry in report["collapsed"])
+        assert _moved(mg, vt.cm, domain, report["tips"] + report["stubs"]) <= bound * (1 + 1e-3) + tol
+    else:
+        assert on.geometry.length.sum() == pytest.approx(_cleaned_barrier_length(vt.cm) - uncovered, rel=1e-6)
 
 
 # ---------------------------------------------------------------------------
@@ -362,7 +366,7 @@ def test_hex_ring_next_to_a_barrier_is_dropped_unless_kept():
 
 def test_barrier_report_lists_every_entry():
     mg, _, _ = _mesh(_model(EXACT_CASES["t_junction"]))
-    assert set(mg.barrier_report) == {"corridors", "merged", "collapsed", "tips", "stubs", "snaps", "noise",
+    assert set(mg.barrier_report) == {"corridors", "collapsed", "tips", "stubs", "snaps", "noise",
                                       "on_boundary", "rings", "fixed_nodes", "repair_rounds", "sites",
                                       "removed_nodes", "polish"}
     assert mg.barrier_report["sites"] > 0
@@ -759,18 +763,23 @@ def _wedge_cases() -> dict:
 WEDGE_CASES = _wedge_cases()
 
 
-def _moved(mg: MeshGenerator, cm: ConceptualMesh, domain) -> float:
+def _moved(mg: MeshGenerator, cm: ConceptualMesh, domain, uncovered: list = ()) -> float:
     """The largest distance between a barrier as cleaned and as its faces follow it (both ways; the input
-    may also be matched by the domain boundary it was merged onto)."""
+    may also be matched by the domain boundary it was merged onto, and need not be within 2 x the reported
+    length of an ``uncovered`` tip or stub)."""
     cleaned = cm.clean_lines.set_index("line_id").geometry
+    left = shapely.union_all([Point(e["location"]).buffer(2 * e["length"]) for e in uncovered]) if uncovered \
+        else None
     out = 0.0
     for line_id, line in zip(mg.barrier_lines["line_id"], mg.barrier_lines.geometry):
         drawn = cleaned[line_id]
         drawn = drawn if isinstance(drawn, LineString) else shapely.union_all(drawn.to_numpy())
         new_points = shapely.points(shapely.get_coordinates(shapely.segmentize(line, 0.05)))
         old_points = shapely.points(shapely.get_coordinates(shapely.segmentize(drawn, 0.05)))
+        if left is not None:
+            old_points = old_points[~shapely.covers(left, old_points)]
         out = max(out, float(shapely.distance(drawn, new_points).max()),
-                  float(shapely.distance(shapely.union(line, domain.boundary), old_points).max()))
+                  float(shapely.distance(shapely.union(line, domain.boundary), old_points).max(initial=0.0)))
     return out
 
 
@@ -818,62 +827,164 @@ def test_polish_moves_only_the_nodes_near_the_barrier():
 
 
 # ---------------------------------------------------------------------------
-# Close parallel barriers: below 0.25 x resolution they share one line of faces
+# Narrow gaps keep one row of cells, so flow along the gap stays open
 # ---------------------------------------------------------------------------
-def _parallel(gap: float, x0: float = 0.0, x1: float = 300.0) -> list:
-    """Two barriers ``gap`` apart, from x0 to x1 (the domain boundary by default)."""
+ASPECT = 3.0  # corridor.CORRIDOR_ASPECT: a corridor's cells are at most this many times longer than the gap
+
+
+def _parallel(gap: float, x0: float = 40.0, x1: float = 260.0) -> list:
+    """Two barriers ``gap`` apart, from x0 to x1."""
     return [([(x0, 150), (x1, 150)], B), ([(x0, 150 + gap), (x1, 150 + gap)], B)]
 
 
-@pytest.mark.parametrize("gap", [0.5, 1.0])
-def test_close_parallel_barriers_are_merged_onto_one_line_of_faces(gap):
-    with pytest.warns(UserWarning, match="merged onto their midline.*combined properties"):
-        mg, vt, grid = _mesh(_model(_parallel(gap)))
-    _assert_exact(mg, vt, grid)
-    [merge] = mg.barrier_report["merged"]
-    assert sorted(merge["line_ids"]) == ["line0", "line1"] and merge["length"] == pytest.approx(300.0)
-    assert merge["gap"] == pytest.approx(gap) and merge["deviation"] <= gap / 2 + 1e-9
-    assert mg.barrier_report["corridors"] == []
-    # Both lines follow the midline, from boundary to boundary, so every face on it maps to both IDs.
-    rows = mg.barrier_lines.set_index("line_id").geometry
-    assert rows["line0"].equals(rows["line1"])
-    assert rows["line0"].hausdorff_distance(LineString([(0, 150 + gap / 2), (300, 150 + gap / 2)])) < 1e-9
-    on, _ = _barrier_faces(grid, mg, 1e-6)
-    for line in rows:
-        assert (shapely.distance(on.geometry.to_numpy(), line) < 1e-6).all()
-    assert _sealed(mg, grid, (150, 100), (150, 200))
-    # The pair costs about as many cells as one barrier.
-    single, _, single_grid = _mesh(_model(_parallel(gap)[:1]))
-    assert len(grid) <= 1.05 * len(single_grid)
+def _components(mg: MeshGenerator, grid) -> int:
+    """Number of groups of cells connected across faces that are not barrier faces."""
+    from scipy.sparse import coo_matrix
+    from scipy.sparse.csgraph import connected_components
+
+    tol = TOUCH * max(np.ptp(np.asarray(grid.total_bounds).reshape(2, 2), axis=0))
+    on, connectivity = _barrier_faces(grid, mg, tol)
+    open_faces = connectivity.drop(on.index)
+    i, j = open_faces["cell_id_1"].to_numpy(), open_faces["cell_id_2"].to_numpy()
+    count, _ = connected_components(coo_matrix((np.ones(len(i)), (i, j)), shape=(len(grid),) * 2), directed=False)
+    return int(count)
 
 
-def test_merged_stretch_lets_both_barriers_go_on_where_they_part():
-    lines = [([(40, 150), (260, 150)], B), ([(40, 151), (150, 151), (260, 190)], B)]
-    with pytest.warns(UserWarning, match="merged onto their midline"):
-        mg, vt, grid = _mesh(_model(lines))
-    _assert_exact(mg, vt, grid)
-    [merge] = mg.barrier_report["merged"]
-    bound = 0.125 * LC  # half the merge gap, reached where the lines part
-    assert merge["deviation"] <= bound + 1e-9
-    rows = mg.barrier_lines.set_index("line_id").geometry
-    for line_id, (coords, _) in zip(["line0", "line1"], lines):
-        assert rows[line_id].hausdorff_distance(LineString(coords)) <= bound + 1e-6
-    assert rows["line0"].coords[-1] == (260.0, 150.0) and rows["line1"].coords[-1] == (260.0, 190.0)
-
-
-@pytest.mark.parametrize("gap, warned", [(2.0, True), (4.0, False)])
-def test_parallel_barriers_at_or_above_the_merge_gap_keep_their_corridor(gap, warned):
+@pytest.mark.parametrize("gap", [0.4, 0.8, 2.0, 4.0])
+def test_close_parallel_barriers_keep_one_row_of_cells(gap):
     with warnings.catch_warnings(record=True) as record:
         warnings.simplefilter("always")
-        mg, vt, grid = _mesh(_model(_parallel(gap, 40.0, 260.0)))
+        mg, vt, grid = _mesh(_model(_parallel(gap)))
     _assert_exact(mg, vt, grid)
-    assert mg.barrier_report["merged"] == []
     [corridor] = mg.barrier_report["corridors"]
-    assert corridor["cells"] > corridor["length"] / LC and corridor["resolution"] == LC
-    dense = [w for w in record if "row of cells shorter than" in str(w.message)]
-    assert len(dense) == int(warned)
-    if warned:
+    assert corridor["kind"] == "barriers" and corridor["gap"] == pytest.approx(gap)
+    assert corridor["ends"] == ("tip", "tip") and corridor["resolution"] == LC
+    # One row: as many cells as the spacing min(lc, ASPECT x gap) gives, each with its site on the midline.
+    spacing = min(LC, ASPECT * gap)
+    assert abs(corridor["cells"] - corridor["length"] / spacing) <= 2
+    between = (grid.x > 60) & (grid.x < 240) & (grid.y > 150) & (grid.y < 150 + gap)
+    assert between.sum() == pytest.approx(180 / spacing, abs=2)
+    assert np.allclose(grid.y[between], 150 + gap / 2, atol=1e-6)
+    widths = grid.geometry[between].bounds
+    assert ((widths.maxx - widths.minx) <= ASPECT * gap * (1 + 1e-6)).all()
+    assert _components(mg, grid) == 1  # the gap is open along its length and at both ends
+    dense = [w for w in record if "keep one row of cells" in str(w.message)]
+    assert len(dense) == int(spacing < 0.5 * LC)
+    if dense:
         assert f"{corridor['cells']} cells" in str(dense[0].message)
+
+
+@pytest.mark.parametrize("distance", [0.8, 2.0])
+def test_barrier_close_to_the_boundary_keeps_cells_at_most_three_to_one(distance):
+    # The boundary cuts the row's cells to the distance, so that is the gap their length is held to.
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore", UserWarning)
+        mg, vt, grid = _mesh(_model([([(40, distance), (260, distance)], B)]))
+    _assert_exact(mg, vt, grid)
+    [corridor] = mg.barrier_report["corridors"]
+    assert corridor["kind"] == "boundary" and corridor["gap"] == pytest.approx(distance)
+    between = (grid.x > 60) & (grid.x < 240) & (grid.y < distance)
+    widths = grid.geometry[between].bounds
+    assert between.sum() == pytest.approx(180 / min(LC, ASPECT * distance), abs=2)
+    assert ((widths.maxx - widths.minx) <= ASPECT * distance * (1 + 1e-6)).all()
+
+
+def test_corridor_cells_grow_smoothly_as_the_gap_narrows():
+    # No cliff anywhere: from 0.05 to 1.3 lc the row has length / min(lc, ASPECT x gap) cells, the total
+    # never drops as the gap narrows and rises by at most the step's share of 1 / gap. The one step up with
+    # a wider gap (11%) is at 1.2 lc, where the corridor gives way to a row of faces on each barrier.
+    fractions = np.round(np.arange(0.05, 1.31, 0.1), 3)
+    cells = []
+    for fraction in fractions:
+        gap = fraction * LC
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore", UserWarning)
+            mg, vt, grid = _mesh(_model(_parallel(gap)))
+        _assert_exact(mg, vt, grid)
+        assert _components(mg, grid) == 1
+        corridors = mg.barrier_report["corridors"]
+        assert len(corridors) == int(fraction <= 1.2)
+        if corridors:
+            assert abs(corridors[0]["cells"] - corridors[0]["length"] / min(LC, ASPECT * gap)) <= 2
+        cells.append(len(grid))
+    cells = np.array(cells, dtype=float)
+    density = 1.0 / np.minimum(fractions, 1.0 / ASPECT)
+    assert (cells[1:] <= 1.15 * cells[:-1]).all()
+    assert (cells[:-1] / cells[1:] <= density[:-1] / density[1:] + 0.15).all()
+
+
+def test_relay_ramp_to_the_boundary_stays_connected():
+    # Two overlapping faults 0.2 lc apart, each ending on the boundary: the ramp between them joins north and
+    # south (a single line of faces there would seal them apart).
+    gap = 0.2 * LC
+    lines = [([(0, 150), (200, 150)], B), ([(120, 150 + gap), (300, 150 + gap)], B)]
+    mg, vt, grid = _mesh(_model(lines))
+    _assert_exact(mg, vt, grid)
+    assert not _sealed(mg, grid, (60, 200), (240, 100))
+    assert [c["ends"] for c in mg.barrier_report["corridors"]] == [("stagger", "stagger")]
+
+
+@pytest.mark.parametrize("name, coords", [
+    ("double dip", [(40, 156), (90, 151.6), (130, 151.6), (150, 154), (170, 151.6), (210, 151.6), (260, 156)]),
+    ("wavy", [(x, 150 + LC * (0.25 + 0.06 * math.sin(x / 9))) for x in np.linspace(40, 260, 111)]),
+], ids=["double_dip", "wavy"])
+def test_a_gap_that_narrows_and_widens_leaves_no_pocket(name, coords):
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore", UserWarning)
+        mg, vt, grid = _mesh(_model([([(40, 150), (260, 150)], B), (coords, B)]))
+    _assert_exact(mg, vt, grid)
+    assert _components(mg, grid) == 1
+    [corridor] = mg.barrier_report["corridors"]  # one row along the whole bending strand
+    assert corridor["length"] == pytest.approx(220.0, abs=1.0)
+
+
+@pytest.mark.parametrize("y", [150.8, 151.2])
+def test_well_between_two_close_barriers_meshes(y):
+    well = {"geometry": Point(150, y), "point_id": "w", "resolution": 2.0}
+    mg, vt, grid = _mesh(_model(_parallel(1.6), points=[well]))
+    _assert_exact(mg, vt, grid)
+    assert mg.barrier_report["corridors"] == []  # the barriers keep their own faces, capped by the well
+    assert np.hypot(*(mg.nodes - [150, y]).T).min() < 1e-9  # the well is a cell centre, where it was put
+    assert _components(mg, grid) == 1
+
+
+def test_zone_edge_between_two_close_barriers_keeps_its_nodes():
+    zone = {"geometry": box(0, 0, 300, 150.8), "zone_id": 2, "resolution": BACKGROUND_LC, "z_order": 1}
+    mg, vt, grid = _mesh(_model(_parallel(1.6), polygons=[zone]))
+    _assert_exact(mg, vt, grid)
+    assert mg.barrier_report["corridors"] == [] and mg.barrier_report["fixed_nodes"] == []
+
+
+def _hairpin_shapes(gap: float) -> dict:
+    """Joined near-parallel legs ``gap`` apart: a U-turn, a thin closed loop and a closed lens with tapered ends."""
+    half, taper = gap / 2.0, gap / math.tan(math.radians(40.0))
+    return {
+        "u_turn": [([(40, 150 - half), (260, 150 - half), (260, 150 + half), (40, 150 + half)], B)],
+        "thin_loop": [([(40, 150 - half), (260, 150 - half), (260, 150 + half), (40, 150 + half),
+                        (40, 150 - half)], B)],
+        "lens": [([(60, 150), (60 + taper, 150 + half), (240 - taper, 150 + half), (240, 150),
+                   (240 - taper, 150 - half), (60 + taper, 150 - half), (60, 150)], B)],
+    }
+
+
+@pytest.mark.parametrize("gap", [0.1 * LC, 0.25 * LC])
+@pytest.mark.parametrize("name", ["u_turn", "thin_loop", "lens"])
+def test_joined_close_legs_keep_one_row_of_cells(name, gap):
+    lines = _hairpin_shapes(gap)[name]
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore", UserWarning)
+        mg, vt, grid = _mesh(_model(lines))
+        _, _, plain = _mesh(_model([(coords, {}) for coords, _ in lines]))  # the legs as standard lines
+    _assert_exact(mg, vt, grid)
+    [corridor] = mg.barrier_report["corridors"]
+    assert "bend" in corridor["ends"]
+    # Cost bound: each row cell beyond the length / lc the resolution gives brings its two mirrored outer
+    # cells and the grading from the row's spacing back to lc on both sides, about 2 / 0.3 (Gmsh's growth)
+    # more: about 10 cells; 14 leaves 40% for Gmsh, and 1.2 x the legs meshed as standard lines covers the
+    # turns. Measured at 0.1 lc: 1298 / 1360 / 1061 cells against bounds of 1591 / 1513 / 1300 (develop, which
+    # cuts cells instead: 673 / 680 / 622; this branch with two rows of capped faces: 2649 / 2649 / 2329).
+    extra = max(0.0, corridor["cells"] - corridor["length"] / LC)
+    assert len(grid) <= 1.2 * len(plain) + 14 * extra
 
 
 def test_splay_crossing_a_bent_fault_just_past_the_junction_is_merged_onto_one_line():

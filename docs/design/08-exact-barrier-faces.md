@@ -393,7 +393,7 @@ barrier.
   the faces must stay within the reported deviation of the line.
 - When this note was written the full suite gave 664 passed and 2 xfailed;
   after the first review fixes it gave 769 passed and 2 xfailed, and after
-  the second, merged with develop up to #76 and with GapField honoured, 905 passed, 2 skipped and 2
+  the second, merged with develop up to #76 and with GapField honoured, 907 passed and 2
   xfailed.
 - `examples/barrier_meshing.ipynb` shows the cases that used to be cut, the
   report and the remaining limits.

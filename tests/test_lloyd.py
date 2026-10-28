@@ -786,8 +786,12 @@ def test_lloyd_keeps_cells_fixed_nodes_and_zones(well_case):
         rows["lloyd_shift"], np.hypot(rows["x"] - mg.nodes[:, 0], rows["y"] - mg.nodes[:, 1])
     )
 
-    # Every generator stays in its zone, so zone counts do not change.
-    assert relaxed["zone_id"].value_counts().to_dict() == baseline["zone_id"].value_counts().to_dict()
+    # Every generator stays in its zone, so a cell keeps its zone. A cell whose
+    # generator lies on the zone edge takes the zone holding most of it, which
+    # the relaxed cell shape can change.
+    on_edge = shapely.dwithin(INNER_ZONE.exterior, shapely.points(rows[["x", "y"]].to_numpy()), 1e-9)
+    base_zone = _by_node(baseline, tags)["zone_id"].to_numpy()
+    np.testing.assert_array_equal(rows["zone_id"].to_numpy()[~on_edge], base_zone[~on_edge])
     inner = relaxed[relaxed["zone_id"] == 2]
     # A node on a slanted zone edge can lie a float hair off it (its cell may take either zone).
     assert shapely.dwithin(INNER_ZONE, shapely.points(inner[["x", "y"]].to_numpy()), 1e-9).all()

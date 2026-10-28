@@ -304,7 +304,9 @@ def test_min_size_warning_names_location_and_cells_across(caplog):
             _mesh(_two_line_model(), GapField(3, min_size=10.0))
         # pytest >= 9.1 can record a propagating message twice (once on the
         # vorflow logger, once on the root), so compare distinct messages.
-        warnings = sorted({r.getMessage() for r in caplog.records if r.levelno == logging.WARNING})
+        # Older Gmsh adds an unrelated quality-measure warning; keep GapField's.
+        warnings = sorted({r.getMessage() for r in caplog.records
+                           if r.levelno == logging.WARNING and r.getMessage().startswith("GapField")})
     finally:
         vorflow.set_verbosity(1)
     assert len(warnings) == 1

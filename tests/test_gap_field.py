@@ -302,7 +302,9 @@ def test_min_size_warning_names_location_and_cells_across(caplog):
         caplog.clear()
         with caplog.at_level(logging.WARNING, logger="vorflow"):
             _mesh(_two_line_model(), GapField(3, min_size=10.0))
-        warnings = [r.getMessage() for r in caplog.records if r.levelno == logging.WARNING]
+        # pytest >= 9.1 can record a propagating message twice (once on the
+        # vorflow logger, once on the root), so compare distinct messages.
+        warnings = sorted({r.getMessage() for r in caplog.records if r.levelno == logging.WARNING})
     finally:
         vorflow.set_verbosity(1)
     assert len(warnings) == 1

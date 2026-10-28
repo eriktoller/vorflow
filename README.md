@@ -200,7 +200,11 @@ empty-circle rule of the UPR method
 `MeshGenerator.generate()` places these generators and checks the rule
 before Gmsh runs. As a result, each barrier segment is one straight face with
 an orthogonality error of 0. No cell has to be cut, also at corners,
-junctions, crossings and on finely drawn curves.
+junctions, crossings and on finely drawn curves. This does not hold for two
+kinds of barrier, which still go through the tessellator's mirror generators
+and cut, so their faces are not always exact: a barrier with
+`quad_buffer=True`, and a barrier added with `embed=False`, which only sets
+the mesh size.
 
 Before meshing, `ConceptualMesh.generate()` cleans the barrier lines:
 
@@ -218,7 +222,9 @@ Before meshing, `ConceptualMesh.generate()` cleans the barrier lines:
 - with `simplify_tolerance` above 0, the line is simplified after the
   junctions are joined, so a splay stays on the fault it starts on;
 - a vertex closer than 0.1 x `resolution` to its neighbour is dropped as
-  digitising noise, with a warning, even when `simplify_tolerance` is 0.
+  digitising noise, with a warning, even when `simplify_tolerance` is 0. A
+  vertex is kept where dropping it would leave a fold sharper than
+  18 degrees, so the corner of a narrow U-turn stays.
 
 `MeshGenerator.barrier_report` lists each of these changes with its place.
 It also lists what the construction changed or gave up while placing the
@@ -230,17 +236,15 @@ faces. Each kind raises one `UserWarning` with its count:
   hole, at less than `sharp_angle` share a short stem instead of bounding a
   sliver, and so do fans of legs closer than 29 degrees (`collapsed`). No
   point of a line moves more than 0.1 x `resolution`;
-- two barriers closer than 0.25 x `resolution` over a stretch are moved onto
-  their midline there (`merged`), which moves each by at most half the gap.
-  One line of faces then carries both barriers, and `barrier_lines` lists
-  it under both `line_id`s. Give the HFB on those faces the combined
-  properties of both barriers;
-- two nearly parallel barriers further apart, up to about
-  1.2 x `resolution`, share one row of cells between them, and so does a
-  barrier within about 0.6 x `resolution` of the domain boundary
-  (`corridors`). The cells of the row are at most 1.5 x the gap long, so a
-  narrow gap adds cells; a row of cells shorter than 0.5 x `resolution`
-  raises a warning with the cell count.
+- two nearly parallel barriers closer than about 1.2 x `resolution` share
+  one row of cells between them, and so do the close legs of one barrier (a
+  U-turn, a thin loop, a lens) and a barrier within about 0.6 x `resolution`
+  of the domain boundary (`corridors`). No barrier is moved, and flow along
+  the gap stays connected. The cells of the row are at most `resolution`
+  and at most 3 x the gap long, so a narrow gap adds cells: about
+  `length / (3 x gap)` in the row, and the mesh around it is graded down to
+  match. Rows of cells shorter than 0.5 x `resolution` raise one warning
+  with their cell count.
 
 Check the report before you build HFB input.
 
@@ -263,12 +267,13 @@ the faces that short there and what helps for that cause. For example: an
 end that nearly meets another barrier is snapped onto it by a
 `simplify_tolerance` of at least the gap; a barrier running close to the
 boundary is dropped there by the same tolerance; next to the boundary, a
-point or a fixed line, the message gives the barrier `resolution` at which
-the faces would fit. Where barrier legs meet or fold back at angles too
-narrow for cells between them (a narrow spike or zigzag, or many legs at one
-point), `simplify_tolerance` of about `resolution / 8` removes digitising
-noise, and otherwise `quad_buffer=True` on the barrier meshes it with a
-structured strip of cells instead, whose faces are not exact.
+point or a fixed line, the message gives a barrier `resolution` at which
+the faces fit. Where barrier legs meet or fold back at angles too narrow for
+cells between them (a narrow spike or zigzag, or many legs at one point),
+the message gives the `simplify_tolerance` that removes a short fold there,
+if it is digitising noise, and otherwise `quad_buffer=True` on the barrier
+meshes it with a structured strip of cells instead, whose faces are not
+exact.
 
 **Breaking:** a point feature, such as a well, on a barrier or at its end
 (closer than about 0.05 x `resolution`) now raises `BarrierMeshError`,

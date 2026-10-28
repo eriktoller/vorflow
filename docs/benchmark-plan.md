@@ -57,7 +57,7 @@ reported separately from the Fortran reference, never merged with it.
 | Multiple zones / zone IDs | yes (`z_order` partition) | no (layers are refinement only) | region attributes | no |
 | Internal line refinement | yes | yes | only as densified `nodes` (centres on line) | yes (`inner_line`) |
 | Faces aligned to a line | yes (embedded lines) | no | no | no (seeds on line) |
-| Flow barrier | yes (straddle + split) | no | no | no |
+| Flow barrier | yes (exact faces, empty-circle rule) | no | no | no |
 | Well is a generator | yes | point is seeded | if passed as node | yes, with hexagonal ring |
 | Smooth size grading | fields, `growth_factor` | geometric rings | nested buffer regions only | `poly_growth_rate` |
 | Output | GeoDataFrame | shapefile → `get_gridprops_disv` | DISV gridprops | DISV + minimal MF6 model |
@@ -343,6 +343,8 @@ count is within 5 % for every buildable tool; outputs are in
     11 on F4). Worth reporting upstream to both projects.
 - **vorflow F4:** the error stays at about 3e-5 even with XT3D. It is
   concentrated on the barrier-split cells, whose centres are centroids.
+  This was before exact barrier faces (design note 08), which leave no
+  split cells; rerun F4 to update it.
 - **FloPy adapter fairness:** band boundaries leave clusters of small cells
   along the rings. Densifying the rings to the band size should fix this;
   do it before Phase 3.

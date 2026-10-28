@@ -17,6 +17,8 @@ instead of adding it as an interior line.
 ``target_ncpl`` is one cell count or a list (a convergence sweep); the first
 target is the one plotted. ``mf6_problems`` lists problem names, or
 ``{name: ..., <parameter>: ...}`` mappings for problems that take parameters.
+Optional ``transects`` (WKT lines) cross narrow gaps between features; the
+metrics count the cells each one passes through.
 
 Sizing spec (see docs/benchmark-plan.md): a background size ``h_max``, a target
 size ``h`` per feature and one cell-to-cell growth ratio ``growth``. Geometric
@@ -64,6 +66,7 @@ class Case:
     targets: tuple
     features: list = field(default_factory=list)
     mf6_problems: list = field(default_factory=list)
+    transects: list = field(default_factory=list)
 
     def features_of(self, kind: str) -> list:
         """Features of one kind, in file order."""
@@ -99,6 +102,7 @@ def load_case(path: Path) -> Case:
         targets=targets,
         features=features,
         mf6_problems=[_load_problem(item) for item in spec.get("mf6_problems", [])],
+        transects=[wkt.loads(item) for item in spec.get("transects", [])],
     )
 
 

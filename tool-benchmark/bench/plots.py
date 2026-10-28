@@ -16,6 +16,7 @@ import numpy as np
 import pandas as pd
 import shapely
 from matplotlib.collections import PolyCollection
+from matplotlib.ticker import NullFormatter
 
 from .case import Case
 from .grid import open_rings
@@ -23,6 +24,8 @@ from .metrics import face_metrics, face_table
 
 TOOL_STYLE = {
     "vorflow": {"color": "#2a78d6", "marker": "o"},
+    "vorflow_lloyd20": {"color": "#8a4fd6", "marker": "o"},
+    "vorflow_lloyd20_mirror": {"color": "#c24fa8", "marker": "o"},
     "mf6voronoi": {"color": "#eb6834", "marker": "s"},
     "flopy": {"color": "#1baf7a", "marker": "^"},
     "vorogridgen": {"color": "#eda100", "marker": "D"},
@@ -50,12 +53,19 @@ def _save(fig, path: Path) -> None:
     plt.close(fig)
 
 
-def plot_meshes(case: Case, grids: dict, path: Path) -> None:
-    """One panel per tool: cells coloured by MF6-seen orthogonality error, features on top."""
+MESH_METRICS = {
+    "ortho": ("ortho_deg", (0, 10), "max orthogonality error per cell, deg (as MF6 reads it)"),
+    "skew": ("skewness", (0, 0.5), "max face skewness per cell (as MF6 reads it)"),
+}
+
+
+def plot_meshes(case: Case, grids: dict, path: Path, metric: str = "ortho") -> None:
+    """One panel per tool: cells coloured by an MF6-seen face metric (``MESH_METRICS``), features on top."""
+    key, clim, label = MESH_METRICS[metric]
     fig, axes = plt.subplots(1, len(grids), figsize=(4.5 * len(grids), 4.8), squeeze=False)
     for ax, (tool, grid) in zip(axes[0], grids.items()):
         polys = [grid.vertices[r] for r in open_rings(grid.iverts)]
-        pc = PolyCollection(polys, array=_cell_max_ortho(grid), cmap="viridis", clim=(0, 10),
+        pc = PolyCollection(polys, array=_cell_max_face_metric(grid, key), cmap="viridis", clim=clim,
                             edgecolors="k", linewidths=0.1)
         ax.add_collection(pc)
         _plot_features(ax, case)
@@ -63,19 +73,46 @@ def plot_meshes(case: Case, grids: dict, path: Path) -> None:
         ax.set_aspect("equal")
         ax.autoscale_view()
         ax.set_xticks([]), ax.set_yticks([])
-    fig.colorbar(pc, ax=axes[0].tolist(), shrink=0.8, label="max orthogonality error per cell, deg (as MF6 reads it)")
+    fig.colorbar(pc, ax=axes[0].tolist(), shrink=0.8, label=label)
     fig.suptitle(case.id, color=INK)
     _save(fig, path)
 
 
+def _cell_max_face_metric(grid, key: str = "ortho_deg") -> np.ndarray:
+    """Largest face metric over each cell's faces, using the written centres (NaN faces ignored)."""
+    faces = face_table(grid)
+    values = np.nan_to_num(face_metrics(grid, faces, "written")[key], nan=0.0)
+    per_cell = np.zeros(grid.ncpl)
+    np.maximum.at(per_cell, faces["ci"], values)
+    np.maximum.at(per_cell, faces["cj"], values)
+    return per_cell
+
+
 def _cell_max_ortho(grid) -> np.ndarray:
     """Largest orthogonality error over each cell's faces, using the written centres."""
-    faces = face_table(grid)
-    ortho = face_metrics(grid, faces, "written")["ortho_deg"]
-    per_cell = np.zeros(grid.ncpl)
-    np.maximum.at(per_cell, faces["ci"], ortho)
-    np.maximum.at(per_cell, faces["cj"], ortho)
-    return per_cell
+    return _cell_max_face_metric(grid, "ortho_deg")
+
+
+def plot_metric_dots(summary: pd.DataFrame, panels: dict, path: Path, log: bool = False) -> None:
+    """Dot plot of summary columns: one panel per {column: title}, one row per case, one marker per tool."""
+    cases = list(dict.fromkeys(summary["case"]))
+    tools = [t for t in TOOL_STYLE if t in set(summary["tool"])]
+    fig, axes = plt.subplots(1, len(panels), figsize=(4.2 * len(panels), 0.45 * len(cases) + 1.6),
+                             sharey=True, squeeze=False)
+    for ax, (column, title) in zip(axes[0], panels.items()):
+        for k, tool in enumerate(tools):
+            sub = summary[summary["tool"] == tool].set_index("case").reindex(cases)
+            y = np.arange(len(cases)) + (k - (len(tools) - 1) / 2) * 0.2
+            ax.plot(sub[column], y, ls="none", label=tool, ms=5, **TOOL_STYLE[tool])
+        ax.set_title(title, color=INK, fontsize=10)
+        if log:
+            ax.set_xscale("log")
+            ax.xaxis.set_minor_formatter(NullFormatter())  # minor labels collide on short decades
+        _style_axes(ax)
+    axes[0][0].set_yticks(range(len(cases)), cases)
+    axes[0][0].invert_yaxis()
+    axes[0][-1].legend(loc="lower right", fontsize=8, frameon=False)
+    _save(fig, path)
 
 
 def _plot_features(ax, case: Case) -> None:

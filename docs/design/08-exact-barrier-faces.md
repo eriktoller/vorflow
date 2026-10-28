@@ -110,7 +110,7 @@ on a 220 m pair, a wavy gap and a U-turn:
 | cells at most ... x the gap long | 1.5 | 2 | 2.5 | 3 | 3.5 | 4 | 5 |
 |---|---|---|---|---|---|---|---|
 | compactness of the row's cells | 0.75 | 0.70 | 0.64 | 0.59 | 0.54 | 0.50 | 0.44 |
-| cells, pair at 0.05 x `resolution` | 4312 | | | 2288 | | 1775 | |
+| cells, pair at 0.05 x `resolution` | 4312 | | | 2312 | | 1775 | |
 | cells, pair at 0.1 x `resolution` | 2260 | | | 1228 | | 980 | |
 
 A 3:1 rectangle has a compactness of 0.59, about the worst cell next to a
@@ -148,7 +148,12 @@ between two barriers, or between a barrier and the boundary, there is no
 corridor (`corridor.gap_field_wins`): each barrier gets its own faces, at
 most the GapField size there, with GapField's rows of cells between them.
 Where it asks for less, the corridor stays, its cells no longer than the
-GapField size. The barrier sites are not gap walls, so a lone barrier is no
+GapField size. A corridor that narrows below GapField's `min_size` somewhere
+stays too, all along: GapField's rows could not pass the narrow part, and
+dropping the corridor there made a model that meshes without GapField raise
+`BarrierMeshError` with it (two barriers converging from 4 m to 0.1 m). The
+corridors are found with the size field without GapField, whose small sizes
+in the gap would hide them. The barrier sites are not gap walls, so a lone barrier is no
 gap. With `GapField(min_size=0.2)` at `resolution` 8 and `background_lc` 20,
 pairs 1.6 m and 4 m apart, a barrier 4 m from a river and a barrier 2 m from
 the boundary get at least 3 cells across (7178, 3008, 3081 and 3883 cells;
@@ -200,12 +205,19 @@ zone edge, 77 cells held less than a quarter of their area in their zone, and
 the least held 6% (0.3.0: 6 cells, least 21%). A cell whose generator lies on
 a zone edge now takes the zone (of those its generator lies on) holding most
 of its area, when it holds at least 0.1 more of the cell than the `z_order`
-zone. Such cells then hold at least 45% of their area in their zone. The
-least share left in these cases is 38%: a barrier site just inside one zone
-whose cell reaches across the edge keeps its generator's zone, so no cell
-takes a zone its generator is not in. Cells about a straight edge split about
-evenly and keep the `z_order` rule, so grids without barriers change only at
-zone corners.
+zone. A zone's share is summed over all its polygon rows, so a zone drawn as
+several tiles is not beaten by a smaller one. Such cells then hold at least
+45% of their area in their zone. The least share left in these cases is 38%:
+a barrier site just inside one zone whose cell reaches across the edge keeps
+its generator's zone, so no cell takes a zone its generator is not in.
+
+The rule applies only to the barrier sites' cells and the cells touching
+them. Applied to every cell, it made straight zone edges ragged where the
+resolution changes across them: with a resolution-2 zone against a
+resolution-20 background, 30 of the 149 cells centred on the edge went to the
+outer zone. It also shrank thin zones: a 4 m strip kept 25 of its 77 cells.
+Away from barriers the `z_order` rule stays, so grids without barriers are
+the same as in 0.3.0, zones included.
 
 ## Line cleaning
 
@@ -281,7 +293,7 @@ standard line.
 These are with the polish limited to the nodes near the barriers; polishing
 the whole domain gave the same compactness and cell ratios of 0.94 and 0.97.
 In the MODFLOW 6 check on the design set, the largest head RMSE fell from
-0.0192 to 0.0180.
+0.0193 to 0.0173.
 
 The flow through an HFB on the barrier faces was compared with a 4 x finer
 grid built by the same code (in units of 1e-4):
@@ -295,8 +307,12 @@ So 0.3.0 under-counts the flow by 42-56%, and the exact faces are within 1%
 of their own finer grid.
 
 Meshing a model with barriers takes about 1.7 x as long as in 0.3.0: 12.7 s
-against 7.4 s over 23 benchmark cases, 1.5-2.3 x per case. The polish band
-keeps the extra cost tied to the barrier length.
+against 7.4 s over 23 benchmark cases, 1.5-2.3 x per case. Over the 43
+held-out cases it takes 2.0 x as long, and up to 5.2 x for one case (a
+network of collinear barriers). The polish band keeps the extra cost tied to
+the barrier length. Planning the barriers (before Gmsh) takes about as long
+as at the first exact-faces commit: 14 s for 100 digitised faults in a 100 km
+domain, 121 s for 300.
 
 Spikes of 10 and 15 degrees in the held-out and adversarial sets each leave 7.2 m of tip without faces (0.9 x their 8 m resolution), as
 intended. These are the only cases where the faces do not cover the whole
@@ -394,6 +410,8 @@ barrier.
 - When this note was written the full suite gave 664 passed and 2 xfailed;
   after the first review fixes it gave 769 passed and 2 xfailed, and after
   the second, merged with develop up to #76 and with GapField honoured, 907 passed and 2
-  xfailed.
+  xfailed. After the third (zone rule near barriers only, GapField and
+  converging gaps, planning speed) it gave 910 passed, 2 skipped (no build
+  tool) and 2 xfailed.
 - `examples/barrier_meshing.ipynb` shows the cases that used to be cut, the
   report and the remaining limits.

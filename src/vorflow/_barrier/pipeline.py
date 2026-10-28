@@ -141,9 +141,12 @@ def advice(cause: str, h: float, fold: float | None = None, lc: float | None = N
               f"otherwise {QUAD_BUFFER_ADVICE}") if fold is not None else \
         f"The legs there are long, so simplify_tolerance does not help; {QUAD_BUFFER_ADVICE}"
     return {
-        "barrier": "two barrier parts come that close without meeting (a near-miss end, or two barriers side by "
-                   "side). If one should end on the other, set simplify_tolerance on it to at least the gap, which "
-                   "snaps the end onto the other; otherwise move them apart",
+        "barrier": "a barrier end comes that close to another barrier without meeting it. If it should end on "
+                   "the other, set simplify_tolerance on it to at least the gap, which snaps the end onto the "
+                   "other; otherwise move them apart",
+        "side by side": "two barrier parts run side by side that close without meeting. simplify_tolerance does "
+                        "not join them: if they are one barrier drawn twice, keep one of them; otherwise move them "
+                        f"apart, or {QUAD_BUFFER_ADVICE}",
         "boundary": "the barrier comes that close to the domain boundary or a hole without ending on it. End it on "
                     "the boundary or move it away: simplify_tolerance of at least the gap snaps a near-miss end "
                     f"onto the boundary and drops a part that runs along it. Or use {finer}",
@@ -202,7 +205,7 @@ def floor_cause(net: Network, field: SizeField, k: int, lc: float, gradation: fl
     point = shapely.Point(field.xy[k])
     for c in net.corridors:
         if c.region.distance(point) <= 0.5 * lc:
-            return "boundary" if len(c.sides) == 1 else "barrier"
+            return "boundary" if len(c.sides) == 1 else "side by side"
     if field.cause is None or len(field.capped) != len(field.h):
         return "junction"
     d = np.hypot(*(field.xy - field.xy[k]).T)
@@ -217,7 +220,15 @@ def floor_cause(net: Network, field: SizeField, k: int, lc: float, gradation: fl
         cause = CAUSES[int(field.cause[j])]
     if cause == "barrier" and not _other_line_near(net, field.xy[j], field.capped[j] / BARRIER_CAP):
         return "junction"
+    if cause == "barrier" and not _free_end_near(net, field.xy[j], lc):
+        return "side by side"
     return cause
+
+
+def _free_end_near(net: Network, xy: np.ndarray, reach: float) -> bool:
+    """True when a barrier end that is not on the domain boundary lies within ``reach`` of ``xy``."""
+    ends = [v for v, pieces in enumerate(net.node_pieces) if len(pieces) == 1 and not net.plans[v].on_boundary]
+    return bool(ends) and float(np.hypot(*(net.hard_xy[ends] - xy).T).min()) <= reach
 
 
 def _other_line_near(net: Network, xy: np.ndarray, reach: float) -> bool:

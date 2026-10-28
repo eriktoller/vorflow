@@ -958,10 +958,10 @@ def test_gap_field_puts_its_cells_across_gaps_next_to_barriers(name):
     for mg, vt, grid in (off, on):
         _assert_exact(mg, vt, grid)
         assert _components(mg, grid) == 1
-    (mg_off, _, grid_off), (mg_on, _, grid_on) = off, on
-    # Sizing that ignored GapField removed hundreds of Gmsh nodes (861 for the single barrier); a few stray
-    # ones depend on the Gmsh version (0 with Gmsh 4.14, 1-2 with 4.15).
-    assert mg_on.barrier_report["removed_nodes"] <= mg_off.barrier_report["removed_nodes"] + 5
+    (_, _, grid_off), (mg_on, _, grid_on) = off, on
+    # Sizing that ignored GapField removed hundreds of Gmsh nodes (861 for the single barrier); with it,
+    # Gmsh 4.14.1-4.15.2 leave at most a stray one or two inside the circles.
+    assert mg_on.barrier_report["removed_nodes"] <= 2
     if span is None:
         assert not mg_on.diagnostics["gap_field"]["field_created"]
         assert np.array_equal(grid_on[["x", "y"]].to_numpy(), grid_off[["x", "y"]].to_numpy())
@@ -980,6 +980,19 @@ def test_gap_field_keeps_the_corridor_where_min_size_allows_one_cell_across():
     _assert_exact(mg, vt, grid)
     [corridor] = mg.barrier_report["corridors"]
     assert corridor["cells"] >= 220 / 2.0 - 2
+
+
+def test_gap_field_keeps_the_corridor_where_the_gap_narrows_below_min_size():
+    # Two barriers converge from 4 m to 0.1 m apart. GapField's rows cannot pass the 0.1 m end, below its
+    # min_size, so the corridor stays all along and the model meshes as it does without GapField
+    # (8987f7d dropped the corridor and raised BarrierMeshError).
+    lines = [([(40, 150), (260, 150)], B), ([(40, 154), (260, 150.1)], B)]
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore", UserWarning)
+        mg, vt, grid = _mesh(_model(lines), gap_field=GapField(min_size=1.0))
+    _assert_exact(mg, vt, grid)
+    assert _components(mg, grid) == 1
+    assert len(mg.barrier_report["corridors"]) == 1
 
 
 def test_relay_ramp_with_a_gap_field_stays_connected():

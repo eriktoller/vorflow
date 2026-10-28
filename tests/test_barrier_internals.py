@@ -271,23 +271,22 @@ def test_faces_below_the_floor_raise_before_grading():
         _plan([[(40, 150), (260, 150)], [(150, 270), (150, 150.01)]])
 
 
-@pytest.mark.parametrize("coords, features, cause", [
-    ([[(40, 150), (260, 150)], [(150, 270), (150, 150.1)]], None, "two barrier parts come that close"),
-    ([[(40, 0.02), (260, 0.02)]], None, "close to the domain boundary"),
-    ([[(40, 150), (260, 150)]], [(150, 150.1)], "a well, hex-ring seed or embedded point"),
-    ([[(150, 150), (40, 150)], [(150, 150), (40, 151.9)]], None, "legs meet or fold back"),
-], ids=["barrier", "boundary", "feature", "junction"])
-def test_floor_error_names_its_cause_and_a_remedy_for_it(coords, features, cause):
+@pytest.mark.parametrize("coords, features, cause, remedy", [
+    ([[(40, 150), (260, 150)], [(150, 270), (150, 150.1)]], None, "a barrier end comes that close",
+     "set simplify_tolerance on it"),
+    ([[(40, 150), (260, 150)], [(40, 150.04), (260, 150.04)]], None, "run side by side",
+     "simplify_tolerance does not join them"),
+    ([[(40, 0.02), (260, 0.02)]], None, "close to the domain boundary", "simplify_tolerance of at least the gap"),
+    ([[(40, 150), (260, 150)]], [(150, 150.1)], "a well, hex-ring seed or embedded point", "Move the point away"),
+    # Two long legs at 1 degree: no tolerance opens the angle, so only the quad buffer is advised there.
+    ([[(150, 150), (40, 150)], [(150, 150), (40, 151.9)]], None, "legs meet or fold back",
+     "simplify_tolerance does not help; quad_buffer=True"),
+], ids=["barrier end", "side by side", "boundary", "feature", "junction"])
+def test_floor_error_names_its_cause_and_a_remedy_for_it(coords, features, cause, remedy):
     with pytest.raises(pipeline.BarrierMeshError, match="faces would have to be") as info:
         _plan(coords, features=features)
     message = str(info.value)
-    assert cause in message
-    # Two long legs at 1 degree: no tolerance opens the angle, so only the quad buffer is advised there.
-    fold = cause == "legs meet or fold back"
-    assert ("simplify_tolerance" in message) == (fold or cause in ("two barrier parts come that close",
-                                                                    "close to the domain boundary"))
-    assert ("simplify_tolerance does not help; quad_buffer=True" in message) == fold
-    assert ("quad_buffer=True" in message) == fold
+    assert cause in message and remedy in message
 
 
 def _advised(message: str, what: str) -> float:

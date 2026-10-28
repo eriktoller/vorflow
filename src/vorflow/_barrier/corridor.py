@@ -84,7 +84,8 @@ dropped the same way (``pipeline``), and its pieces get no other pair
 corridor. With ``MeshGenerator(gap_field=...)``, a gap where GapField asks
 for more than one cell across gets no corridor either (``gap_field_wins``):
 the barriers get their own faces, sized by GapField, with its rows of cells
-between them.
+between them. A corridor narrower than GapField's ``min_size`` somewhere
+keeps its one row all along, since GapField's rows could not pass there.
 """
 from __future__ import annotations
 
@@ -297,7 +298,7 @@ def _end_kind(kinds: list, aligned: bool, boundary_chord: bool) -> str | None:
 
 def _other_piece(net, v: int, p: int) -> int:
     """The piece at kink ``v`` other than ``p``."""
-    return next(int(q) for q in np.flatnonzero((net.pieces == v).any(axis=1)) if q != p)
+    return next(q for q in net.node_pieces[v] if q != p)
 
 
 def _far_node(net, p: int, v: int) -> int:
@@ -316,23 +317,23 @@ def _strand(net, p: int, m: np.ndarray, degree: np.ndarray, rung_nodes: set, run
     """Piece ``p`` and the pieces it runs on into through kinks, each within CORRIDOR_ANGLE of ``m`` and going
     the same way along it, as SidePieces in order along ``m`` (none with a node in ``blocked``)."""
     cos_max = math.cos(CORRIDOR_ANGLE)
-    out = [_oriented(net, p, m)]
+    ahead, behind = [_oriented(net, p, m)], []  # behind is built backwards, from p
     seen = {p}
-    for forward in (True, False):
-        while len(out) <= MAX_STRAND:
-            v = out[-1].end if forward else out[0].start
+    for forward, out in ((True, ahead), (False, behind)):
+        while len(ahead) + len(behind) <= MAX_STRAND:
+            last = out[-1] if out else ahead[0]
+            v = last.end if forward else last.start
             if not _joinable(net, v, degree, rung_nodes):
                 break
-            q = _other_piece(net, v, out[-1].piece if forward else out[0].piece)
+            q = _other_piece(net, v, last.piece)
             w = _far_node(net, q, v)
             step = net.hard_xy[w] - net.hard_xy[v]
             along = float(step @ m) / float(np.hypot(*step))
             if q in seen or q in rung_pieces or w in blocked or (along if forward else -along) < cos_max:
                 break
             seen.add(q)
-            sp = SidePiece(q, v, w) if forward else SidePiece(q, w, v)
-            out = out + [sp] if forward else [sp] + out
-    return out
+            out.append(SidePiece(q, v, w) if forward else SidePiece(q, w, v))
+    return behind[::-1] + ahead
 
 
 def _trim(net, side: list, probe, x0: float, x1: float) -> list:
@@ -422,6 +423,8 @@ def _pair_corridor(net, pa: int, pb: int, size_fn, domain, obstacles: Obstacles,
         return None
     origin, m = _bisector(A0, A1, B0, B1)
     side_a = _strand(net, pa, m, degree, rung_nodes, rung_pieces | used, set())
+    if any(sp.piece == pb for sp in side_a):  # one strand, not two sides
+        return None
     nodes_a = {v for sp in side_a for v in (sp.start, sp.end)}
     side_b = _strand(net, pb, m, degree, rung_nodes, rung_pieces | used, nodes_a)
     probe = Corridor(origin, m, [side_a, side_b], 0.0, 0.0, (), (), Polygon(), (pa, pb))
@@ -591,7 +594,7 @@ def _chains(net, pieces: list, degree: np.ndarray, rung_nodes: set) -> list:
                 for v in net.pieces[p]:
                     if degree[v] != 2 or v in rung_nodes or net.plans[v].on_boundary:
                         continue
-                    q = next(int(q) for q in np.flatnonzero((net.pieces == v).any(axis=1)) if q != p)
+                    q = _other_piece(net, int(v), p)
                     if q in members and q in left:
                         left.discard(q)
                         chain.insert(0, q) if end == 0 else chain.append(q)
@@ -626,21 +629,28 @@ def _run(net, chain: list, e0: np.ndarray, e1: np.ndarray, degree, rung_nodes, h
 
 
 def gap_field_wins(c: Corridor, size_fn) -> bool:
-    """True when GapField (``size_fn.gap``) asks for more than one cell across the gap of ``c``.
+    """True when GapField (``size_fn.gap``) asks for more than one cell across the gap of ``c``, all along it.
 
     Its cells then go across the gap instead of the corridor's one row: the
-    barriers there get their own faces, sized by GapField.
+    barriers there get their own faces, sized by GapField. Where the gap
+    narrows below GapField's ``min_size`` its rows cannot go on, so the
+    corridor stays (with its one row) and the model meshes as without it.
     """
     gap = getattr(size_fn, "gap", None)
-    return gap is not None and gap.cells_across(c.region) > 1.0
+    return gap is not None and c.gap > gap.estimate.min_size and gap.cells_across(c.region) > 1.0
 
 
 def find_corridors(net, size_fn, domain, standard: list, features: np.ndarray, skip: set) -> list:
-    """Pair corridors first, then boundary runs on the pieces left; none where GapField wins."""
-    pairs = [c for c in pair_corridors(net, size_fn, domain, standard, features, skip)
+    """Pair corridors first, then boundary runs on the pieces left; none where GapField wins.
+
+    The corridors are found with the size field without GapField, whose own
+    small sizes in the gap would hide them; ``gap_field_wins`` then decides.
+    """
+    plain = dataclasses.replace(size_fn, gap=None) if getattr(size_fn, "gap", None) is not None else size_fn
+    pairs = [c for c in pair_corridors(net, plain, domain, standard, features, skip)
              if not gap_field_wins(c, size_fn)]
     used = {sp.piece for c in pairs for side in c.sides for sp in side}
-    runs = boundary_runs(net, size_fn, domain, standard, features, skip, used)
+    runs = boundary_runs(net, plain, domain, standard, features, skip, used)
     return pairs + [c for c in runs if not gap_field_wins(c, size_fn)]
 
 
@@ -985,7 +995,7 @@ def _stagger_node(net, side: list, node: tuple, tip: np.ndarray, at_start: bool)
         return i, new
     end_node = sp.start if at_start else sp.end
     room = t if at_start else length - t
-    free = int((net.pieces == end_node).any(axis=1).sum()) == 1 and not net.plans[end_node].on_boundary
+    free = len(net.node_pieces[end_node]) == 1 and not net.plans[end_node].on_boundary
     if free and room * (1 - CORRIDOR_FOOT) >= half:
         return i, 0.0 if at_start else length
     return None

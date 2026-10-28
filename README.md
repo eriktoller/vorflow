@@ -199,10 +199,10 @@ empty-circle rule of the UPR method
 ([Berge et al., 2019](https://doi.org/10.1007/s10596-018-9790-0)).
 `MeshGenerator.generate()` places these generators and checks the rule
 before Gmsh runs. As a result, each barrier segment is one straight face with
-an orthogonality error of 0. No cell has to be cut, also at corners,
-junctions, crossings and on finely drawn curves. This does not hold for two
-kinds of barrier, which still go through the tessellator's mirror generators
-and cut, so their faces are not always exact: a barrier with
+an orthogonality error of 0, also at corners, junctions, crossings and on
+finely drawn curves, and the barrier cells need no cutting. This does not
+hold for two kinds of barrier, which still go through the tessellator's
+mirror generators and cut, so their faces are not always exact: a barrier with
 `quad_buffer=True`, and a barrier added with `embed=False`, which only sets
 the mesh size.
 
@@ -247,7 +247,8 @@ faces. Each kind raises one `UserWarning` with its count:
   with their cell count. With `MeshGenerator(gap_field=...)`, a gap where
   `GapField` asks for more than one cell across gets no corridor: each
   barrier gets its own faces, sized by `GapField`, with its rows of cells
-  between them (see Narrow gaps).
+  between them (see Narrow gaps). A gap that narrows below the `GapField`
+  `min_size` somewhere keeps its one row all along.
 
 Check the report before you build HFB input.
 
@@ -406,7 +407,8 @@ print(mesher.diagnostics["gap_field"])  # field_created, min_gap, n_floor_bound,
   between two barriers, or between a barrier and the domain boundary, that
   gap gets no shared row of cells (see Barriers): each barrier gets its own
   faces, no longer than the `GapField` size there, with the rows of cells
-  between them. Elsewhere along a barrier the faces follow the `GapField`
+  between them. A gap that narrows below `min_size` somewhere keeps its
+  shared row all along, as without `GapField`. Elsewhere along a barrier the faces follow the `GapField`
   size too, so the cells along it match Gmsh's. If the faces would have to
   be far shorter than the barrier's `resolution`, `generate()` raises
   `BarrierMeshError` and gives a `min_size` that works.

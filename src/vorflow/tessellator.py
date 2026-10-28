@@ -422,43 +422,51 @@ def _join_unmatched_to_nearest_zone(joined, pts_gdf, zones):
     return pd.concat([joined[matched], nearest])
 
 
-def _edge_cells_to_majority_zone(grid, zones, margin: float = ZONE_SHARE_MARGIN):
-    """Give each cell whose generator lies on an edge between zones the one of them holding most of its area.
+def _edge_cells_to_majority_zone(grid, zones, band, margin: float = ZONE_SHARE_MARGIN):
+    """Give each ``band`` cell whose generator lies on an edge between zones the one of them holding most of its area.
 
     The generator join gives such a cell the zone of highest ``z_order``. Next
     to a barrier, the cell of a node on a zone edge is lopsided (the barrier
     sites bound it on one side), so it could take a zone it barely touches.
-    Among the zones its generator lies on, the cell keeps the ``z_order`` zone
-    unless another holds at least ``margin`` more of its area, so cells about
-    a straight edge, which split about evenly, keep the ``z_order`` rule. A
-    cell never takes a zone its generator is not in.
+    ``band`` marks the cells next to a barrier (``_barrier_band``); all other
+    cells keep the ``z_order`` rule, so meshes without barriers keep their
+    zones. Among the zones its generator lies on, a band cell keeps the
+    ``z_order`` zone unless another holds at least ``margin`` more of its
+    area. A zone's share sums all its polygon rows. A cell never takes a zone
+    its generator is not in.
     """
-    if grid.empty or len(zones) < 2:
+    if grid.empty or len(zones) < 2 or not np.any(band):
         return grid
     extent = float(max(np.ptp(np.asarray(zones.total_bounds).reshape(2, 2), axis=0)))
     tol = max(ZONE_EDGE_FRACTION * extent, 1e-12)
-    generators = shapely.points(grid["x"].to_numpy(), grid["y"].to_numpy())
-    on = np.stack([shapely.dwithin(z, generators, tol) for z in zones.geometry.to_numpy()], axis=1)
-    rows = np.flatnonzero(on.sum(axis=1) >= 2)
+    codes, zone_ids = pd.factorize(zones["zone_id"])
+    geoms = zones.geometry.to_numpy()
+    candidates = np.flatnonzero(band)
+    generators = shapely.points(grid["x"].to_numpy()[candidates], grid["y"].to_numpy()[candidates])
+    on = np.zeros((len(candidates), len(zone_ids)), dtype=bool)
+    for code, zone in zip(codes, geoms):
+        on[:, code] |= shapely.dwithin(zone, generators, tol)
+    rows, on = candidates[on.sum(axis=1) >= 2], on[on.sum(axis=1) >= 2]
     if len(rows) == 0:
         return grid
     cells = grid.geometry.to_numpy()[rows]
-    shares = np.stack([shapely.area(shapely.intersection(cells, z)) for z in zones.geometry.to_numpy()], axis=1)
-    shares = np.where(on[rows], shares / np.maximum(shapely.area(cells), 1e-300)[:, None], -1.0)
-    zone_ids = zones["zone_id"].to_numpy()
-    z_orders = zones["z_order"].to_numpy() if "z_order" in zones else None
-    current = grid["zone_id"].to_numpy()[rows]
-    own = np.array([share[zone_ids == zone].max(initial=0.0) for share, zone in zip(shares, current)])
+    shares = np.zeros(on.shape)
+    for code, zone in zip(codes, geoms):
+        shares[:, code] += shapely.area(shapely.intersection(cells, zone))
+    shares = np.where(on, shares / np.maximum(shapely.area(cells), 1e-300)[:, None], -1.0)
+    current = pd.Index(zone_ids).get_indexer(grid["zone_id"].to_numpy()[rows])
+    own = np.where(current >= 0, shares[np.arange(len(rows)), current], 0.0)
     best = np.argmax(shares, axis=1)
     moved = shares[np.arange(len(rows)), best] - own >= margin
     if not moved.any():
         return grid
     grid = grid.copy()
     index = grid.index[rows[moved]]
-    grid.loc[index, "zone_id"] = zone_ids[best[moved]]
-    if z_orders is not None and "z_order" in grid:
-        grid.loc[index, "z_order"] = z_orders[best[moved]]
-    logger.debug(f"  -> {int(moved.sum())} cell(s) on a zone edge given the zone holding most of their area.")
+    grid.loc[index, "zone_id"] = zone_ids.to_numpy()[best[moved]]
+    if "z_order" in zones and "z_order" in grid:
+        z_order = zones["z_order"].groupby(codes).max().to_numpy()
+        grid.loc[index, "z_order"] = z_order[best[moved]]
+    logger.debug(f"  -> {int(moved.sum())} cell(s) next to a barrier given the zone holding most of their area.")
     return grid
 
 
@@ -1045,6 +1053,21 @@ class VoronoiTessellator:
             return None
         return np.asarray(circles[0], dtype=float), np.asarray(circles[1], dtype=float)
 
+    def _barrier_band(self, grid):
+        """Mask of the grid cells next to a barrier: the barrier sites' cells and the cells touching them."""
+        sites = getattr(self.mg, 'node_is_site', None)
+        tags = getattr(self.mg, 'node_tags', None)
+        if grid.empty or sites is None or tags is None or len(sites) != len(tags) or not np.any(sites):
+            return np.zeros(len(grid), dtype=bool)
+        is_site = np.isin(grid['node_id'].to_numpy(), np.asarray(tags)[np.asarray(sites, dtype=bool)])
+        cells = grid.geometry.to_numpy()
+        extent = float(max(np.ptp(np.asarray(grid.total_bounds).reshape(2, 2), axis=0)))
+        tree = shapely.STRtree(cells)
+        _, touching = tree.query(cells[is_site], predicate='dwithin', distance=max(ZONE_EDGE_FRACTION * extent, 1e-12))
+        band = is_site.copy()
+        band[touching] = True
+        return band
+
     def _check_circles_empty(self, generators, all_generators=False):
         """Raise BarrierMeshError if a generator other than a barrier site lies inside a barrier circle.
 
@@ -1463,7 +1486,7 @@ class VoronoiTessellator:
                 how="left",
             )
         
-        zoned_grid = _edge_cells_to_majority_zone(zoned_grid, zones)
+        zoned_grid = _edge_cells_to_majority_zone(zoned_grid, zones, self._barrier_band(zoned_grid))
         logger.info(f"  -> Zones Assigned: {len(zoned_grid)}")
         
         # Clipping can create MultiPolygons; explode them into single parts

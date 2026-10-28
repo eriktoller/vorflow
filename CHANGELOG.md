@@ -95,7 +95,9 @@ and the project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   estimate as the Gmsh field), and a gap where it asks for more than one cell
   across, between two barriers or a barrier and the boundary, gets no shared
   row of cells: each barrier gets its own faces with `cells_across` cells
-  between them. The points vorflow places along a barrier are not gap
+  between them. A gap that narrows below `min_size` somewhere keeps its
+  shared row all along, since the `GapField` rows could not pass there.
+  The points vorflow places along a barrier are not gap
   walls. Faces too short to build raise `BarrierMeshError` with a `min_size`
   that works.
 - `gap_wall=` on `ConceptualMesh.add_polygon`, `add_line` and `add_point`
@@ -104,18 +106,15 @@ and the project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Changed
 
-- **Behaviour change, also for models without barriers:** a cell whose
-  generator lies on the edge between zones now takes the one of those zones
-  holding most of its area, when it holds at least 0.1 more of the cell than
-  the zone of highest `z_order`. Before, `z_order` alone decided, so a cell
-  at a zone corner, or a lopsided cell next to a barrier close to a zone
-  edge, could take a zone holding as little as 5% of it. Cells about a
-  straight zone edge split about evenly and keep the `z_order` zone. Nodes
-  are unchanged; only the `zone_id` of cells on zone edges can change. In a
-  300 m model with one inner zone and no barriers, 6-13 cells at the zone
-  corners change zone, and the smallest share of a cell in its own zone
-  rises from 0.18 to 0.45. A cell still never takes a zone its generator is
-  not in.
+- Next to a barrier, a cell whose generator lies on the edge between zones
+  now takes the one of those zones holding most of its area (summed over
+  all polygons with that `zone_id`), when it holds at least 0.1 more of the
+  cell than the zone of highest `z_order`. The barrier sites bound such a
+  cell on one side, so `z_order` alone could give it a zone holding as
+  little as 5% of it. Only the cells of the barrier sites and the cells
+  touching them are affected. Everywhere else, and in models without
+  barriers, `z_order` decides as before. A cell still never takes a zone
+  its generator is not in.
 - Barriers (`add_line(..., is_barrier=True)`) are now meshed so that every
   barrier segment is exactly one Voronoi cell face. vorflow cuts each
   barrier into segments and draws a circle around each segment end. It
@@ -132,8 +131,9 @@ and the project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   next to a barrier rose from 0.59 to 0.76, with about 20% fewer cells near
   the barriers. Meshes of models with barriers change: the node positions
   and counts near every barrier differ from 0.3.0. Meshing a model with
-  barriers takes about 1.7 x as long as in 0.3.0 (12.7 s against 7.4 s over
-  23 benchmark cases, 1.5-2.3 x per case).
+  barriers takes about 1.7 x as long as in 0.3.0 over 23 benchmark cases
+  (12.7 s against 7.4 s, 1.5-2.3 x per case) and 2.0 x over 43 held-out
+  cases, up to 5.2 x for one case.
 - **Breaking:** a point feature (or a kept hex-ring seed) on a barrier or
   at its end, closer than about 0.05 x the barrier's `resolution`, now
   raises `BarrierMeshError` naming the point and the barrier. In 0.3.0 it

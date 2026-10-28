@@ -132,6 +132,16 @@ class Network:
     corridors: list = dataclasses.field(default_factory=list)  # see ``corridor``
     collapsed: list = dataclasses.field(default_factory=list)  # acute wedges merged (``wedge``)
 
+    @functools.cached_property
+    def node_pieces(self) -> list:
+        """The pieces at each hard node, in piece order (``pieces`` never changes after construction)."""
+        out = [[] for _ in range(len(self.hard_xy))]
+        for p, (a, b) in enumerate(self.pieces):
+            out[int(a)].append(p)
+            if b != a:
+                out[int(b)].append(p)
+        return out
+
 
 # ---------------------------------------------------------------------------
 # Lines -> nodes and pieces

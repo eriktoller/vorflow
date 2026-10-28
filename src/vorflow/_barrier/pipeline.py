@@ -214,12 +214,18 @@ def repair_bounds(field: SizeField, layout: Layout, bad: list, refine: np.ndarra
 
 
 def network_with_corridors(lines: list, standard: list, domain, features: np.ndarray, size_fn,
-                           sharp_angle: float, skip: set) -> Network:
-    """The barrier network with its corridors (except those in ``skip``) and their chord nodes re-planned."""
+                           sharp_angle: float, skip: set, fixed: list = ()) -> Network:
+    """The barrier network with its corridors (except those in ``skip``) and their chord nodes re-planned.
+
+    No corridor reaches across a standard line or a ``fixed`` line (zone
+    edges, quad-buffer strips): its Gmsh nodes would fall inside the circles.
+    """
     tol = touch_tolerance(domain)
     net = build_network(lines, standard, domain, tol, sharp_angle)
-    net.corridors = corridors.find_corridors(net, size_fn, domain, standard, features, skip)
-    replan_chord_nodes(net, set().union(*[corridors.chord_nodes(c) for c in net.corridors]), domain, standard, tol)
+    net.corridors = corridors.find_corridors(net, size_fn, domain, list(standard) + list(fixed), features, skip)
+    bent = corridors.bent_rungs(net, net.corridors)
+    net.rungs = [r for r in net.rungs if not any(r is b for b in bent)]
+    replan_chord_nodes(net, set().union(*[corridors.chord_nodes(net, c) for c in net.corridors]), domain, standard, tol)
     return net
 
 
@@ -251,7 +257,8 @@ def _repair_loop(lines: list, standard: list, domain, features: np.ndarray, size
     """``plan``'s steps 1-4 with corridor drops and local repair rounds (module docstring)."""
     skip = set()
     tol = touch_tolerance(domain)
-    net = network_with_corridors(lines, standard, domain, features, size_fn, sharp_angle, skip)
+    fixed = [o.geometry.buffer(o.half_width) if o.half_width > 0 else o.geometry for o in obstacles]
+    net = network_with_corridors(lines, standard, domain, features, size_fn, sharp_angle, skip, fixed)
     refine, first, rounds = None, None, 0
     while True:
         field = capped_field(net, size_fn, domain, features, obstacles, refine, tol)
@@ -259,7 +266,7 @@ def _repair_loop(lines: list, standard: list, domain, features: np.ndarray, size
         field = grade_field(net, field, gradation)
         if field.failed:
             skip |= set(field.failed)
-            net = network_with_corridors(lines, standard, domain, features, size_fn, sharp_angle, skip)
+            net = network_with_corridors(lines, standard, domain, features, size_fn, sharp_angle, skip, fixed)
             refine = None
             continue
         check_floor(net, field, origin)
@@ -272,7 +279,7 @@ def _repair_loop(lines: list, standard: list, domain, features: np.ndarray, size
         troubled = _troubled(net, field, bad)
         if troubled:
             skip |= troubled
-            net = network_with_corridors(lines, standard, domain, features, size_fn, sharp_angle, skip)
+            net = network_with_corridors(lines, standard, domain, features, size_fn, sharp_angle, skip, fixed)
             refine = None
             continue
         first = first or len(layout.sites)

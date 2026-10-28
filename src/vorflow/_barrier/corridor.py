@@ -1,12 +1,19 @@
 """Corridors: one row of cells shared across a narrow gap.
 
-Two close, nearly parallel barrier pieces (closer than CORRIDOR_ANGLE, gap
+Two close, nearly parallel barrier strands (closer than CORRIDOR_ANGLE, gap
 below CORRIDOR_WIDTH x the target spacing h0), or a barrier running along a
 straight edge of the domain boundary (closer than HUG_WIDTH x h0), would
 otherwise need faces short enough for a row of pair sites on each side of
 the gap (the barrier and boundary caps of ``sizing``), so a 0.5 lc gap
 gets two rows of cells a quarter lc long. Instead the gap gets one row of
-sites shared by both sides.
+sites shared by both sides. The row keeps the gap open along its length,
+so flow along the gap is modelled, however narrow it is.
+
+A *strand* is a run of pieces joined at kinks (hard nodes with two pieces,
+off the boundary and off every ladder), each within CORRIDOR_ANGLE of M
+and going the same way along it: a digitised or wavy line, or the
+straight middle of a lens. The two strands may be two lines or the two
+legs of one line (a U-turn, a thin loop): see the ends below.
 
 *Geometry.* M is a straight line through the gap: the bisector of the two
 pieces, or the boundary edge itself. Sites sit on M at x = sigma_k.
@@ -24,10 +31,14 @@ the corridor is a forced chord.
 *Marching* (``march``). From the start chord, each next site goes on M (the
 bisector of the current side pieces; the edge for a boundary run) at the
 local spacing L = min(h, CORRIDOR_ASPECT x gap), where the gap of a
-boundary run is twice the distance to the edge (the run is a corridor
-between the barrier and its mirror image). The steps are evened out so
-that the sites straddle the next event (a side vertex or the end)
-symmetrically, and consecutive steps differ by at most MAX_STEP_RATIO. A
+boundary run is the distance to the edge (the edge cuts its cells to that
+width). So the cells are at most
+CORRIDOR_ASPECT times longer than wide, and their number grows smoothly as
+the gap narrows (1 / gap below h / CORRIDOR_ASPECT). The steps are evened
+out so that the sites straddle the next event (a side vertex or the end)
+symmetrically, steps grow or shrink by at most MAX_GROWTH (a target that
+changes faster is followed more slowly) and consecutive steps differ by at
+most MAX_STEP_RATIO. A
 side vertex is a forced chord: the next site is where the circle about the
 vertex through the last site meets the next M, so the perpendicular
 bisector of the two sites passes through the vertex and M bends there.
@@ -51,11 +62,26 @@ bisector of the two sites passes through the vertex and M bends there.
 - mouth: a side ends at a kink (a hard node with two pieces). The pieces go
   on with regular segments from the chord's nodes, whose radii are derived
   from the last site.
+- bend: both sides end at kinks joined by a short path of kinks (at most
+  BEND_REACH x the gap long): the turn of a U, or the end of a thin loop
+  or of a closed lens. The path may pass through the apex of a ladder
+  between two of its pieces (a lens's tapered end); the bend replaces the
+  ladder.
+  Every circle along the path passes through the last site, so each piece
+  of the path has the last site and its mirror image across the piece as
+  its pair: the last cell fills the turn.
+- fork: both sides end at kinks at the same place along M and go on apart
+  (the end of a lens's straight middle). The mirror image of the last site
+  across the line through the two kinks lies on both kinks' circles; it is
+  the site of the first segment of both pieces beyond, each twice as long
+  as the distance to the site's foot.
 
 Anything else (a junction, a well or another line in the gap, a boundary
-corner) gets no corridor. A corridor that cannot be laid out, or whose
-region keeps a defect, is dropped and its barriers get the regular
-construction (``pipeline``).
+corner) gets no corridor; the barriers there get the regular construction,
+with faces capped by the gap (``sizing``), which also keeps the gap open. A
+corridor that cannot be laid out, or whose region keeps a defect, is
+dropped the same way (``pipeline``), and its pieces get no other pair
+corridor.
 """
 from __future__ import annotations
 
@@ -69,13 +95,15 @@ from shapely.geometry import LineString, Point, Polygon
 CORRIDOR_ANGLE = math.radians(12.0)
 CORRIDOR_WIDTH = 1.2     # x h0: two barrier pieces closer than this share a corridor
 HUG_WIDTH = 0.6          # x h0: a barrier closer than this to a boundary edge runs along it
-CORRIDOR_ASPECT = 1.5    # strip length <= this x the gap
+CORRIDOR_ASPECT = 3.0    # strip length <= this x the gap (cells at most 3:1; see design note 08)
 CORRIDOR_FOOT = 0.2      # a site keeps this fraction of its strip from both chords
 MIN_OVERLAP = 2.0        # x h0: shorter facing stretches get no corridor
 ALIGN_FRACTION = 0.25    # x L: two free ends this close along M end the corridor together
 STAGGER_TILT = math.radians(10.0)
 EDGE_MARGIN = 1.0        # x h0: a boundary run keeps this far from the ends of its edge
 COLLINEAR_FRACTION = 1e-9  # x piece length: pieces this close to one line are collinear, not a corridor
+BEND_REACH = 3.0         # x gap: the longest path of kinks that joins two sides' ends as a bend (a U-turn)
+MAX_STRAND = 10000       # pieces in a strand or a bend at most
 
 
 @dataclasses.dataclass
@@ -104,6 +132,10 @@ class Corridor:
     end_nodes: tuple
     region: Polygon
     key: tuple
+    gap: float = 0.0          # the narrowest gap (a boundary run: twice its distance to the edge)
+    paths: tuple = ((), ())   # per end: the pieces of a bend from one side's end to the other's
+    forks: tuple = ((), ())   # per end: the piece each side goes on into past a fork
+    span: tuple | None = None  # (lo, hi) along M of the sides' stretch laid out by the corridor (default x0, x1)
 
 
 @dataclasses.dataclass
@@ -179,18 +211,26 @@ def _node_kind(net, v: int, degree: np.ndarray, rung_nodes: set) -> str:
     return {1: "free", 2: "kink"}.get(int(degree[v]), "other")
 
 
+def _nearest_on(a: np.ndarray, b: np.ndarray, p: np.ndarray) -> np.ndarray:
+    """The point of segment a-b nearest to ``p``."""
+    d = b - a
+    return a + float(np.clip((p - a) @ d / (d @ d), 0.0, 1.0)) * d
+
+
 def _bisector(a0: np.ndarray, a1: np.ndarray, b0: np.ndarray, b1: np.ndarray) -> tuple:
     """(origin, m): the line midway between the lines through pieces a0-a1 and b0-b1, m oriented like a1 - a0.
 
-    The normals are oriented towards the other piece's midpoint, so pieces
-    that meet (a ladder's legs) work too. Collinear pieces have no
+    Each normal is oriented from the piece's midpoint towards the nearest
+    point of the other piece, so a short piece of a wavy strand facing a
+    long one, and pieces that meet, work too. Collinear pieces have no
     bisector; their common line is returned (callers reject such pairs).
     """
     ua, ub = _unit(a1 - a0), _unit(b1 - b0)
+    mid_a, mid_b = 0.5 * (a0 + a1), 0.5 * (b0 + b1)
     na = _rot90(ua)
-    na = na if na @ (0.5 * (b0 + b1) - a0) > 0 else -na
+    na = na if na @ (_nearest_on(b0, b1, mid_a) - mid_a) > 0 else -na
     nb = _rot90(ub)
-    nb = nb if nb @ (0.5 * (a0 + a1) - b0) > 0 else -nb
+    nb = nb if nb @ (_nearest_on(a0, a1, mid_b) - mid_b) > 0 else -nb
     k = na - nb
     if k @ k <= COLLINEAR_FRACTION ** 2:
         return a0.copy(), ua
@@ -215,7 +255,8 @@ def _oriented(net, p: int, m: np.ndarray) -> SidePiece:
 
 @dataclasses.dataclass
 class Obstacles:
-    """Everything a corridor's gap must be free of: barrier pieces (first), standard lines and feature nodes."""
+    """Everything a corridor's gap must be free of: barrier pieces (first), standard and fixed lines (zone
+    edges, quad-buffer strips) and feature nodes."""
     geoms: list
     tree: shapely.STRtree
 
@@ -245,12 +286,127 @@ def _end_kind(kinds: list, aligned: bool, boundary_chord: bool) -> str | None:
             return "tip"
         if kinds == ["boundary", "boundary"] and boundary_chord:
             return "boundary"
+        if kinds == ["kink", "kink"]:
+            return "fork"
         return None
     return {"free": "stagger", "kink": "mouth"}.get(kinds[0])
 
 
-def _pair_corridor(net, pa: int, pb: int, size_fn, domain, obstacles: Obstacles, degree, rung_nodes) -> Corridor | None:
-    """The corridor between pieces ``pa`` and ``pb``, or None when they do not make one."""
+def _other_piece(net, v: int, p: int) -> int:
+    """The piece at kink ``v`` other than ``p``."""
+    return next(int(q) for q in np.flatnonzero((net.pieces == v).any(axis=1)) if q != p)
+
+
+def _far_node(net, p: int, v: int) -> int:
+    """The node of piece ``p`` other than ``v``."""
+    a, b = (int(x) for x in net.pieces[p])
+    return b if a == v else a
+
+
+def _joinable(net, v: int, degree: np.ndarray, rung_nodes: set) -> bool:
+    """True when a strand may go on through hard node ``v``: a kink off the boundary and off every ladder."""
+    return int(degree[v]) == 2 and v not in rung_nodes and not net.plans[v].on_boundary
+
+
+def _strand(net, p: int, m: np.ndarray, degree: np.ndarray, rung_nodes: set, rung_pieces: set,
+            blocked: set) -> list:
+    """Piece ``p`` and the pieces it runs on into through kinks, each within CORRIDOR_ANGLE of ``m`` and going
+    the same way along it, as SidePieces in order along ``m`` (none with a node in ``blocked``)."""
+    cos_max = math.cos(CORRIDOR_ANGLE)
+    out = [_oriented(net, p, m)]
+    seen = {p}
+    for forward in (True, False):
+        while len(out) <= MAX_STRAND:
+            v = out[-1].end if forward else out[0].start
+            if not _joinable(net, v, degree, rung_nodes):
+                break
+            q = _other_piece(net, v, out[-1].piece if forward else out[0].piece)
+            w = _far_node(net, q, v)
+            step = net.hard_xy[w] - net.hard_xy[v]
+            along = float(step @ m) / float(np.hypot(*step))
+            if q in seen or q in rung_pieces or w in blocked or (along if forward else -along) < cos_max:
+                break
+            seen.add(q)
+            sp = SidePiece(q, v, w) if forward else SidePiece(q, w, v)
+            out = out + [sp] if forward else [sp] + out
+    return out
+
+
+def _trim(net, side: list, probe, x0: float, x1: float) -> list:
+    """The pieces of ``side`` whose stretch along M overlaps (x0, x1)."""
+    out = []
+    for sp in side:
+        a, b = (float(x) for x in proj(probe, np.array(_piece_xy(net, sp))))
+        if b > x0 and a < x1:
+            out.append(sp)
+    return out
+
+
+def _side_line(net, probe, side: list, x0: float, x1: float) -> list:
+    """Points of ``side`` from x0 to x1 along M: where the chords there meet it, and its vertices between."""
+    pts = [side_point(net, probe, side, x0)[2]]
+    for sp in side[:-1]:
+        x = float(proj(probe, net.hard_xy[sp.end]))
+        if x0 < x < x1:
+            pts.append(net.hard_xy[sp.end])
+    return pts + [side_point(net, probe, side, x1)[2]]
+
+
+def _bend_path(net, a: int, pa: int, b: int, reach: float, degree: np.ndarray, rung_nodes: set,
+               apexes: set = frozenset()) -> list | None:
+    """Pieces of the short path of kinks from ``a`` (leaving piece ``pa``) to ``b``, at most ``reach`` long.
+
+    The path may pass through the apex of a ladder between two of its
+    pieces (``apexes``: the tapered end of a lens); the bend replaces it.
+    """
+    path, v, p, length = [], a, pa, 0.0
+    while len(path) < MAX_STRAND:
+        q = _other_piece(net, v, p)
+        w = _far_node(net, q, v)
+        length += float(np.hypot(*(net.hard_xy[w] - net.hard_xy[v])))
+        if q in path or length > reach:
+            return None
+        path.append(q)
+        if w == b:
+            return path
+        apex = w in apexes and int(degree[w]) == 2 and not net.plans[w].on_boundary
+        if not (_joinable(net, w, degree, rung_nodes) or apex):
+            return None
+        v, p = w, q
+    return None
+
+
+def _pair_end(net, probe, sides: list, end: int, x: float, gap: float, h0: float, domain, degree: np.ndarray,
+              rung_nodes: set, rung_pieces: set = frozenset(), apexes: set = frozenset()) -> tuple | None:
+    """(kind, ending nodes, x, bend path, fork pieces) of a pair corridor's end ``end`` at ``x``, or None."""
+    xy = net.hard_xy
+    nodes = [side[0].start if end == 0 else side[-1].end for side in sides]
+    pieces = [side[0].piece if end == 0 else side[-1].piece for side in sides]
+    kinds = [_node_kind(net, v, degree, rung_nodes) for v in nodes]
+    if kinds == ["kink", "kink"]:
+        path = _bend_path(net, nodes[0], pieces[0], nodes[1], BEND_REACH * gap, degree, rung_nodes, apexes)
+        if path is not None:
+            return "bend", nodes, float(proj(probe, xy[nodes]).mean()), path, ()
+    nodes_x = proj(probe, xy[nodes])
+    aligned = abs(float(nodes_x[0] - nodes_x[1])) <= ALIGN_FRACTION * min(h0, CORRIDOR_ASPECT * gap)
+    ending = nodes if aligned else [nodes[int(np.argmin(np.abs(nodes_x - x)))]]
+    kinds = [_node_kind(net, v, degree, rung_nodes) for v in ending]
+    chord = LineString(xy[nodes])
+    kind = _end_kind(kinds, aligned, aligned and domain.boundary.buffer(1e-6 * chord.length).covers(chord))
+    if kind is None:
+        return None
+    along = proj(probe, xy[ending])
+    if kind == "tip":
+        return kind, ending, float(along.max() if end == 0 else along.min()), (), ()
+    forks = tuple(_other_piece(net, v, p) for v, p in zip(nodes, pieces)) if kind == "fork" else ()
+    if set(forks) & rung_pieces:
+        return None
+    return kind, ending, float(along.mean()), (), forks
+
+
+def _pair_corridor(net, pa: int, pb: int, size_fn, domain, obstacles: Obstacles, degree, rung_nodes,
+                   rung_pieces: set, used: set) -> Corridor | None:
+    """The corridor between the strands through pieces ``pa`` and ``pb``, or None when they do not make one."""
     xy = net.hard_xy
     A0, A1 = xy[net.pieces[pa]]
     B0, B1 = xy[net.pieces[pb]]
@@ -262,43 +418,66 @@ def _pair_corridor(net, pa: int, pb: int, size_fn, domain, obstacles: Obstacles,
     if LineString([A0, A1]).intersects(LineString([B0, B1])) or collinear(A0, A1, B0, B1):
         return None
     origin, m = _bisector(A0, A1, B0, B1)
-    sa, sb = _oriented(net, pa, m), _oriented(net, pb, m)
-    probe = Corridor(origin, m, [[sa], [sb]], 0.0, 0.0, (), (), Polygon(), (pa, pb))
-    xa = proj(probe, xy[[sa.start, sa.end]])
-    xb = proj(probe, xy[[sb.start, sb.end]])
+    side_a = _strand(net, pa, m, degree, rung_nodes, rung_pieces | used, set())
+    nodes_a = {v for sp in side_a for v in (sp.start, sp.end)}
+    side_b = _strand(net, pb, m, degree, rung_nodes, rung_pieces | used, nodes_a)
+    probe = Corridor(origin, m, [side_a, side_b], 0.0, 0.0, (), (), Polygon(), (pa, pb))
+    xa = proj(probe, xy[[side_a[0].start, side_a[-1].end]])
+    xb = proj(probe, xy[[side_b[0].start, side_b[-1].end]])
     x0, x1 = max(xa[0], xb[0]), min(xa[1], xb[1])
     if x1 <= x0:
         return None
-    pts = [side_point(net, probe, s, x)[2] for s, x in (([sa], x0), ([sa], x1), ([sb], x1), ([sb], x0))]
-    region = Polygon(pts)
-    h0 = min(float(net.piece_lc[pa]), float(net.piece_lc[pb]),
-             float(size_fn(np.array(region.centroid.coords))[0]))
-    gaps = [width(net, probe, x0), width(net, probe, x1)]
+    sides = [_trim(net, side_a, probe, x0, x1), _trim(net, side_b, probe, x0, x1)]
+    probe.sides = sides
+    lines = [_side_line(net, probe, side, x0, x1) for side in sides]
+    if LineString(lines[0]).intersects(LineString(lines[1])):
+        return None
+    region = Polygon(lines[0] + lines[1][::-1])
+    if not region.is_valid:
+        return None
+    pieces = [sp.piece for side in sides for sp in side]
+    h0 = min(float(net.piece_lc[pieces].min()), float(size_fn(np.array(region.centroid.coords))[0]))
+    xs = [x0, x1] + [float(x) for side in sides for sp in side for x in proj(probe, xy[[sp.start, sp.end]])
+                     if x0 < x < x1]
+    gaps = [width(net, probe, x) for x in xs]
     if x1 - x0 < MIN_OVERLAP * h0 or max(gaps) > CORRIDOR_WIDTH * h0:
         return None
-    if not _clear(region, obstacles, {pa, pb}, domain):
+    if not _clear(region, obstacles, set(pieces), domain):
         return None
-    ends, end_nodes, xs = [], [], []
-    for x, nodes_x, nodes in ((x0, (xa[0], xb[0]), (sa.start, sb.start)), (x1, (xa[1], xb[1]), (sa.end, sb.end))):
-        align = ALIGN_FRACTION * min(h0, CORRIDOR_ASPECT * min(gaps))
-        aligned = abs(nodes_x[0] - nodes_x[1]) <= align
-        ending = list(nodes) if aligned else [nodes[int(np.argmin(np.abs(np.array(nodes_x) - x)))]]
-        kinds = [_node_kind(net, v, degree, rung_nodes) for v in ending]
-        chord = LineString(xy[list(nodes)])
-        kind = _end_kind(kinds, aligned, aligned and domain.boundary.buffer(1e-6 * chord.length).covers(chord))
-        if kind is None:
-            return None
-        ends.append(kind)
-        end_nodes.append(ending)
-        along = proj(probe, xy[ending])
-        xs.append(float(along.max() if x == x0 else along.min()) if kind == "tip" else float(along.mean()))
-    probe.x0, probe.x1 = xs
-    probe.ends, probe.end_nodes, probe.region = tuple(ends), tuple(end_nodes), region
+    apexes = {int(r.nodes[0]) for r in net.rungs if r.t0 == 0}
+    ends = [_pair_end(net, probe, sides, end, x, min(gaps), h0, domain, degree, rung_nodes, rung_pieces, apexes)
+            for end, x in ((0, x0), (1, x1))]
+    if None in ends:
+        return None
+    if ends[0][0] == ends[1][0] == "bend" and set(ends[0][3]) & set(ends[1][3]):
+        return None
+    probe.ends = tuple(e[0] for e in ends)
+    probe.end_nodes = tuple(e[1] for e in ends)
+    probe.x0, probe.x1 = ends[0][2], ends[1][2]
+    probe.region, probe.gap = region, float(min(gaps))
+    whole = ("tip", "boundary", "bend", "fork")  # both sides run to their end nodes
+    lo = [float(proj(probe, xy[sides[k][0].start])) for k in (0, 1)] if probe.ends[0] in whole else [x0]
+    hi = [float(proj(probe, xy[sides[k][-1].end])) for k in (0, 1)] if probe.ends[1] in whole else [x1]
+    probe.span = (min(lo + [x0]), max(hi + [x1]))
+    probe.paths = tuple(e[3] for e in ends)
+    probe.forks = tuple(e[4] for e in ends)
+    probe.key = tuple(sorted(members(probe)))
     return probe
 
 
+def members(c: Corridor) -> set:
+    """Every piece a corridor lays out: its sides, the pieces of its bends and the first pieces past its forks."""
+    return {sp.piece for side in c.sides for sp in side} | {p for path in c.paths for p in path} | \
+        {p for fork in c.forks for p in fork}
+
+
+def _banned(skip: set) -> set:
+    """Pieces of the pair corridors in ``skip`` (dropped corridors): no other pair corridor may use them."""
+    return {int(p) for key in skip if key[:1] != ("boundary",) for p in key}
+
+
 def pair_corridors(net, size_fn, domain, standard: list, features: np.ndarray, skip: set) -> list:
-    """Corridors between two close, nearly parallel barrier pieces (each piece in one corridor at most)."""
+    """Corridors between two close, nearly parallel barrier strands (each piece in one corridor at most)."""
     degree = _degree(net)
     rung_nodes = {int(v) for r in net.rungs for v in r.nodes}
     rung_pieces = {int(p) for r in net.rungs for p in r.pieces}
@@ -314,17 +493,16 @@ def pair_corridors(net, size_fn, domain, standard: list, features: np.ndarray, s
             pb = int(pb)
             if pb <= pa or pb in rung_pieces or set(net.pieces[pa]) & set(net.pieces[pb]):
                 continue
-            if (pa, pb) in skip:
-                continue
             candidates.append((line.distance(lines[pb]), pa, pb))
-    used, out = set(), []
+    used, out = set(_banned(skip)), []
     for _, pa, pb in sorted(candidates):
         if pa in used or pb in used:
             continue
-        c = _pair_corridor(net, pa, pb, size_fn, domain, obstacles, degree, rung_nodes)
-        if c is not None:
-            out.append(c)
-            used.update((pa, pb))
+        c = _pair_corridor(net, pa, pb, size_fn, domain, obstacles, degree, rung_nodes, rung_pieces, used)
+        if c is None or members(c) & used:
+            continue
+        out.append(c)
+        used |= members(c)
     return out
 
 
@@ -440,6 +618,7 @@ def _run(net, chain: list, e0: np.ndarray, e1: np.ndarray, degree, rung_nodes, h
     pts = [xy[sp.start] for sp in sides] + [xy[sides[-1].end]]
     feet = [e0 + float((p - e0) @ m) * m for p in pts]
     c.region = Polygon(pts + feet[::-1])
+    c.gap = min(float(np.hypot(*(p - f))) for p, f in zip(pts, feet))
     return c
 
 
@@ -450,22 +629,33 @@ def find_corridors(net, size_fn, domain, standard: list, features: np.ndarray, s
     return pairs + boundary_runs(net, size_fn, domain, standard, features, skip, used)
 
 
-def chord_nodes(c: Corridor) -> set:
+def bent_rungs(net, corridors: list) -> list:
+    """The ladders of ``net`` whose two legs lie on the bend of a corridor (the bend replaces them)."""
+    bent = {p for c in corridors for path in c.paths for p in path}
+    return [r for r in net.rungs if r.t0 == 0 and set(int(p) for p in r.pieces) <= bent]
+
+
+def chord_nodes(net, c: Corridor) -> set:
     """Hard nodes on an end chord of ``c`` (except free tips), whose radius the corridor sets.
 
     The side vertices the corridor passes are handled in ``sites`` (a hard
-    node whose segments all have explicit sites gets no sites of its own).
+    node whose segments all have explicit sites gets no sites of its own);
+    the kinks along a bend are chord nodes too.
     """
-    return {int(v) for kind, nodes in zip(c.ends, c.end_nodes) if kind != "tip" for v in nodes}
+    out = {int(v) for kind, nodes in zip(c.ends, c.end_nodes) if kind != "tip" for v in nodes}
+    return out | {int(v) for path in c.paths for p in path for v in net.pieces[p]}
 
 
 def contains(c: Corridor, piece: int, xy: np.ndarray) -> np.ndarray:
-    """Mask of the samples ``xy`` of ``piece`` that lie in the corridor's stretch."""
+    """Mask of the samples ``xy`` of ``piece`` that lie in the corridor's stretch (all of a bend's)."""
+    if any(piece in path for path in c.paths):
+        return np.ones(len(xy), dtype=bool)
     if all(sp.piece != piece for side in c.sides for sp in side):
         return np.zeros(len(xy), dtype=bool)
     x = proj(c, xy)
-    tol = 1e-9 * max(1.0, abs(c.x1 - c.x0))
-    return (x >= c.x0 - tol) & (x <= c.x1 + tol)
+    lo, hi = c.span if c.span is not None else (c.x0, c.x1)
+    tol = 1e-9 * max(1.0, abs(hi - lo))
+    return (x >= lo - tol) & (x <= hi + tol)
 
 
 # ---------------------------------------------------------------------------
@@ -513,7 +703,7 @@ def _gap_and_h(c: Corridor, net, field, idx: list, point: np.ndarray, m: np.ndar
         p0, p1 = _piece_xy(net, sp)
         feet.append(p0 + t / _length(net, sp) * (p1 - p0))
         hs.append(_h_at(net, field, sp, t))
-    gap = np.hypot(*(feet[0] - feet[1])) if len(feet) == 2 else 2.0 * np.hypot(*(feet[0] - point))
+    gap = np.hypot(*(feet[0] - feet[1])) if len(feet) == 2 else np.hypot(*(feet[0] - point))
     return float(gap), min(hs)
 
 
@@ -621,7 +811,7 @@ class _March:
         if target <= x0:
             return False
         spacing = self.spacing(o + x0 * m, m)
-        count = max(1, int(round((target - x0) / spacing)))
+        count = max(1, math.ceil((target - x0) / spacing - 1e-9))
         self.sites.append(o + (x0 + 0.5 * (target - x0) / count) * m)
         return True
 
@@ -638,11 +828,13 @@ class _March:
         events = [(float((v - o) @ m), k, v) for k, v in self.vertices()]
         events.append((end, None, None))
         p, k, v = min(events, key=lambda e: e[0])
-        count = max(1, int(round((p - s) / spacing + 0.5)))
+        count = max(1, math.ceil((p - s) / spacing + 0.5 - 1e-9))  # steps of at most the spacing
         previous = self.last_step()
-        if previous is not None:  # grow by at most MAX_GROWTH per step
+        if previous is not None:  # grow, or shrink, by at most MAX_GROWTH per step
             while (p - s) / max(count - 0.5, 0.5) > MAX_GROWTH * previous and count < MAX_STRIPS:
                 count += 1
+            while count > 1 and (p - s) / (count - 0.5) < previous / MAX_GROWTH:
+                count -= 1
         if k is None and count <= 1:
             return "done"
         if k is not None and count <= 1:
@@ -709,7 +901,7 @@ class _March:
 
 
 MAX_STEP_RATIO = 2.5    # consecutive site spacings differ by at most this factor
-MAX_GROWTH = 1.5        # the march lengthens its steps by at most this factor
+MAX_GROWTH = 1.5        # the march lengthens or shortens its steps by at most this factor
 MAX_STRIPS = 5000
 
 
@@ -810,4 +1002,31 @@ def lay_out(c: Corridor, net, field, aspect: float = CORRIDOR_ASPECT) -> Corrido
                 nodes.append(new)
                 seg_sites.append(tip)
         runs += _runs_of_side(net, side, nodes, seg_sites)
+    for end in (0, 1):
+        sigma = sites[0] if end == 0 else sites[-1]
+        if c.ends[end] == "bend":
+            runs += [(p, np.array([0.0, float(np.hypot(*np.subtract(*net.hard_xy[net.pieces[p]])))]), [sigma])
+                     for p in c.paths[end]]
+        if c.ends[end] == "fork":
+            fork = _fork_runs(c, net, end, sigma)
+            if fork is None:
+                return None
+            runs += fork
     return CorridorLayout(runs, [])
+
+
+def _fork_runs(c: Corridor, net, end: int, sigma: np.ndarray) -> list | None:
+    """Runs of the first segment of each piece past a fork: its site is the mirror of the end site ``sigma``
+    across the line through the two ending kinks, and the segment is twice the distance to that site's foot."""
+    a, b = (net.hard_xy[v] for v in c.end_nodes[end])
+    beyond = _reflect(sigma, a, b)
+    out = []
+    for v, p in zip(c.end_nodes[end], c.forks[end]):
+        far = _far_node(net, p, v)
+        length = float(np.hypot(*(net.hard_xy[far] - net.hard_xy[v])))
+        foot = float((beyond - net.hard_xy[v]) @ _unit(net.hard_xy[far] - net.hard_xy[v]))
+        if foot <= 0 or 2 * foot > length - CORRIDOR_FOOT * foot:
+            return None
+        t = np.array([0.0, 2 * foot]) if v == net.pieces[p][0] else np.array([length - 2 * foot, length])
+        out.append((p, t, [beyond]))
+    return out

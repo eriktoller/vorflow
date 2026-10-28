@@ -889,28 +889,29 @@ class MeshGenerator:
             because a barrier is too close), ``fixed_nodes`` (per standard
             line, zone edge or quad-buffer strip, the ``nodes`` that had to
             be removed inside the circles), ``corridors`` (narrow gaps given
-            one shared row of cells: ``kind`` "barriers" between two close
-            parallel barriers or "boundary" along a boundary edge,
-            ``line_ids``, ``length``, ``cells`` in its row, ``resolution``;
-            a row of cells shorter than 0.5 x resolution raises one
-            UserWarning), ``merged`` (stretches of two barriers closer than
-            0.25 x resolution moved onto their midline, which carries the
-            faces of both: ``line_ids``, ``gap``, ``length``,
-            ``deviation``, the largest move, at most 0.125 x resolution;
-            give the HFB on those faces the combined properties of both
-            barriers), ``collapsed`` (barrier legs meeting
-            at less than ``sharp_angle``, or fans of legs closer than 29
-            degrees, merged over a short reach: ``kind`` "junction" or
-            "boundary", ``line_ids``, ``angle``, ``reach``, ``deviation``,
-            the largest move of a line, at most 0.1 x its resolution), plus
+            one shared row of cells, at most 3 x the gap long, so flow
+            along the gap is kept: ``kind`` "barriers" between two close,
+            nearly parallel barriers (separate lines, or the legs of one
+            line: a U-turn, a thin loop) or "boundary" along a boundary
+            edge, ``line_ids``, ``length``, ``gap`` (the narrowest; for
+            "boundary" the distance to the edge),
+            ``ends`` (how each end closes: "tip", "stagger", "mouth",
+            "boundary", "bend" or "fork"), ``cells`` in its row,
+            ``resolution``; rows of cells shorter than 0.5 x resolution
+            raise one UserWarning with their cell count), ``collapsed``
+            (barrier legs meeting at less than ``sharp_angle``, or fans of
+            legs closer than 29 degrees, merged over a short reach: ``kind``
+            "junction" or "boundary", ``line_ids``, ``angle``, ``reach``,
+            ``deviation``, the largest move of a line, at most 0.1 x its
+            resolution), plus
             ``repair_rounds``, ``sites``, ``removed_nodes`` (Gmsh nodes
             removed for the sites, not counting Gmsh's copies of the sites)
             and ``polish`` (``iterations``, ``residual``, ``rejected``,
             short faces before and after, and ``moved``, the nodes it
-            moved). Merged stretches, merged wedges, tips, stubs, snapped
-            ends and fixed-line nodes each raise one UserWarning with their
-            count. When the cleaning dropped every barrier, the report holds
-            only what it dropped.
+            moved). Merged wedges, tips, stubs, snapped ends and fixed-line
+            nodes each raise one UserWarning with their count. When the
+            cleaning dropped every barrier, the report holds only what it
+            dropped.
         barrier_lines (GeoDataFrame): The lines the barrier faces follow
             (after stubs and sharp tips are removed and narrow junctions
             merged; a stretch the faces of several lines share is part of

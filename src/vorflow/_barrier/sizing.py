@@ -261,10 +261,9 @@ def _corridor_masks(net: Network, field: SizeField) -> list:
     out = []
     for c in net.corridors:
         inside = np.zeros(len(field.s), dtype=bool)
-        for side in c.sides:
-            for sp in side:
-                sel = np.flatnonzero(field.piece == sp.piece)
-                inside[sel] = corridors.contains(c, sp.piece, field.xy[sel])
+        for p in [sp.piece for side in c.sides for sp in side] + [p for path in c.paths for p in path]:
+            sel = np.flatnonzero(field.piece == p)
+            inside[sel] = corridors.contains(c, p, field.xy[sel])
         out.append(inside)
     return out
 

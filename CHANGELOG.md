@@ -90,22 +90,32 @@ and the project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   local size, no field is created and the mesh is unchanged. `min_size` (in
   model units, default 0.1 x `background_lc`) floors the size, with a warning
   that names each place where it leaves fewer than `cells_across` cells.
-  `MeshGenerator.diagnostics["gap_field"]` summarises the estimate.
+  `MeshGenerator.diagnostics["gap_field"]` summarises the estimate. With
+  barriers, the barrier faces follow the `GapField` sizes (read from the same
+  estimate as the Gmsh field), and a gap where it asks for more than one cell
+  across, between two barriers or a barrier and the boundary, gets no shared
+  row of cells: each barrier gets its own faces with `cells_across` cells
+  between them. The points vorflow places along a barrier are not gap
+  walls. Faces too short to build raise `BarrierMeshError` with a `min_size`
+  that works.
 - `gap_wall=` on `ConceptualMesh.add_polygon`, `add_line` and `add_point`
   (default True): with `gap_wall=False` the feature is never a side of a gap
   for `GapField`, e.g. a boundary-condition line just inside the domain edge.
 
 ### Changed
 
-- A cell whose generator lies on the edge between zones now takes the one
-  of those zones holding most of its area, when it holds at least 0.1 more of
-  the cell than the zone of highest `z_order`. Before, `z_order` alone
-  decided, so a cell at a zone corner, or a lopsided cell next to a barrier
-  close to a zone edge, could take a zone holding as little as 5% of it.
-  Cells about a straight zone edge split about evenly and keep the `z_order`
-  zone, so grids without barriers change only at zone corners (6-13 cells in
-  a 300 m model with one inner zone). A cell still never takes a zone its
-  generator is not in.
+- **Behaviour change, also for models without barriers:** a cell whose
+  generator lies on the edge between zones now takes the one of those zones
+  holding most of its area, when it holds at least 0.1 more of the cell than
+  the zone of highest `z_order`. Before, `z_order` alone decided, so a cell
+  at a zone corner, or a lopsided cell next to a barrier close to a zone
+  edge, could take a zone holding as little as 5% of it. Cells about a
+  straight zone edge split about evenly and keep the `z_order` zone. Nodes
+  are unchanged; only the `zone_id` of cells on zone edges can change. In a
+  300 m model with one inner zone and no barriers, 6-13 cells at the zone
+  corners change zone, and the smallest share of a cell in its own zone
+  rises from 0.18 to 0.45. A cell still never takes a zone its generator is
+  not in.
 - Barriers (`add_line(..., is_barrier=True)`) are now meshed so that every
   barrier segment is exactly one Voronoi cell face. vorflow cuts each
   barrier into segments and draws a circle around each segment end. It

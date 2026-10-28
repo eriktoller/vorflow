@@ -131,9 +131,10 @@ def fold_tolerance(net: Network, points: np.ndarray) -> float | None:
     return None if best is None else round_up(FOLD_MARGIN * best)
 
 
-def advice(cause: str, h: float, fold: float | None = None) -> str:
+def advice(cause: str, h: float, fold: float | None = None, lc: float | None = None) -> str:
     """What makes the faces there possible, for a face length ``h`` set by ``cause`` (``sizing.CAUSES``);
-    ``fold`` is the simplify_tolerance that removes a short fold there (``fold_tolerance``)."""
+    ``fold`` is the simplify_tolerance that removes a short fold there (``fold_tolerance``), ``lc`` the
+    barrier resolution there."""
     finer = (f"a barrier resolution of {round_down(FINER_MARGIN * h / MIN_H_FRACTION):.3g} or finer there"
              if h > 0 else "a finer barrier resolution there")
     remedy = (f"If that is digitising noise, simplify_tolerance of at least {fold:.3g} on the barrier removes it; "
@@ -155,6 +156,11 @@ def advice(cause: str, h: float, fold: float | None = None) -> str:
         "merge": "merging a narrow junction or boundary exit there (MeshGenerator.barrier_report['collapsed']) "
                  f"left barrier pieces that short; the input is not at fault. Until that is fixed, "
                  f"{QUAD_BUFFER_ADVICE}; please report the case",
+        "gap field": "the GapField (MeshGenerator(gap_field=...)) asks for cells that small in the gap there "
+                     "(gap / cells_across, but not below its min_size). "
+                     + (f"Set GapField(min_size={round_up(MIN_H_FRACTION * lc / FINER_MARGIN):.3g}) or larger, "
+                        if lc else "Set a larger GapField min_size, ")
+                     + "or leave gap_field out",
         "size field": "the size field is that fine there (a finer zone, line or point next to the barrier). Use a "
                       "barrier resolution closer to it",
     }.get(cause, "barrier legs meet or fold back there at angles too narrow for cells between them (a narrow "
@@ -236,7 +242,8 @@ def check_floor(net: Network, field: SizeField, origin: np.ndarray, drawn: set =
         if cause == "short piece" and drawn and not {tuple(net.hard_xy[v]) for v in net.pieces[field.piece[k]]} <= drawn:
             cause = "merge"
         _fail(f"the faces would have to be {field.h[k]:.3g} long ({field.h[k] / lc[k]:.2g} x lc), because "
-              f"{advice(cause, field.h[k], fold_tolerance(net, field.xy[[k]]))}", field.xy[tiny], origin)
+              f"{advice(cause, field.h[k], fold_tolerance(net, field.xy[[k]]), float(lc[k]))}", field.xy[tiny],
+              origin)
 
 
 def repair_bounds(field: SizeField, layout: Layout, bad: list, refine: np.ndarray | None) -> np.ndarray:

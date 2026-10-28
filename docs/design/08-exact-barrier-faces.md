@@ -138,6 +138,24 @@ each cell the row has beyond the resolution. Rows of cells shorter than
 resolution alone would give, and `barrier_report["corridors"]` lists each
 corridor with its gap, its ends and its cells.
 
+**GapField** (`MeshGenerator(gap_field=...)`, from #76). The GapField
+estimate is made once, on the clean frames, before the barriers are planned.
+The barrier sizing reads its sizes at each sample (`sizing.GapSizes`, from
+`GapEstimate.sizes_at`), and Gmsh gets a field built from the same estimate,
+so the faces and circles match the mesh around them and no Gmsh node is
+removed for them. Where GapField asks for more than one cell across a gap
+between two barriers, or between a barrier and the boundary, there is no
+corridor (`corridor.gap_field_wins`): each barrier gets its own faces, at
+most the GapField size there, with GapField's rows of cells between them.
+Where it asks for less, the corridor stays, its cells no longer than the
+GapField size. The barrier sites are not gap walls, so a lone barrier is no
+gap. With `GapField(min_size=0.2)` at `resolution` 8 and `background_lc` 20,
+pairs 1.6 m and 4 m apart, a barrier 4 m from a river and a barrier 2 m from
+the boundary get at least 3 cells across (7178, 3008, 3081 and 3883 cells;
+develop with #76: 8273, 3405, 3245 and 4284, with mirrored generators and
+cut cells). Faces that GapField would make shorter than 0.02 x `resolution`
+raise `BarrierMeshError` with a `min_size` that works.
+
 **Repair and error** (`pipeline.py`). Where the check fails, the faces are
 halved locally. If the construction is still invalid after a few rounds, or
 the faces would have to be shorter than 0.02 x `resolution`, the plan raises
@@ -239,6 +257,9 @@ and 0.45 s.
   merged junctions and dense corridors each raise one `UserWarning` with
   their count.
 - `vorflow.BarrierMeshError(ValueError)`.
+- `MeshGenerator(gap_field=GapField(...))` (#76) is honoured by the barrier
+  construction; `GapField.create` reuses an estimate already in its
+  `tags_dict`.
 - `add_line(straddle_width=...)` is deprecated with a `FutureWarning`, and
   its value is ignored. The internal `vorflow._straddle` module was removed.
 
@@ -372,6 +393,7 @@ barrier.
   the faces must stay within the reported deviation of the line.
 - When this note was written the full suite gave 664 passed and 2 xfailed;
   after the first review fixes it gave 769 passed and 2 xfailed, and after
-  the second, merged with develop up to #76, 897 passed, 2 skipped and 2 xfailed.
+  the second, merged with develop up to #76 and with GapField honoured, 905 passed, 2 skipped and 2
+  xfailed.
 - `examples/barrier_meshing.ipynb` shows the cases that used to be cut, the
   report and the remaining limits.

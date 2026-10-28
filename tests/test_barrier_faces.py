@@ -12,6 +12,7 @@ boundary, scale); ``REGRESSION_CASES`` are the held-out and stress shapes of
 the barrier benchmark.
 """
 import math
+import re
 import warnings
 
 import numpy as np
@@ -22,7 +23,7 @@ from shapely import affinity
 from shapely.geometry import LineString, Point, box
 
 import vorflow
-from vorflow import ConceptualMesh, MeshGenerator, VoronoiTessellator
+from vorflow import ConceptualMesh, GapField, MeshGenerator, VoronoiTessellator
 from vorflow.utils import build_connectivity
 
 pytestmark = pytest.mark.slow  # gmsh-heavy end-to-end tests
@@ -922,6 +923,83 @@ def test_relay_ramp_to_the_boundary_stays_connected():
     _assert_exact(mg, vt, grid)
     assert not _sealed(mg, grid, (60, 200), (240, 100))
     assert [c["ends"] for c in mg.barrier_report["corridors"]] == [("stagger", "stagger")]
+
+
+GAP_MIN_SIZE = 0.2  # small enough that gap / cells_across is above it in every case below
+GAP_CASES = {
+    # (lines, (y0, y1) of the gap the transects cross, or None)
+    "single barrier": ([([(40, 150), (260, 150)], B)], None),
+    "pair 1.6 m": ([([(40, 150), (260, 150)], B), ([(40, 151.6), (260, 151.6)], B)], (150, 151.6)),
+    "pair 4 m": ([([(40, 150), (260, 150)], B), ([(40, 154), (260, 154)], B)], (150, 154)),
+    "4 m from a river": ([([(40, 150), (260, 150)], B), ([(40, 154), (260, 154)], {})], (150, 154)),
+    "2 m from the boundary": ([([(40, 2), (260, 2)], B)], (0, 2)),
+}
+
+
+def _cells_across(grid, y0: float, y1: float) -> list:
+    """Cells crossed by vertical transects of the gap from y0 to y1, at x off the face spacing."""
+    cells = grid.geometry.to_numpy()
+    return [int(shapely.intersects(cells, LineString([(x, y0 + 1e-6), (x, y1 - 1e-6)])).sum())
+            for x in np.linspace(70.37, 229.71, 9)]
+
+
+@pytest.mark.parametrize("name", GAP_CASES)
+def test_gap_field_puts_its_cells_across_gaps_next_to_barriers(name):
+    # With a GapField the gap gets cells_across cells instead of a corridor's one row; the barrier faces
+    # follow the GapField sizes, so no Gmsh node is removed for them, and a lone barrier is not a gap.
+    # Cells with / without GapField(min_size=0.2), this branch against develop with #76: single barrier
+    # 460 / 460 (507 / 507), pair 1.6 m 7178 / 691 (8273 / 616), pair 4 m 3008 / 512 (3405 / 570),
+    # 4 m from a river 3081 / 696 (3245 / 619), 2 m from the boundary 3883 / 453 (4284 / 483).
+    lines, span = GAP_CASES[name]
+    off = _mesh(_model(lines))
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore", UserWarning)
+        on = _mesh(_model(lines), gap_field=GapField(min_size=GAP_MIN_SIZE))
+    for mg, vt, grid in (off, on):
+        _assert_exact(mg, vt, grid)
+        assert _components(mg, grid) == 1
+    (mg_off, _, grid_off), (mg_on, _, grid_on) = off, on
+    assert mg_on.barrier_report["removed_nodes"] <= mg_off.barrier_report["removed_nodes"]
+    if span is None:
+        assert not mg_on.diagnostics["gap_field"]["field_created"]
+        assert np.array_equal(grid_on[["x", "y"]].to_numpy(), grid_off[["x", "y"]].to_numpy())
+        return
+    assert mg_on.barrier_report["corridors"] == []
+    assert min(_cells_across(grid_on, *span)) >= 3  # GapField's cells_across
+
+
+def test_gap_field_keeps_the_corridor_where_min_size_allows_one_cell_across():
+    # 1.6 m apart with min_size 2: GapField asks for less than one cell across, so the corridor stays,
+    # its cells no longer than GapField's size there.
+    lines = GAP_CASES["pair 1.6 m"][0]
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore", UserWarning)
+        mg, vt, grid = _mesh(_model(lines), gap_field=GapField(min_size=2.0))
+    _assert_exact(mg, vt, grid)
+    [corridor] = mg.barrier_report["corridors"]
+    assert corridor["cells"] >= 220 / 2.0 - 2
+
+
+def test_relay_ramp_with_a_gap_field_stays_connected():
+    gap = 0.2 * LC
+    lines = [([(0, 150), (200, 150)], B), ([(120, 150 + gap), (300, 150 + gap)], B)]
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore", UserWarning)
+        mg, vt, grid = _mesh(_model(lines), gap_field=GapField(min_size=GAP_MIN_SIZE))
+    _assert_exact(mg, vt, grid)
+    assert not _sealed(mg, grid, (60, 200), (240, 100))
+    assert mg.barrier_report["corridors"] == []
+
+
+def test_gap_field_too_fine_for_the_barrier_faces_raises_with_a_min_size_that_works():
+    lines = [([(40, 150), (260, 150)], B), ([(40, 150.4), (260, 150.4)], B)]
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore", UserWarning)
+        with pytest.raises(vorflow.BarrierMeshError, match="GapField") as error:
+            _mesh(_model(lines), gap_field=GapField(min_size=0.1))
+        advised = float(re.search(r"GapField\(min_size=([0-9.]+)\)", str(error.value)).group(1))
+        mg, vt, grid = _mesh(_model(lines), gap_field=GapField(min_size=advised))
+    _assert_exact(mg, vt, grid)
 
 
 @pytest.mark.parametrize("name, coords", [

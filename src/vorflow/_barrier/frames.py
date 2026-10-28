@@ -50,7 +50,7 @@ from ..buffer import protection_epsilon
 from . import pipeline as planning
 from . import corridor as corridors
 from . import polish, wedge
-from .sizing import FEATURE_CAP, Obstacle, near_crossing, size_function
+from .sizing import FEATURE_CAP, GapSizes, Obstacle, near_crossing, size_function
 
 logger = logging.getLogger(__name__)
 
@@ -217,9 +217,12 @@ def obstacles(polys, lines, domain, items: list, origin: np.ndarray, background_
 
 
 def prepare(polys, lines, points, background_lc: float, feature_fields, gradation: float,
-            sharp_angle_deg: float) -> tuple:
+            sharp_angle_deg: float, gap_estimate=None) -> tuple:
     """(plan, context) of the barriers in the clean frames, or (None, None) without any.
 
+    ``gap_estimate`` (a ``_gap.GapEstimate``) is the GapField's estimate when
+    ``MeshGenerator(gap_field=...)`` is set: the faces follow its sizes, and
+    where it asks for more than one cell across a gap there is no corridor.
     Raises BarrierMeshError when the construction cannot be made valid.
     """
     face = [(idx, row) for idx, row in lines.iterrows() if is_face_line(row)] if lines is not None and \
@@ -249,7 +252,8 @@ def prepare(polys, lines, points, background_lc: float, feature_fields, gradatio
     barrier_lines = planning.barrier_lines(items, standard, domain)
     sources, ignored = size_sources(polys, lines, points, background_lc, feature_fields, origin)
     warn_ignored_fields(ignored)
-    size_fn = size_function(sources, background_lc)
+    gap = None if gap_estimate is None else GapSizes(gap_estimate, origin)
+    size_fn = size_function(sources, background_lc, gap)
     embedded_lines = [row.geometry for _, row in _embedded_rows(lines)]
     context = Context(
         origin=origin, domain=domain, domain_global=domain_global, zones=zones, standard=standard,
@@ -292,8 +296,9 @@ def gmsh_frames(plan: planning.BarrierPlan, context: Context, lines, points) -> 
     edges = shapely.union_all([_local(z.boundary, origin) for z in context.zones] + context.standard)
     embed = planning.embeddable(layout.sites, spacing, edges, context.features, context.rings)
     sites = layout.sites + origin
+    # The sites are no gap walls for GapField: only the barrier lines are.
     site_rows = [{'geometry': Point(sites[k]), 'point_id': f"barrier_site_{k}", 'lc': None, 'embed': True,
-                  'hex_ring': False, 'ring_seeds': None}
+                  'hex_ring': False, 'ring_seeds': None, 'gap_wall': False}
                  for k in np.flatnonzero(embed)]
     return _append_rows(lines, fine_rows), _append_rows(points, site_rows)
 

@@ -3,7 +3,9 @@
 1. ``size_function``: vorflow's own size field evaluated in Python (no
    probe Gmsh run): the background lc, every finer polygon (its lc inside,
    growing by growth_factor - 1 per unit distance outside), finer standard
-   lines and points (lc + gradient x distance). Barriers are not part of it.
+   lines and points (lc + gradient x distance), and, with
+   ``MeshGenerator(gap_field=...)``, the size GapField asks for in narrow
+   gaps (``GapSizes``). Barriers are not part of it.
 2. Samples every lc / SAMPLES_PER_LC along each piece get
    ``h0 = min(barrier lc, size field)``.
 3. Caps (the local feature size the empty-circle condition needs; no
@@ -72,34 +74,70 @@ PAIR_CHUNK = 20000       # samples per neighbour query in ``near_pairs``
 SOURCE_CHUNK = 256       # hard nodes per Dijkstra call in ``node_distances``
 SHORT_BLEND = 0.5
 JUNCTION_PASSES = 3
-CAUSES = ("size field", "barrier", "boundary", "feature", "fixed line", "short piece", "repair")
+CAUSES = ("size field", "barrier", "boundary", "feature", "fixed line", "short piece", "repair", "gap field")
 
 
 # ---------------------------------------------------------------------------
 # vorflow's size field
 # ---------------------------------------------------------------------------
-def size_function(sources: list, background_lc: float):
+@dataclasses.dataclass
+class GapSizes:
+    """The sizes a ``fields.GapField`` asks for (its ``_gap.GapEstimate``), at local points.
+
+    ``origin`` is the local frame's origin. Only the estimate's active medial
+    samples set a size, as in the Gmsh field.
+    """
+    estimate: object
+    origin: np.ndarray
+
+    def __call__(self, xy: np.ndarray) -> np.ndarray:
+        """GapField's size at local points xy (the background size where it asks for nothing)."""
+        return self.estimate.sizes_at(np.asarray(xy, dtype=float).reshape(-1, 2) + self.origin)
+
+    def cells_across(self, region) -> float:
+        """Most cells GapField asks for across a gap inside ``region`` (local), 0 where it asks for none."""
+        est = self.estimate
+        act = est.active
+        if not act.any() or region is None or region.is_empty:
+            return 0.0
+        inside = shapely.contains_xy(region, *(est.xy[act] - self.origin).T)
+        return float(np.max(est.gap[act][inside] / est.size[act][inside], initial=0.0))
+
+
+@dataclasses.dataclass
+class SizeFunction:
     """``size(xy)``: vorflow's target mesh size at local points, evaluated in Python.
 
     ``sources`` holds ``(geometry, is_area, ramp)`` per sizing feature, in
     local coordinates; ``ramp(distance)`` is the size the feature's fields
     ask for at that distance (see ``fields.MeshField.python_size``). An area
-    holds its size at distance 0 inside. The background lc caps everything.
+    holds its size at distance 0 inside. The background lc caps everything,
+    and ``gap`` (``GapSizes``), when set, caps it in narrow gaps.
     """
-    for geom, _, _ in sources:
-        shapely.prepare(geom)
+    sources: list
+    background_lc: float
+    gap: GapSizes | None = None
 
-    def size(xy: np.ndarray) -> np.ndarray:
+    def __post_init__(self):
+        for geom, _, _ in self.sources:
+            shapely.prepare(geom)
+
+    def __call__(self, xy: np.ndarray) -> np.ndarray:
         pts = shapely.points(np.asarray(xy, dtype=float).reshape(-1, 2))
-        out = np.full(len(pts), float(background_lc))
-        for geom, is_area, ramp in sources:
+        out = np.full(len(pts), float(self.background_lc))
+        for geom, is_area, ramp in self.sources:
             d = shapely.distance(geom, pts)
             if is_area:
                 d = np.where(shapely.covers(geom, pts), 0.0, d)
             out = np.minimum(out, ramp(d))
+        if self.gap is not None:
+            out = np.minimum(out, self.gap(shapely.get_coordinates(pts)))
         return out
 
-    return size
+
+def size_function(sources: list, background_lc: float, gap: GapSizes | None = None) -> SizeFunction:
+    """``SizeFunction`` of the sizing features ``sources`` and, optionally, GapField's sizes."""
+    return SizeFunction(sources, float(background_lc), gap)
 
 
 # ---------------------------------------------------------------------------
@@ -511,6 +549,10 @@ def capped_field(net: Network, size_fn, domain, features: np.ndarray, obstacles:
     caps = np.vstack([h0, barrier_cap(net, field, h0, rho, extents), boundary_cap(net, field, domain, rho),
                       feature_cap(field, features), obstacle_cap(field, obstacles, h0, tol)])
     h, cause = caps.min(axis=0), caps.argmin(axis=0)
+    gap = getattr(size_fn, "gap", None)
+    if gap is not None:
+        set_by_gap = (cause == CAUSES.index("size field")) & (gap(field.xy) <= caps[0] * (1 + 1e-9))
+        cause = np.where(set_by_gap, CAUSES.index("gap field"), cause)
     lengths = piece_lengths(net)[field.piece]
     short = lengths < h
     h_short = np.where(short, lengths ** (1 - SHORT_BLEND) * h ** SHORT_BLEND, h)

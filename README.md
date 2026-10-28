@@ -244,7 +244,10 @@ faces. Each kind raises one `UserWarning` with its count:
   and at most 3 x the gap long, so a narrow gap adds cells: about
   `length / (3 x gap)` in the row, and the mesh around it is graded down to
   match. Rows of cells shorter than 0.5 x `resolution` raise one warning
-  with their cell count.
+  with their cell count. With `MeshGenerator(gap_field=...)`, a gap where
+  `GapField` asks for more than one cell across gets no corridor: each
+  barrier gets its own faces, sized by `GapField`, with its rows of cells
+  between them (see Narrow gaps).
 
 Check the report before you build HFB input.
 
@@ -397,7 +400,16 @@ print(mesher.diagnostics["gap_field"])  # field_created, min_gap, n_floor_bound,
   their linework. Separation is measured along the linework, so a junction or
   corner wider than about 30 degrees is not a gap, while a polygon's own
   narrow neck is. Field-only (`embed=False`) features are never a side of a
-  gap. Barrier, straddle and quad-buffered lines count as plain lines.
+  gap. Barrier, straddle and quad-buffered lines count as plain lines (the
+  points vorflow places along a barrier do not).
+- **Barriers.** Where `GapField` asks for more than one cell across a gap
+  between two barriers, or between a barrier and the domain boundary, that
+  gap gets no shared row of cells (see Barriers): each barrier gets its own
+  faces, no longer than the `GapField` size there, with the rows of cells
+  between them. Elsewhere along a barrier the faces follow the `GapField`
+  size too, so the cells along it match Gmsh's. If the faces would have to
+  be far shorter than the barrier's `resolution`, `generate()` raises
+  `BarrierMeshError` and gives a `min_size` that works.
 - **Size.** Across a gap of width w the size is `w / cells_across`, graded
   away from it at `growth_factor` (default 1.2), and Gmsh still takes the
   smallest of this and the model's own fields. With `cells_across=3`, about

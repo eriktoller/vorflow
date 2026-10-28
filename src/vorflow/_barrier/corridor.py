@@ -81,7 +81,10 @@ corner) gets no corridor; the barriers there get the regular construction,
 with faces capped by the gap (``sizing``), which also keeps the gap open. A
 corridor that cannot be laid out, or whose region keeps a defect, is
 dropped the same way (``pipeline``), and its pieces get no other pair
-corridor.
+corridor. With ``MeshGenerator(gap_field=...)``, a gap where GapField asks
+for more than one cell across gets no corridor either (``gap_field_wins``):
+the barriers get their own faces, sized by GapField, with its rows of cells
+between them.
 """
 from __future__ import annotations
 
@@ -622,11 +625,23 @@ def _run(net, chain: list, e0: np.ndarray, e1: np.ndarray, degree, rung_nodes, h
     return c
 
 
+def gap_field_wins(c: Corridor, size_fn) -> bool:
+    """True when GapField (``size_fn.gap``) asks for more than one cell across the gap of ``c``.
+
+    Its cells then go across the gap instead of the corridor's one row: the
+    barriers there get their own faces, sized by GapField.
+    """
+    gap = getattr(size_fn, "gap", None)
+    return gap is not None and gap.cells_across(c.region) > 1.0
+
+
 def find_corridors(net, size_fn, domain, standard: list, features: np.ndarray, skip: set) -> list:
-    """Pair corridors first, then boundary runs on the pieces left."""
-    pairs = pair_corridors(net, size_fn, domain, standard, features, skip)
+    """Pair corridors first, then boundary runs on the pieces left; none where GapField wins."""
+    pairs = [c for c in pair_corridors(net, size_fn, domain, standard, features, skip)
+             if not gap_field_wins(c, size_fn)]
     used = {sp.piece for c in pairs for side in c.sides for sp in side}
-    return pairs + boundary_runs(net, size_fn, domain, standard, features, skip, used)
+    runs = boundary_runs(net, size_fn, domain, standard, features, skip, used)
+    return pairs + [c for c in runs if not gap_field_wins(c, size_fn)]
 
 
 def bent_rungs(net, corridors: list) -> list:

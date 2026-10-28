@@ -633,14 +633,19 @@ class GapField(MeshField):
 
         ``tags_dict`` must hold ``'gap_walls'`` (a ``_gap.GapWalls``) and may
         hold ``'size_sources'``; ``MeshGenerator`` builds both. The estimate
-        is left in ``tags_dict['gap_estimate']``.
+        is left in ``tags_dict['gap_estimate']``. When it already holds one
+        (``MeshGenerator`` makes it before meshing, for the barrier faces to
+        follow the same sizes; ``GapEstimate.sizes_at`` gives them at any
+        point), that estimate is used.
         """
         if "gap_walls" not in tags_dict:
             raise ValueError(
                 "GapField is model-wide: pass it as MeshGenerator(gap_field=GapField(...)), "
                 "not in a feature's fields."
             )
-        est = self.estimate(tags_dict["gap_walls"], background_lc, tags_dict.get("size_sources", ()))
+        est = tags_dict.get("gap_estimate")
+        if est is None:
+            est = self.estimate(tags_dict["gap_walls"], background_lc, tags_dict.get("size_sources", ()))
         tags_dict["gap_estimate"] = est
         if not est.active.any():
             return None

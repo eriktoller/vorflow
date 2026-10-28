@@ -1016,6 +1016,7 @@ class MeshGenerator:
         if gap_field is not None and not isinstance(gap_field, GapField):
             raise ValueError(f"gap_field must be a GapField or None. Got {gap_field!r}.")
         self.gap_field = gap_field
+        self._gap_estimate = None
         self.conceptual_mesh = conceptual_mesh
         self.background_lc = background_lc
         self.verbosity = verbosity
@@ -2677,6 +2678,15 @@ class MeshGenerator:
                          f"first map key {first_key!r} ({type(first_key).__name__}), "
                          f"match={first_idx in surfaces}")
 
+    def _estimate_gaps(self, polygons_gdf, lines_gdf, points_gdf):
+        """The GapField's estimate (``_gap.GapEstimate``) on the clean frames, or None without a gap_field."""
+        if self.gap_field is None:
+            return None
+        self._validate_background_lc()
+        background_lc = float(self.background_lc)
+        return self.gap_field.estimate(_gap_walls(polygons_gdf, lines_gdf, points_gdf), background_lc,
+                                       _gap_size_sources(polygons_gdf, lines_gdf, points_gdf, background_lc))
+
     def _add_gap_field(self, polygons_gdf, lines_gdf, points_gdf, background_lc):
         """The GapField's Gmsh field id as a list (empty without a field); records diagnostics['gap_field']."""
         if self.gap_field is None:
@@ -2685,6 +2695,8 @@ class MeshGenerator:
             'gap_walls': _gap_walls(polygons_gdf, lines_gdf, points_gdf),
             'size_sources': _gap_size_sources(polygons_gdf, lines_gdf, points_gdf, background_lc),
         }
+        if getattr(self, '_gap_estimate', None) is not None:
+            tags_dict['gap_estimate'] = self._gap_estimate
         f_id = self.gap_field.create(gmsh, tags_dict, background_lc)
         est = tags_dict['gap_estimate']
         active = est.active
@@ -3031,6 +3043,8 @@ class MeshGenerator:
         self.barrier_lines = None
         self.barrier_circles = None
         self.node_is_site = None
+        # The GapField estimate comes first: the barrier faces follow its sizes, and Gmsh gets the same one.
+        self._gap_estimate = self._estimate_gaps(clean_polys, clean_lines, clean_points)
         # Before any Gmsh call: an invalid barrier construction raises here.
         barrier_plan, barrier_context = self._plan_barriers(clean_polys, clean_lines, clean_points)
         gmsh_lines, gmsh_points = clean_lines, clean_points
@@ -3094,7 +3108,7 @@ class MeshGenerator:
         """(plan, context) of the barrier sites, or (None, None) without barriers; see ``vorflow._barrier``."""
         plan, context = _barrier_frames.prepare(
             clean_polys, clean_lines, clean_points, float(self.background_lc), _feature_fields,
-            self.barrier_gradation, self.sharp_angle,
+            self.barrier_gradation, self.sharp_angle, gap_estimate=getattr(self, '_gap_estimate', None),
         )
         if plan is not None:
             logger.info(f"Barrier construction: {len(plan.layout.sites)} sites on {len(plan.layout.segments)} "

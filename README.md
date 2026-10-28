@@ -338,6 +338,65 @@ than 2 x `resolution`, or when a finer size field reaches the ring (below
 point's). After meshing, `MeshGenerator.diagnostics["hex_rings"]` records
 whether each ring came out intact.
 
+### Narrow gaps
+
+Where two features run close together, the mesh between them is only as fine
+as their resolutions and the background make it, so a narrow gap can end up
+one or two cells across. `GapField` finds the gaps between embedded features
+and caps the size there at gap / `cells_across`. It is model-wide, so it goes
+on the mesh generator rather than on a feature:
+
+```python
+from vorflow import GapField
+
+mesher = MeshGenerator(
+    background_lc=40,
+    conceptual_mesh=blueprint,
+    gap_field=GapField(cells_across=3, min_size=2.0),
+)
+mesher.generate()
+print(mesher.diagnostics["gap_field"])  # field_created, min_gap, n_floor_bound, ...
+```
+
+- **What is a gap.** The local distance between embedded polygon
+  boundaries, lines and points, measured on an approximate medial axis of
+  their linework. Separation is measured along the linework, so a junction or
+  corner wider than about 30 degrees is not a gap, while a polygon's own
+  narrow neck is. Field-only (`embed=False`) features are never a side of a
+  gap. Barrier, straddle and quad-buffered lines count as plain lines.
+- **Size.** Across a gap of width w the size is `w / cells_across`, graded
+  away from it at `growth_factor` (default 1.2), and Gmsh still takes the
+  smallest of this and the model's own fields. With `cells_across=3`, about
+  three cells lie wholly between the two walls, plus the cells centred on
+  them.
+- **No narrow gap, no change.** Only gaps narrower than `cells_across` times
+  the local size (the background, or a feature's default size field where it
+  is finer) are refined. When there are none, no Gmsh field is added and the
+  mesh is identical to one built without `gap_field`.
+- **`min_size`** (model units, default 0.1 x `background_lc`) is the floor on
+  the size. It is needed because wedges, such as a line meeting the boundary
+  at under about 30 degrees, narrow to zero at the tip. Wherever gap /
+  `cells_across` is below it, a warning names the place and the cells across
+  it gets. The linework is sampled every `min_size / 2`, so a smaller
+  `min_size` costs more.
+- **Opting features out.** The field cannot tell an oversight from a
+  deliberate coarse region. Add `gap_wall=False` to features whose gaps should
+  not be refined, such as a boundary-condition line digitised just inside the
+  domain edge or a sliver polygon:
+
+  ```python
+  blueprint.add_line(river_bc, line_id="river", resolution=40, gap_wall=False)
+  ```
+
+  A `gap_wall=False` feature is never a side of a gap; for a polygon, that
+  covers its whole boundary, including edges it shares with other polygons.
+
+Refining a gap costs cells. In a 1000 x 600 m domain at `background_lc=40`,
+two lines 15 m apart get about three cells across with `GapField(3)`, and the
+grid grows from about 550 to 2400 cells. Vertex jitter larger than
+`min_size / 4` can read as small notches, which the field refines down to
+`min_size`; simplify such input first (`simplify_tolerance`).
+
 ### Lloyd relaxation
 
 `lloyd_iterations` moves the free generators (interior nodes of the zones)

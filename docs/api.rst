@@ -33,6 +33,15 @@ Pass these to the ``fields`` argument of ``add_polygon``, ``add_line`` or
    ExponentialField
    ThresholdField
 
+:class:`~vorflow.GapField` is model-wide: pass it to
+``MeshGenerator(gap_field=...)``, not to a feature's ``fields``.
+
+.. autosummary::
+   :toctree: generated
+   :nosignatures:
+
+   GapField
+
 Logging
 -------
 

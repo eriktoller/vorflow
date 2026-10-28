@@ -14,6 +14,18 @@ and the project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   sdist attached (`scripts/release_notes.py`). A tag without a changelog
   section now fails the build before anything is uploaded.
 
+### Changed
+
+- Embedding points (point features, hex-ring seeds, barrier straddle pairs)
+  now scales linearly with their number. Each point's owning surface was
+  found with one `gmsh.model.isInside` call, whose cost grows with the points
+  already in the surface, so the step was quadratic: 2.1 s of a 4.8 s
+  `generate()` at 10⁴ points. The owner now comes from the fragmented
+  topology (the surface holding the point as an interior vertex), with
+  `isInside` kept for points on a boundary or in no surface, and points are
+  embedded with one `embed` call per surface. Meshes are unchanged: nodes and
+  `node_tags` are identical on all benchmark cases.
+
 ## [0.3.0] - 2026-10-15
 
 MODFLOW 6 DISV export (`to_disv()`, `to_modflowgwfdisv()`), `plot()` methods

@@ -671,6 +671,36 @@ def _surface_bboxes(surface_tags):
     return bboxes
 
 
+def _interior_point_owners(surface_tags):
+    """Point entity tag -> the one surface that holds it as an interior vertex.
+
+    Fragmenting a point into a face makes it an interior vertex of that face,
+    which Gmsh lists in getEmbedded(). A point that lies inside a face is
+    interior to that face alone (fragmented faces do not overlap), so this
+    gives the owner isInside() would find without its per-point cost, which
+    grows with the number of vertices already in the face. Points listed by
+    several surfaces are left out and fall back to isInside().
+    """
+    owners = {}
+    shared = set()
+    for surf_tag in surface_tags:
+        try:
+            embedded = gmsh.model.mesh.getEmbedded(2, int(surf_tag))
+        except Exception:
+            logger.debug("getEmbedded failed for domain surface %d; its points "
+                         "are located with isInside().", surf_tag)
+            continue
+        for dim, tag in embedded:
+            if int(dim) != 0:
+                continue
+            if int(tag) in owners:
+                shared.add(int(tag))
+            owners[int(tag)] = int(surf_tag)
+    for tag in shared:
+        del owners[tag]
+    return owners
+
+
 def _bbox_contains_point(bbox, pt, eps=1e-4):
     """True if ``pt`` lies inside ``bbox`` grown by ``eps``."""
     return (bbox[0] - eps <= pt[0] <= bbox[3] + eps and
@@ -2612,9 +2642,12 @@ class MeshGenerator:
             return
 
         surface_bboxes = _surface_bboxes(domain_surface_tags)
+        point_owners = _interior_point_owners(surface_bboxes)
         stats = _EmbedStats()
+        pending_points = {}
         for dim, tag in _entities_to_embed(gmsh_map, points_gdf, lines_gdf):
-            self._embed_entity(dim, tag, surface_bboxes, stats)
+            self._embed_entity(dim, tag, surface_bboxes, point_owners, pending_points, stats)
+        self._embed_points(pending_points, stats)
 
         if stats.unmatched_tags:
             logger.warning(
@@ -2633,8 +2666,13 @@ class MeshGenerator:
         self._log_embed_summary_diagnostics(stats)
         self.diagnostics['embedding'] = stats.as_diagnostics(include_records=self.diagnose)
 
-    def _embed_entity(self, dim, tag, surface_bboxes, stats):
-        """Embed one point or curve into the smallest domain surface containing it."""
+    def _embed_entity(self, dim, tag, surface_bboxes, point_owners, pending_points, stats):
+        """Embed one curve, or queue one point, into the smallest domain surface containing it.
+
+        A point's owner comes from ``point_owners`` when it is a candidate, else
+        from isInside(). Points are queued in ``pending_points`` (surface ->
+        [(tag, record)]) and embedded per surface by _embed_points.
+        """
         try:
             bbox = gmsh.model.getBoundingBox(dim, tag)
         except Exception:
@@ -2669,7 +2707,10 @@ class MeshGenerator:
             stats.unmatched_tags.append(_unmatched_record(dim, tag, bbox))
             return
 
-        matches = self._surfaces_containing(tag, sample_points, candidates, stats)
+        if dim == 0 and point_owners.get(int(tag)) in candidates:
+            matches = [point_owners[int(tag)]]
+        else:
+            matches = self._surfaces_containing(tag, sample_points, candidates, stats)
         if not matches:
             stats.skip_no_match += 1
             stats.unmatched_tags.append(_unmatched_record(dim, tag, bbox))
@@ -2696,6 +2737,22 @@ class MeshGenerator:
                 return
 
         for surf_tag in matches:
+            record = None
+            if self.diagnose:
+                record = {
+                    'dim': int(dim),
+                    'tag': int(tag),
+                    'surface': int(surf_tag),
+                    'bbox': tuple(float(v) for v in bbox),
+                    'sample_points': sample_points,
+                }
+            if dim == 0:
+                # Recorded now to keep the records in embedding order;
+                # _embed_points drops the record if the embed fails.
+                if record is not None:
+                    stats.records.append(record)
+                pending_points.setdefault(int(surf_tag), []).append((tag, record))
+                continue
             try:
                 gmsh.model.mesh.embed(dim, [tag], 2, surf_tag)
             except Exception as e:
@@ -2703,14 +2760,31 @@ class MeshGenerator:
                 stats.fail_tags.append((tag, str(e)[:60]))
                 continue
             stats.ok += 1
-            if self.diagnose:
-                stats.records.append({
-                    'dim': int(dim),
-                    'tag': int(tag),
-                    'surface': int(surf_tag),
-                    'bbox': tuple(float(v) for v in bbox),
-                    'sample_points': sample_points,
-                })
+            if record is not None:
+                stats.records.append(record)
+
+    @staticmethod
+    def _embed_points(pending_points, stats):
+        """Embed the queued points with one embed() call per surface (per point if that call fails)."""
+        for surf_tag, queued in pending_points.items():
+            try:
+                gmsh.model.mesh.embed(0, [tag for tag, _ in queued], 2, surf_tag)
+            except Exception:
+                logger.debug("Embedding %d points into surface %d at once failed; "
+                             "embedding them one by one.", len(queued), surf_tag)
+            else:
+                stats.ok += len(queued)
+                continue
+            for tag, record in queued:
+                try:
+                    gmsh.model.mesh.embed(0, [tag], 2, surf_tag)
+                except Exception as e:
+                    stats.failed += 1
+                    stats.fail_tags.append((tag, str(e)[:60]))
+                    if record is not None:
+                        stats.records = [r for r in stats.records if r is not record]
+                    continue
+                stats.ok += 1
 
     @staticmethod
     def _surfaces_containing(tag, sample_points, candidates, stats):

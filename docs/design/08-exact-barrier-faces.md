@@ -71,7 +71,12 @@ than `sharp_angle` share a stem along their bisector, as long as it keeps
 every point within 0.1 x `resolution` of the lines as drawn, and part at
 1.5 x `sharp_angle` at its end. A barrier leaving the domain boundary or a
 hole edge that narrowly slides along the boundary instead, so it still ends
-on it. Fans and stars are merged pair by pair, narrowest first; two adjacent
+on it. It parts from the boundary at 1.5 x `sharp_angle`, but at most
+25 degrees more than its own angle (a wider opening leaves the re-drawn leg
+shorter than 0.2 x `resolution`), and short of any bend whose vertices the
+chord would move beyond the bound. The angle is measured to the boundary
+0.1 x `resolution` along it, so an exit next to a corner is merged along the
+edge past the corner when it runs narrowly beside that edge. Fans and stars are merged pair by pair, narrowest first; two adjacent
 sectors below 29 degrees are merged too, because the sector plan cannot place
 sites in both. Two legs that run to the same next vertex become its chord
 (`barrier_report["collapsed"]`). A junction where the move would exceed its
@@ -167,7 +172,11 @@ the faces would have to be shorter than 0.02 x `resolution`, the plan raises
 `BarrierMeshError`, a `ValueError` naming the place, what made the faces that
 short there (the size caps record which one bound each face length: another
 barrier part, the boundary, a point, a fixed line, closely spaced vertices,
-a corridor, or a junction or fold) and what helps for that cause. A finer
+a corridor, or a junction or fold) and what helps for that cause. Where the
+failure lies within 5 x `resolution` of a barrier leaving the boundary at
+less than 30 degrees (counting a corner within 0.1 x `resolution`), the
+message names that exit and its angle instead, and gives the `sharp_angle`
+that merges it when the exit was not merged. A finer
 `resolution` is given with a 10% margin and rounded down, so the value
 printed meshes. For a fold, the message gives the `simplify_tolerance` that
 removes it, 1.25 x the shortest piece there, or says that the legs are too

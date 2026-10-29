@@ -37,8 +37,14 @@ whose leg makes an angle theta below ``sharp_angle`` with the boundary
 moves along the boundary to Q, q = DEVIATION x lc / sin(theta) away, and
 runs straight from Q to its point at arc length L, again the largest L
 with an angle of at least OPEN_FACTOR x ``sharp_angle`` to the boundary at
-Q. The stretch from J to Q lies on the boundary, where a barrier separates
-nothing; the barrier still ends on the boundary, so it stays sealed.
+Q, but at most EXIT_OPEN_MAX more than theta: the re-drawn leg is
+q sin(theta) / sin(opening - theta) long, and q sin(theta) is the bound, so
+a wider opening (a large ``sharp_angle``) leaves it shorter than MIN_LEG x
+lc. L stays short of any bend whose vertices the chord would move further
+than the bound (at junctions too). The angle theta is measured to the
+boundary DEVIATION x lc along it, so a corner that close to J counts. The
+stretch from J to Q lies on the boundary, where a barrier separates nothing;
+the barrier still ends on the boundary, so it stays sealed.
 
 A spike (one line folding back on itself, or two lines ending together:
 a node with two legs) keeps the uncovered-tip rule of ``network``; a pair
@@ -59,6 +65,7 @@ from .lines import BarrierLine
 
 DEVIATION = 0.1        # x lc: the largest move of a barrier by a merge
 OPEN_FACTOR = 1.5      # x sharp_angle: the angle at which two merged legs leave the stem (or the boundary)
+EXIT_OPEN_MAX = math.radians(25.0)  # a boundary exit opens by at most this: wider leaves a leg below MIN_LEG
 FAN_ANGLE = math.radians(29.0)  # two adjacent sectors narrower than this are merged too (fans, stars)
 MIN_LEG = 0.2          # x lc: a re-drawn leg shorter than this is not made; the reach shrinks instead
 SHRINK = 0.7           # the stem is shortened by this factor when a merge does not fit
@@ -155,6 +162,15 @@ def _min_opening(apex: np.ndarray, points: list, outer: tuple | None = None) -> 
     for a, b in zip(dirs[:-1], dirs[1:]):
         out = min(out, abs((b - a + math.pi) % (2 * math.pi) - math.pi))
     return out
+
+
+def _vertices_near(path: np.ndarray, reach: float, redrawn: np.ndarray, bound: float) -> bool:
+    """True when every vertex of ``path`` before arc length ``reach`` lies within ``bound`` of the polyline
+    ``redrawn`` that replaces it: a quick test of the move bound, which a reach round a bend fails."""
+    seg = np.hypot(*np.diff(path, axis=0).T)
+    before = np.concatenate([[0.0], np.cumsum(seg)]) < reach
+    d = shapely.distance(LineString(redrawn), shapely.points(path[before]))
+    return bool((d <= bound * (1 + 1e-6)).all())
 
 
 def _bisect_reach(opening, lo: float, hi: float, target: float) -> float | None:
@@ -286,7 +302,13 @@ def _merge_pair(lines: list, originals: list, apex: np.ndarray, pair: tuple, sto
         def ends_at(reach, paths=paths, caps=caps):
             return [_along(p, min(reach, c))[0] for p, c in zip(paths, caps)]
 
-        reach = _bisect_reach(lambda r: _min_opening(stem, ends_at(r)), m, max(caps), OPEN_FACTOR * limit)
+        def opening(r, stem=stem, ends_at=ends_at):
+            ends = ends_at(r)
+            if not all(_vertices_near(p, r, np.array([apex, stem, q]), bound) for p, q in zip(paths, ends)):
+                return -math.inf  # past a bend: the re-drawn legs would move a line too far
+            return _min_opening(stem, ends)
+
+        reach = _bisect_reach(opening, m, max(caps), OPEN_FACTOR * limit)
         if reach is not None:
             cuts = [_along(p, min(reach, c)) for p, c in zip(paths, caps)]
             pts = [q for q, _ in cuts]
@@ -321,13 +343,18 @@ def _merge_loop(lines: list, originals: list, apex: np.ndarray, pair: tuple, pat
             "deviation": moved, "lines": sorted({lines[leg.k].line_id for g in pair for leg in g}, key=str)}
 
 
-def _boundary_ray(domain, xy: np.ndarray, leg_angle: float, tol: float) -> tuple | None:
+def boundary_ray(domain, xy: np.ndarray, leg_angle: float, tol: float, reach: float = 0.0) -> tuple | None:
     """(ring, along-ring position of xy, direction sign, angle to the leg) of the boundary ray at ``xy`` that
-    makes the narrowest angle with the leg, inside the domain."""
+    makes the narrowest angle with the leg, inside the domain.
+
+    The ray points at the boundary ``reach`` along (at least a short probe),
+    so a corner closer than that counts: a leg leaving next to a corner can
+    run at a narrow angle to the edge past it.
+    """
     rings = [LineString(r.coords) for p in getattr(domain, "geoms", [domain]) for r in [p.exterior, *p.interiors]]
     ring = min(rings, key=lambda r: r.distance(Point(xy)))
     d = ring.project(Point(xy))
-    step = max(tol * 1e3, 1e-6 * ring.length)
+    step = max(tol * 1e3, 1e-6 * ring.length, reach)
     best = None
     for sign in (-1, 1):
         p = np.array(ring.interpolate((d + sign * step) % ring.length).coords[0])
@@ -351,20 +378,28 @@ def _merge_boundary_exit(lines: list, originals: list, k: int, end: int, stop: n
     i, step = (0, 1) if end == 0 else (len(b.xy) - 1, -1)
     apex = b.xy[i].copy()
     d = b.xy[i + step] - apex
-    ring, along, sign, theta, _ = _boundary_ray(domain, apex, math.atan2(d[1], d[0]), tol)
-    if not 0 < theta < sharp or not math.isfinite(b.lc):
+    if not math.isfinite(b.lc):
+        return None
+    bound = DEVIATION * b.lc
+    ring, along, sign, theta, _ = boundary_ray(domain, apex, math.atan2(d[1], d[0]), tol, bound)
+    if not 0 < theta < sharp:
         return None
     path = _path(b.xy, i, step, stop)
     cap = _length(path)
-    bound = DEVIATION * b.lc
     q = min(bound / math.sin(theta), 0.5 * cap)
     region = domain.buffer(tol)
     probe = max(tol * 1e3, 1e-6 * ring.length)
     for _ in range(TRIES):
         foot, ahead = _along_ring(ring, along + sign * q, sign, probe, 1)
         outer = (math.atan2(*(ahead - foot)[::-1]),)
-        reach = _bisect_reach(lambda r: _min_opening(foot, [_along(path, min(r, cap))[0]], outer), q, cap,
-                              OPEN_FACTOR * sharp)
+
+        def opening(r, foot=foot, outer=outer):
+            end_pt = _along(path, min(r, cap))[0]
+            if not _vertices_near(path, r, np.array([apex, foot, end_pt]), bound):
+                return -math.inf  # past a bend: the chord would move the line too far
+            return _min_opening(foot, [end_pt], outer)
+
+        reach = _bisect_reach(opening, q, cap, min(OPEN_FACTOR * sharp, theta + EXIT_OPEN_MAX))
         if reach is not None:
             end_pt, n = _along(path, min(reach, cap))
             chord = LineString([foot, end_pt])

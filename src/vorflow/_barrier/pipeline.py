@@ -53,6 +53,7 @@ from .network import SHARP_ANGLE, Network, build_network, replan_chord_nodes
 from .sites import Layout, construct
 from .sizing import BARRIER_CAP, CAUSES, GRADATION, SizeField, capped_field, grade_field
 from .validate import all_finite, defects
+from .wedge import DEVIATION, boundary_ray
 
 REPAIR_ROUNDS = 8
 REPAIR_FACTOR = 0.5
@@ -69,6 +70,8 @@ CIRCLE_MARGIN = 0.02     # Gmsh nodes within R (1 + CIRCLE_MARGIN) of a circle c
 FINER_MARGIN = 0.9       # an advised finer resolution is this x the one at which the faces just fit
 FOLD_MARGIN = 1.25       # an advised simplify_tolerance is this x the shortest piece of the fold
 CLEAR_FRACTION = 0.5     # ... and those within this x the local spacing of a site
+EXIT_ANGLE = math.radians(30.0)  # a barrier leaving the boundary closer than this to it is a shallow exit
+EXIT_REACH = 5.0         # x lc: a failure this close to a shallow exit is put down to it
 
 
 GEOMETRY_ERRORS = (shapely.errors.GEOSException, ArithmeticError)  # degenerate geometry inside the construction
@@ -170,6 +173,37 @@ def advice(cause: str, h: float, fold: float | None = None, lc: float | None = N
                  f"spike or zigzag, or many legs at one point). {remedy}")
 
 
+def shallow_exit(net: Network, points: np.ndarray, domain, tol: float) -> float | None:
+    """The narrowest angle (radians) below EXIT_ANGLE at which a barrier leaves the domain boundary within
+    EXIT_REACH x lc of ``points``, else None. A corner within DEVIATION x lc of the exit counts
+    (``wedge.boundary_ray``)."""
+    pts = np.asarray(points, dtype=float).reshape(-1, 2)
+    best = None
+    for v, node_plan in enumerate(net.plans):
+        if not node_plan.on_boundary:
+            continue
+        xy = net.hard_xy[v]
+        for leg in node_plan.legs:
+            if leg.kind != "piece":
+                continue
+            lc = float(net.piece_lc[leg.piece])
+            if float(np.hypot(*(pts - xy).T).min()) > EXIT_REACH * lc:
+                continue
+            theta = boundary_ray(domain, xy, leg.angle, tol, DEVIATION * lc)[3]
+            if theta < EXIT_ANGLE and (best is None or theta < best):
+                best = theta
+    return best
+
+
+def exit_advice(theta: float, sharp: float) -> str:
+    """What makes the faces possible at a barrier that leaves the boundary at the narrow angle ``theta``."""
+    merge = (f"; a sharp_angle above {round_up(math.degrees(theta)):.3g} merges the exit along the boundary"
+             if theta >= sharp else "")
+    return (f"the barrier leaves the domain boundary there at {math.degrees(theta):.2g} degrees, too narrow for "
+            f"cells between the barrier and the boundary{merge}. End it on the boundary at a steeper angle, or "
+            f"short of the boundary; or {QUAD_BUFFER_ADVICE}")
+
+
 def _fail(reason: str, points: np.ndarray, origin: np.ndarray) -> None:
     """Raise BarrierMeshError with the place, the cause and what to do about it."""
     raise BarrierMeshError(f"barrier faces cannot be made exact near {where(points, origin)}: {reason}.")
@@ -239,11 +273,14 @@ def _other_line_near(net: Network, xy: np.ndarray, reach: float) -> bool:
     return bool(((d <= reach * (1 + 1e-6)) & (np.arange(len(d)) != own)).any())
 
 
-def check_floor(net: Network, field: SizeField, origin: np.ndarray, drawn: set = frozenset()) -> None:
+def check_floor(net: Network, field: SizeField, origin: np.ndarray, drawn: set = frozenset(), domain=None,
+                sharp: float = SHARP_ANGLE) -> None:
     """Fail when the target face length is below MIN_H_FRACTION x lc somewhere.
 
     ``drawn`` holds the vertices of the lines as they came in: a short piece
-    that is not between two of them was made by a merge (``wedge``).
+    that is not between two of them was made by a merge (``wedge``). With
+    the ``domain``, a floor set by a junction or by repair rounds next to a
+    shallow boundary exit is put down to the exit.
     """
     lc = net.piece_lc[field.piece]
     tiny = field.h < MIN_H_FRACTION * lc
@@ -252,9 +289,13 @@ def check_floor(net: Network, field: SizeField, origin: np.ndarray, drawn: set =
         cause = floor_cause(net, field, k, lc[k])
         if cause == "short piece" and drawn and not {tuple(net.hard_xy[v]) for v in net.pieces[field.piece[k]]} <= drawn:
             cause = "merge"
-        _fail(f"the faces would have to be {field.h[k]:.3g} long ({field.h[k] / lc[k]:.2g} x lc), because "
-              f"{advice(cause, field.h[k], fold_tolerance(net, field.xy[[k]]), float(lc[k]))}", field.xy[tiny],
-              origin)
+        reason = advice(cause, field.h[k], fold_tolerance(net, field.xy[[k]]), float(lc[k]))
+        if cause in ("junction", "repair") and domain is not None:
+            theta = shallow_exit(net, field.xy[[k]], domain, touch_tolerance(domain))
+            if theta is not None:
+                reason = exit_advice(theta, sharp)
+        _fail(f"the faces would have to be {field.h[k]:.3g} long ({field.h[k] / lc[k]:.2g} x lc), because {reason}",
+              field.xy[tiny], origin)
 
 
 def repair_bounds(field: SizeField, layout: Layout, bad: list, refine: np.ndarray | None) -> np.ndarray:
@@ -322,14 +363,14 @@ def _repair_loop(lines: list, standard: list, domain, features: np.ndarray, size
     refine, first, rounds = None, None, 0
     while True:
         field = capped_field(net, size_fn, domain, features, obstacles, refine, tol)
-        check_floor(net, field, origin, drawn)
+        check_floor(net, field, origin, drawn, domain, sharp_angle)
         field = grade_field(net, field, gradation)
         if field.failed:
             skip |= set(field.failed)
             net = network_with_corridors(lines, standard, domain, features, size_fn, sharp_angle, skip, fixed)
             refine = None
             continue
-        check_floor(net, field, origin, drawn)
+        check_floor(net, field, origin, drawn, domain, sharp_angle)
         layout = construct(net, field)
         if not all_finite(layout):
             raise internal_failure("construction", FloatingPointError("non-finite radii or sites"))
@@ -346,8 +387,11 @@ def _repair_loop(lines: list, standard: list, domain, features: np.ndarray, size
         if rounds == REPAIR_ROUNDS or len(layout.sites) > SITE_GROWTH_CAP * first:
             kinds = sorted({k for k, _ in bad})
             points = np.array([p for _, p in bad])
+            theta = shallow_exit(net, points, domain, tol) if "site outside" in kinds else None
+            reason = advice("repair", 0.0, fold_tolerance(net, points)) if theta is None else \
+                exit_advice(theta, sharp_angle)
             _fail(f"{len(bad)} defects ({', '.join(kinds)}) are left after {rounds} local refinements, because "
-                  f"{advice('repair', 0.0, fold_tolerance(net, points))}", points, origin)
+                  f"{reason}", points, origin)
         refine = repair_bounds(field, layout, bad, refine)
         rounds += 1
 

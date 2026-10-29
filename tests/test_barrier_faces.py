@@ -758,6 +758,12 @@ def _wedge_cases() -> dict:
         out[f"hole{angle}"] = ([([(180, 150), _ray((180, 150), 90 - angle, 400)], B),
                                 ([(120, 150), _ray((120, 150), 270 - angle, 400)], B)],
                                [(260, 60), (40, 240)], DOMAIN.difference(hole))
+    for angle in (3, 12):
+        # A bend 120 before the exit: the merge used to reach past it and fail its bound.
+        exit_ = (200.0, 300.0)
+        bend = _ray(exit_, 180 + angle, 120)
+        out[f"bent_boundary{angle}"] = ([([(0, 150), bend, _ray(exit_, angle, 30)], B)], [(20, 280), (150, 100)],
+                                        DOMAIN)
     return out
 
 

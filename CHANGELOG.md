@@ -30,8 +30,9 @@ and the project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   cell face, for example where the faces would have to be far shorter than
   the barrier's `resolution`. The message gives the place (x, y), what
   makes the faces that short there (another barrier part, the boundary, a
-  point, a fixed line, closely spaced vertices, or legs meeting at too
-  narrow an angle) and what helps for that cause: a `simplify_tolerance`
+  point, a fixed line, closely spaced vertices, a barrier leaving the
+  boundary at a narrow angle, or legs meeting at too narrow an angle) and
+  what helps for that cause: a `simplify_tolerance`
   that snaps the end or drops the part, the barrier `resolution` at which
   the faces fit next to the boundary, a point or a fixed line (rounded down,
   with a 10% margin, so the value given meshes), the `simplify_tolerance`
@@ -201,7 +202,10 @@ and the project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - Barrier legs that meet at a junction (a splay, a T-branch, a crossing),
   or leave the domain boundary or a hole edge, at less than `sharp_angle`
   share a short stem along the bisector and then part at 1.5 x
-  `sharp_angle`, so no sliver is left between them; fans and stars whose
+  `sharp_angle`, so no sliver is left between them (a boundary exit
+  slides along the boundary and parts from it at 1.5 x `sharp_angle`, or at
+  most 25 degrees more than its own angle, short of the next bend; a corner
+  within 0.1 x resolution of the exit counts); fans and stars whose
   neighbouring legs are closer than 29 degrees are merged the same way. No
   point of a line moves more than 0.1 x its resolution. One `UserWarning`
   gives the count; the details are in `barrier_report["collapsed"]`. This

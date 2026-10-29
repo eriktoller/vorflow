@@ -116,6 +116,51 @@ def test_sharp_spike_tip_is_truncated_and_joined_by_a_ladder():
     assert net.rungs[0].theta == pytest.approx(math.radians(10.0))
 
 
+def _shallow_exit(angle_deg: float, bend: float = 120.0) -> list:
+    """A barrier that bends ``bend`` from the top of DOMAIN and leaves it at (200, 300), ``angle_deg`` to it."""
+    a = math.radians(angle_deg)
+    return [[(40, 150), (200 - bend * math.cos(a), 300 - bend * math.sin(a)), (200, 300)]]
+
+
+@pytest.mark.parametrize("angle", [3.0, 12.0])
+def test_shallow_boundary_exit_is_merged_short_of_the_bend_before_it(angle):
+    # The reach used to run past the bend, where the chord moved the line far beyond the bound, so no merge
+    # was made and the plan failed with sites outside the domain.
+    plan = _plan(_shallow_exit(angle))
+    [record] = plan.net.collapsed
+    assert record["kind"] == "boundary" and record["deviation"] <= 0.1 * LC * (1 + 1e-6)
+    assert record["reach"] < 120.0
+
+
+def test_shallow_boundary_exit_is_merged_at_a_large_sharp_angle():
+    # At sharp_angle 57.5 the opening asked for (1.5 x sharp_angle) left the re-drawn leg shorter than
+    # wedge.MIN_LEG; the opening is now held to the exit angle plus wedge.EXIT_OPEN_MAX.
+    coords = [[(130, 0), (130 + 110 * math.cos(math.radians(3.5)), 110 * math.sin(math.radians(3.5)))]]
+    items = [(0, np.asarray(coords[0], dtype=float), LC)]
+    barriers = pipeline.barrier_lines(items, [], DOMAIN)
+    plan = pipeline.plan(barriers, [], DOMAIN, np.empty((0, 2)), sizing.size_function([], 20.0), ORIGIN,
+                         sharp_angle=math.radians(57.5))
+    assert [r["kind"] for r in plan.net.collapsed] == ["boundary"]
+
+
+def test_exit_next_to_a_corner_is_merged_along_the_edge_past_the_corner():
+    # The leg leaves the top edge 0.01 from the corner at 77 degrees to it, but runs at 13 degrees to the
+    # right edge just past the corner.
+    a = math.radians(77.0)
+    exit_ = (299.99, 300.0)
+    plan = _plan([[(exit_[0] - 100 * math.cos(a), 300 - 100 * math.sin(a)), exit_]])
+    [record] = plan.net.collapsed
+    assert record["kind"] == "boundary" and record["angle"] == pytest.approx(13.0, abs=1.0)
+
+
+def test_boundary_rays_are_measured_from_the_foot_on_the_boundary():
+    # A node a hair inside the boundary (within the touch tolerance) used to tilt the rays over the short
+    # probe, and a site shared with the ray fell outside the domain.
+    tol = pipeline.touch_tolerance(DOMAIN)
+    rays = network._boundary_rays(DOMAIN, np.array([150.0, 300.0 - 0.5 * tol]), tol)
+    assert max(abs(math.sin(r)) for r in rays) < 1e-12
+
+
 def test_narrow_wedge_at_a_junction_gets_a_rung():
     net = _network([[(40, 150), (150, 150), (260, 150)], [(150, 150), (260, 190)]])  # a 20 degree splay
     assert len(net.rungs) == 1
@@ -330,6 +375,17 @@ def test_advised_tolerance_for_a_short_fold_is_its_length_and_works():
                                        np.array([True, False, False, True]))
         lines.simplify_lines([simplified])
         _plan([simplified.xy])
+
+
+def test_shallow_exit_that_is_not_merged_is_named_in_the_error():
+    # 12 degrees is above sharp_angle 10, so the exit is not merged; the message used to blame folded legs.
+    items = [(0, np.asarray(_shallow_exit(12.0)[0], dtype=float), LC)]
+    barriers = pipeline.barrier_lines(items, [], DOMAIN)
+    with pytest.raises(pipeline.BarrierMeshError, match="leaves the domain boundary there at 12 degrees") as info:
+        pipeline.plan(barriers, [], DOMAIN, np.empty((0, 2)), sizing.size_function([], 20.0), ORIGIN,
+                      sharp_angle=math.radians(10.0))
+    assert "a sharp_angle above 12 merges the exit" in str(info.value)
+    assert "fold back" not in str(info.value)
 
 
 def test_repair_failure_points_at_narrow_angles_and_the_quad_buffer(monkeypatch):

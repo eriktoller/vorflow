@@ -1502,24 +1502,28 @@ class ConceptualMesh:
         """
         Returns a concatinated GeoDataFrame of all cleaned lines, points and polygons from the ConceptualModel.
 
-        Retruns:
-            features (GeoDataFrame): Returns a GeoDataFrame of all cleaned festures of the ConceptualModel.
+        Returns:
+            features (GeoDataFrame): Returns a GeoDataFrame of all cleaned features of the ConceptualModel with 
+            the columns ``'geometry'``, ``'embed'``, ``'feature_type'``, and ``'feature_id'``.
+
+        Raises:
+            ValueError: If there are no cleaned features.
         """
         lines = gpd.GeoDataFrame()
         if not self.clean_lines.empty:
-            lines = self.clean_lines[["geometry", "line_id"]].copy()
+            lines = self.clean_lines[["geometry", "line_id", "embed"]].copy()
             lines = lines.rename(columns={"line_id": "feature_id"})
             lines["feature_type"] = "line"
 
         points = gpd.GeoDataFrame()
         if not self.clean_points.empty:
-            points = self.clean_points[["geometry", "point_id"]].copy()
+            points = self.clean_points[["geometry", "point_id", "embed"]].copy()
             points = points.rename(columns={"point_id": "feature_id"})
             points["feature_type"] = "point"
 
         polygons = gpd.GeoDataFrame()
         if not self.clean_polygons.empty:
-            polygons = self.clean_polygons[["geometry", "zone_id"]].copy()
+            polygons = self.clean_polygons[["geometry", "zone_id", "embed"]].copy()
             polygons = polygons.rename(columns={"zone_id": "feature_id"})
             polygons["feature_type"] = "polygon"
 
@@ -1528,5 +1532,8 @@ class ConceptualMesh:
             points,
             polygons
         ], ignore_index=True))
+
+        if features.empty:
+            raise ValueError("Run ``.generate()`` before exporting features.")
 
         return features

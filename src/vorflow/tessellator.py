@@ -381,18 +381,38 @@ def _fragment_merge(piece, geometries, tree, barriers):
 def _close_domain_slits(domain_geom, fraction: float = DOMAIN_SLIT_FRACTION):
     """Return ``domain_geom`` with holes and seams narrower than ``fraction`` x its extent closed.
 
-    A mitred buffer out and back in by that width restores every other edge
-    and corner to roundoff (mitre_limit keeps corners down to ~0.1 degrees sharp).
+    A domain without such gaps is returned unchanged. Otherwise a mitred
+    buffer out and back in by that width closes them (mitre_limit keeps
+    corners down to ~0.1 degrees sharp), and the vertices the buffers moved
+    by roundoff are snapped back onto the input's, so the boundary stays
+    exactly where the user drew it and lines along it still meet the cells.
     """
     minx, miny, maxx, maxy = domain_geom.bounds
     width = fraction * max(maxx - minx, maxy - miny)
-    if width <= 0:
+    if width <= 0 or not _has_domain_slits(domain_geom, width):
         return domain_geom
     closed = domain_geom.buffer(width, join_style='mitre', mitre_limit=1e3)
     closed = closed.buffer(-width, join_style='mitre', mitre_limit=1e3)
     if closed.is_empty or not closed.is_valid:
         return domain_geom
-    return closed
+    snapped = shapely.snap(closed, domain_geom, 10 * width)
+    return snapped if snapped.is_valid and not snapped.is_empty else closed
+
+
+def _has_domain_slits(domain_geom, width: float) -> bool:
+    """True if ``domain_geom`` has a hole, or a gap between its parts, narrower than ``width``."""
+    parts = list(getattr(domain_geom, 'geoms', [domain_geom]))
+    for part in parts:
+        for ring in part.interiors:
+            hole = Polygon(ring)
+            # A hole whose area is under width x half its perimeter is nowhere wider than ~width.
+            if hole.area <= width * hole.length:
+                return True
+    if len(parts) > 1:
+        tree = shapely.STRtree(parts)
+        pairs = tree.query(parts, predicate='dwithin', distance=width)
+        return bool(np.any(pairs[0] != pairs[1]))
+    return False
 
 
 def _on_domain_tolerance(domain_geom, fraction: float = ZONE_EDGE_FRACTION) -> float:

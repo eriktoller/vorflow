@@ -131,6 +131,15 @@ def test_domain_union_ignores_field_only_polygons():
     assert buffer.domain_union_geometry(None) is None
 
 
+def test_strip_cells_across_keeps_barrier_node_rows_off_the_line():
+    assert buffer.strip_cells_across(_row(quad_buffer_thickness=2)) == 2
+    assert buffer.strip_cells_across(_row(is_barrier=True)) == 1
+    # An odd quad count: thickness cell rows on each side of the barrier.
+    assert buffer.strip_cells_across(_row(is_barrier=True, quad_buffer_thickness=2)) == 3
+    row = _row(lc=2.0, is_barrier=True, quad_buffer=True, quad_buffer_thickness=2)
+    assert buffer.protection_epsilon(row, 5) == 3.0
+
+
 # --- footprint planning ------------------------------------------------------
 
 def test_plan_line_strip_builds_strip_with_ordered_corners():
@@ -152,6 +161,30 @@ def test_plan_line_strip_clips_offsets_to_the_domain():
     assert len(parts) == 1
     minx, _, maxx, _ = parts[0].strip.bounds
     assert minx == pytest.approx(0.0) and maxx == pytest.approx(10.0)
+
+
+def test_paired_offsets_put_each_rung_through_a_line_vertex():
+    line = LineString([(0, 0), (4, 0), (8, 3)])
+    left, right = buffer.paired_offsets(line, 1.0)
+    assert len(left.coords) == len(right.coords) == 3
+    np.testing.assert_allclose((np.asarray(left.coords) + np.asarray(right.coords)) / 2,
+                               np.asarray(line.coords), atol=1e-12)
+    assert left.distance(line) == pytest.approx(1.0) and right.distance(line) == pytest.approx(1.0)
+
+
+def test_plan_line_strip_reaches_an_oblique_boundary_with_paired_sides():
+    # The line ends where it meets the domain's slanted top edge.
+    domain = Polygon([(0, 0), (20, 0), (20, 20), (0, 10)])
+    parts = buffer.plan_line_strip(LineString([(10, 2), (10, 15)]), lc=1.0, thickness=3,
+                                   domain=domain, feature_name=0)
+    pos, neg = [np.asarray(side.coords) for side in parts[0].side_lines]
+    # Both sides run to the boundary, so no unstructured wedge is left at the end.
+    assert domain.boundary.distance(Point(pos[-1])) < 1e-9
+    assert domain.boundary.distance(Point(neg[-1])) < 1e-9
+    # Vertex i of one side faces vertex i of the other, up to the last one.
+    assert len(pos) == len(neg)
+    np.testing.assert_allclose(pos[:-1, 0] + neg[:-1, 0], 20.0)
+    np.testing.assert_allclose(pos[:-1, 1], neg[:-1, 1])
 
 
 def test_plan_polygon_band_is_an_annulus_around_the_outline():
@@ -199,7 +232,8 @@ def test_plan_quad_buffers_keys_lines_then_embedded_polygons():
 
 def test_protection_epsilon_by_feature_kind():
     assert buffer.protection_epsilon(_row(lc=2.0, quad_buffer=True, quad_buffer_thickness=2), 5) == 2.0
-    assert buffer.protection_epsilon(_row(lc=2.0, straddle_width=0.6), 5) == pytest.approx(0.3)
+    # The deprecated straddle_width is ignored.
+    assert buffer.protection_epsilon(_row(lc=2.0, straddle_width=0.6), 5) == pytest.approx(0.4)
     assert buffer.protection_epsilon(_row(lc=2.0, is_barrier=True), 5) == pytest.approx(0.4)
 
 

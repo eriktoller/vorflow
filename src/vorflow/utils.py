@@ -10,6 +10,8 @@ import shapely
 from shapely.geometry import LineString, MultiLineString, Polygon, MultiPolygon, Point
 from ._features import DEFAULT_CONNECTIVITY_TOLERANCE
 
+from ._convex import CONCAVE_TOLERANCE, centroid_fan_fraction
+
 
 logger = logging.getLogger(__name__)
 
@@ -461,6 +463,15 @@ def calculate_mesh_quality(
     Returns:
         gpd.GeoDataFrame: The input GeoDataFrame with added columns for each
             quality metric (e.g., 'area', 'compactness', 'drift_ratio').
+            ``is_concave`` is True where ``convexity`` (cell area over
+            convex-hull area) is below ``1 - 1e-6``. ``star_from_centroid``
+            is True where every face of the cell is visible from its
+            centroid; MODFLOW 6 particle tracking (PRT) can loop forever in
+            a cell where it is False. A convex polygon has ``is_concave``
+            False and ``star_from_centroid`` True; cells that are not a
+            single polygon without holes get ``star_from_centroid`` False.
+            Clipping at reflex corners of the domain or a hole is what makes
+            cells concave; see ``VoronoiTessellator(split_concave=...)``.
     """
     df = gdf.copy()
     
@@ -475,7 +486,14 @@ def calculate_mesh_quality(
     # 3. Convexity (Solidity): The ratio of the cell's area to the area of its
     # convex hull. A perfectly convex polygon has a convexity of 1.0.
     df['convexity'] = df['area'] / df.geometry.convex_hull.area
-    
+    df['is_concave'] = df['convexity'] < 1.0 - CONCAVE_TOLERANCE
+
+    # 4. Star shape from the centroid: every face is visible from the cell
+    # centroid. MODFLOW 6 PRT tracks particles through a DISV cell on a fan
+    # of triangles that share the centroid, one per face; when a face is
+    # hidden one triangle has a negative area and PRT can loop forever.
+    df['star_from_centroid'] = centroid_fan_fraction(df.geometry.to_numpy()) > 0.0
+
     connectivity_report = None
     if connectivity is not None:
         connectivity_report = connectivity
@@ -488,7 +506,7 @@ def calculate_mesh_quality(
     elif calc_skewness and 'x' in df.columns and 'y' in df.columns:
         connectivity_report = build_connectivity(df, center="generator")
 
-    # 4. Generator-based drift metrics (require generator point coordinates).
+    # 5. Generator-based drift metrics (require generator point coordinates).
     if 'x' in df.columns and 'y' in df.columns:
         centroids = df.geometry.centroid
         dx = df['x'] - centroids.x
@@ -537,7 +555,14 @@ def summarize_quality(gdf: gpd.GeoDataFrame):
     # will lie on or very close to the cell's own geometric boundary.
     is_boundary = np.zeros(len(gdf), dtype=bool)
     if 'x' in gdf.columns and 'y' in gdf.columns:
-        gens = gpd.GeoSeries(gpd.points_from_xy(gdf.x, gdf.y), index=gdf.index,crs=gdf.crs)
+        gen_x, gen_y = gdf.x, gdf.y
+        if 'concave_split' in gdf.columns:
+            # Split concave pieces carry their centroid as x/y and their mesh
+            # node in source_x/source_y.
+            split = gdf['concave_split'].astype(bool)
+            gen_x = gen_x.where(~split, gdf['source_x'])
+            gen_y = gen_y.where(~split, gdf['source_y'])
+        gens = gpd.GeoSeries(gpd.points_from_xy(gen_x, gen_y), index=gdf.index,crs=gdf.crs)
         dists = gdf.geometry.boundary.distance(gens)
         
         # Use a small tolerance relative to the cell size.
@@ -587,6 +612,15 @@ def summarize_quality(gdf: gpd.GeoDataFrame):
                 logger.info(f"[WARNING] {high_drift} INTERNAL cells have high drift (> 0.25).")
             else:
                 logger.info("[OK] Internal drift is excellent.")
+
+    if 'is_concave' in gdf.columns and 'star_from_centroid' in gdf.columns:
+        n_concave = int(gdf['is_concave'].sum())
+        n_hidden = int((~gdf['star_from_centroid']).sum())
+        if n_hidden > 0:
+            logger.info(f"[WARNING] {n_hidden} cells have a face hidden from their centroid "
+                        f"(MODFLOW 6 PRT can stall in them); {n_concave} cells are concave.")
+        elif n_concave > 0:
+            logger.info(f"[OK] {n_concave} cells are concave, but every face is visible from its centroid.")
 
     # Boundary cells have different geometric norms.
     if not boundary_df.empty:
@@ -962,3 +996,88 @@ def faces_on(gdf, geometry, tolerance=None, predicate="within"):
     faces.reset_index(drop=True, inplace=True)
 
     return faces
+def grid_to_mfusg_disu(gdf: gpd.GeoDataFrame, top, botm, nlay: int = 1, gsf_path=None) -> dict:
+    """Build **MODFLOW-USG**, not MODFLOW 6, DISU input from a polygon grid.
+
+    Uses the same horizontal mesh in every layer, with the grid's ``x``/``y``
+    as numerical centres. ``top`` is scalar or ``(ncpl,)``; ``botm`` is scalar,
+    ``(nlay,)`` or ``(nlay, ncpl)``. The upper surface of each lower layer is
+    the preceding layer's bottom. All thicknesses must be positive.
+
+    If ``gsf_path`` is given, the matching GSF file (see :func:`grid_to_gsf`)
+    is written from the same validated grid, so the checks run only once.
+
+    Centre containment and overlap checks allow coordinate roundoff (32
+    machine epsilons times the coordinate scale), preserving input centres
+    and polygons. Roundoff-sized overlap faces are resolved at that precision.
+    Shared faces must be contiguous and straight; bent faces, such as a
+    barrier corner cut inside a cell, and disconnected faces are rejected.
+
+    Returns:
+        dict: Inputs for ``flopy.mfusg.MfUsgDisU``: ``nodes``, ``nlay``,
+        ``njag``, ``nodelay``, ``top``, ``bot``, ``area``, ``iac``, ``ja``,
+        ``cl12``, ``fahl``, ``ivsd=-1`` and ``idsymrd=0``. Node arrays are
+        flattened in layer/row order, ``ja`` is zero-based, and ``area`` is
+        supplied for one layer. Diagonal geometry entries are zero.
+
+        Three additional entries are metadata, **not FloPy constructor
+        arguments**: ``node_id`` (one original ID per model node),
+        ``cell_map`` (a DataFrame with zero-based ``model_node``, ``layer``,
+        ``cell_id``, ``orig_index``, ``node_id`` and optional ``zone_id``),
+        and ``connectivity`` (horizontal face lengths, perpendicular centre
+        distances and ``ortho_error`` in degrees).
+
+        MFUSG ``FAHL`` is interface area, including thickness for horizontal
+        connections; MF6 ``HWVA`` uses horizontal width instead. MFUSG and
+        MF6 also use different vertical-connection flags. These arrays must
+        not be passed to ``flopy.mf6.ModflowGwfdisu``.
+
+    Raises:
+        ValueError: For invalid/overlapping cells, missing or invalid centres,
+            unsupported shared faces, bad array shapes or nonpositive thickness.
+
+    FloPy is optional. Remove the three metadata entries before unpacking
+    into ``MfUsgDisU``; FloPy may modify its ``ja`` argument in place, so copy
+    it if retaining the original zero-based arrays. No GNC or hydraulic
+    barrier properties are generated. Inspect ``connectivity`` to assess
+    nonorthogonal faces before using the mesh in a simulation.
+    """
+    from ._mfusg import _disu_arrays, _prepare_grid, _write_gsf
+
+    grid = _prepare_grid(gdf, top, botm, nlay)
+    arrays = _disu_arrays(grid)
+    if gsf_path is not None:
+        _write_gsf(grid, gsf_path)
+    return arrays
+
+
+def grid_to_gsf(gdf: gpd.GeoDataFrame, filepath, top, botm, nlay: int = 1):
+    """Write an original 3D grid specification file (GSF), returning its Path.
+
+    Geometry, elevations, validation and node order match
+    :func:`grid_to_mfusg_disu`. Vertices are deduplicated by XYZ; each node
+    lists clockwise top and bottom rings, without repeated closing vertices.
+    Node/vertex/layer numbers in the file are one-based. Flat cell surfaces
+    reproduce the supplied cell elevations; no vertex interpolation is done.
+    The shared validation rejects bent and disconnected faces. To write DISU
+    and GSF together, pass ``gsf_path`` to :func:`grid_to_mfusg_disu`.
+
+    GSF is a geometry companion, not a DISU package or a particle-tracking
+    GSF variant. It does not store hydraulic properties, CRS metadata or
+    boundary conditions. FloPy is not required. The format can be read by
+    ``flopy.discretization.UnstructuredGrid.from_gridspec``; compatibility
+    with a particular Vistas version should be checked by importing the pair.
+
+    Args:
+        gdf (GeoDataFrame): Polygon grid with ``x`` and ``y`` centres.
+        filepath (str or Path): Destination file; parent directory must exist.
+        top: Scalar or one top elevation per horizontal cell.
+        botm: Scalar, one bottom per layer, or ``(nlay, ncpl)`` array.
+        nlay (int): Number of stacked layers. Default 1.
+
+    Raises:
+        ValueError: If geometry or elevations fail MFUSG export validation.
+    """
+    from ._mfusg import _prepare_grid, _write_gsf
+
+    return _write_gsf(_prepare_grid(gdf, top, botm, nlay), filepath)

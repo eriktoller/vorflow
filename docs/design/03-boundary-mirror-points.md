@@ -9,8 +9,9 @@ Implemented as `VoronoiTessellator(boundary_centering="inset_mirror")`. Each
 non-corner boundary node moves inward by `boundary_inset_fraction` x its
 nearest boundary-node spacing, and a ghost goes at the mirror position
 outside. Nodes at ring vertices sharper than `boundary_corner_angle` (135
-degrees), and nodes whose ghost would land back inside the domain, stay in
-place. This insets the generator rather than leaving it on the boundary, so
+degrees), nodes whose ghost would land back inside the domain, and nodes
+whose ghost's Voronoi cell would cover part of the domain stay in place and
+are clipped (`boundary_centering` is `"clip"` in their row). This insets the generator rather than leaving it on the boundary, so
 the plan below (a ghost for a node that stays on the edge) changed during
 implementation.
 
@@ -45,6 +46,22 @@ Limits:
   in, 0.3 does slightly better than 0.25. Both beat clip there.
 - `tests/test_integration_gmsh.py::test_inset_mirror_improves_boundary_orthogonality_on_gmsh_mesh`
   checks the improvement on real Gmsh meshes.
+- At a reflex vertex (the boundary bends into the domain) the ghost's face
+  follows the averaged tangent, which cuts into the domain on both sides of
+  the vertex. Ghost cells are discarded, so that strip was left uncovered and
+  MODFLOW 6 saw disconnected faces
+  ([#71](https://github.com/rhugman/vorflow/issues/71)). The tessellator now
+  builds the diagram once with the ghosts, drops every ghost whose cell covers
+  more than `GHOST_LEAK_FRACTION` x inset^2 of the domain, and puts its node
+  back on the boundary; it repeats until no ghost cell leaks. Mirroring across
+  both segments at the vertex does not help, because both reflections land
+  inside the domain. Leaving the node inset without a ghost also covers the
+  domain, but gives worse skewness on finely faceted curves: p95 skewness of
+  faces touching a boundary cell on a 720-sided circular hole is 2.29 inset,
+  1.58 clipped (plain clip: 1.57).
+- Every hole vertex of a polygonised circle is reflex, so a circular hole's
+  nodes all end up clipped (a 64-sided hole: 64 clipped, 260 nodes elsewhere
+  mirrored).
 
 The rest of this document is the original plan.
 

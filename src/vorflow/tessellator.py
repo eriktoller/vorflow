@@ -14,9 +14,11 @@ from shapely.ops import unary_union, split
 from shapely.validation import make_valid
 
 from . import _lloyd
-from ._features import polygon_parts
+from ._log import warn_user
+from ._convex import CONCAVE_TOLERANCE, centroid_fan_fraction, split_concave_cells, split_pinches, zone_by_area
 from ._plot import get_ax
-from .utils import grid_to_disv
+from ._barrier import BarrierMeshError
+from .utils import grid_to_disv, grid_to_gsf, grid_to_mfusg_disu
 
 logger = logging.getLogger(__name__)
 
@@ -24,12 +26,17 @@ logger = logging.getLogger(__name__)
 # floating-point slivers from a barrier that runs along a cell face.
 BARRIER_SLIVER_FRACTION = 1e-6
 
+# split_concave settings other than False: split only cells with a face
+# hidden from the centroid, or every concave cell.
+SPLIT_CONCAVE_MODES = ("hidden_face", "all")
+
 # Split pieces without the generator smaller than this fraction of the cell
 # area join the neighbouring cell on their side of the barrier instead of
-# becoming cells of their own. A curved barrier leaves such pieces all along
-# it: the straddle pairs' Voronoi faces are chords of the curve, which bulges
-# across them by the sagitta (pieces of 0.03-13% of the cell on curves with
-# radius 1-4 lc).
+# becoming cells of their own. Wherever generators near a curved barrier are
+# not placed for it (quad buffers on a barrier, or nodes from elsewhere),
+# their Voronoi faces are chords of the curve, which bulges across them by
+# the sagitta and leaves such pieces all along it (0.03-13% of the cell on
+# curves with radius 1-4 lc).
 BARRIER_FRAGMENT_MERGE_FRACTION = 0.2
 
 # Rounds of barrier mirroring before leftover crossings go to the post-hoc split.
@@ -38,15 +45,43 @@ BARRIER_MIRROR_PASSES = 3
 # A mirror generator is dropped when an existing node lies closer to it than
 # this fraction of its distance to the original node: that node already
 # acts as the partner, and a mirror beside it would squeeze both cells. On a
-# curved barrier a straddle point's partner reflected across the nearest
-# segment lands 4-19% of the reflection distance from it (lc 2, radius 1.7-8).
+# curved barrier, a node and its partner across the line (measured with the
+# retired straddle pairs) reflect across the nearest segment to within 4-19%
+# of the reflection distance of each other (lc 2, radius 1.7-8).
 BARRIER_MIRROR_MERGE_FRACTION = 0.1
+
+# Exact barrier faces (MeshGenerator.barrier_lines) should never need the
+# mirror pass or the cut. When they do, generate() warns; with True it raises
+# BarrierMeshError instead. A private test hook: the test suite sets it True.
+_STRICT_BARRIERS = False
 
 # Cell vertices closer than this fraction of the grid's coordinate scale are
 # one vertex. Clipping puts a cut point within roundoff of a domain vertex
 # wherever a Voronoi face meets the boundary there, which leaves a
 # zero-length edge; MODFLOW 6 can crash on those.
 VERTEX_MERGE_FRACTION = 1e-12
+# A generator within this fraction of the model extent of a zone lies on it.
+ZONE_EDGE_FRACTION = 1e-9
+# A cell centred on a zone edge keeps its z_order zone unless another zone its generator
+# lies on holds at least this much more of its area (straight edges stay as before).
+ZONE_SHARE_MARGIN = 0.1
+
+# A boundary ghost whose Voronoi cell covers more of the domain than this
+# fraction of its inset squared is dropped and its node clipped instead:
+# ghost cells are discarded before clipping, so that area would be left
+# uncovered. Leaks below the threshold stay. Along a straight boundary they
+# are roundoff (~1e-6 m2 on a 20 km domain, ~1e-9 of inset^2); kinks of
+# ~1e-5 m in a boundary leave slivers of ~1e-4 m2 (coverage error ~1e-10,
+# no disconnected faces).
+GHOST_LEAK_FRACTION = 1e-6
+
+# Gaps in the clip domain narrower than this fraction of its extent are closed.
+# Zones that overhang the domain polygon are cookie-cut against each other, and
+# the union of the pieces keeps roundoff slits along their shared edges: holes
+# of ~1e-12 m2 and parts that touch only across a zero-width seam. GEOS can
+# intersect a cell the domain fully covers with such a domain into a
+# LineString, which drops the cell, and a seam through a cell splits it in two.
+DOMAIN_SLIT_FRACTION = 1e-9
 
 
 def _merged_vertex_index(vertices: np.ndarray, tolerance: float) -> np.ndarray:
@@ -216,8 +251,8 @@ def _strictly_inside(domain_geom, points_xy):
 def _split_polygon_pieces(cell_poly, line):
     """Return the polygon pieces of split(cell_poly, line), covering the whole cell.
 
-    Where the line runs along a cell face to within roundoff (a straddle
-    pair's face lies on the barrier segment through the pair), split() can
+    Where the line runs along a cell face to within roundoff (a barrier
+    site pair's face lies on the barrier segment between them), split() can
     drop a piece. Snapping the cell to the line's vertices first makes the
     overlap exact, so split is retried that way when area goes missing.
     """
@@ -232,6 +267,9 @@ def _split_polygon_pieces(cell_poly, line):
     return pieces
 
 
+# _straddled_pieces, _fragment_merge and _merge_barrier_fragments serve the
+# post-hoc barrier cut. With exact barrier faces they only run as a safety
+# net (and warn when they do); they are retired in the next release.
 def _straddled_pieces(cell_poly, line, sliver_fraction=BARRIER_SLIVER_FRACTION):
     """Return the polygon pieces of a cell split by a line, or [] when the line does not straddle it."""
     pieces = _split_polygon_pieces(cell_poly, line)
@@ -317,7 +355,7 @@ def _fragment_merge(piece, geometries, tree, barriers):
     the longest boundary wins.
 
     The piece's cut points can sit a roundoff distance off the cell's face
-    (a barrier vertex on a straddle pair's face), which would leave the two
+    (a barrier vertex on a site pair's face), which would leave the two
     touching at a point only; snapping the cell to the piece's vertices
     first inserts them into its faces.
     """
@@ -340,16 +378,59 @@ def _fragment_merge(piece, geometries, tree, barriers):
     return best
 
 
+def _close_domain_slits(domain_geom, fraction: float = DOMAIN_SLIT_FRACTION):
+    """Return ``domain_geom`` with holes and seams narrower than ``fraction`` x its extent closed.
+
+    A mitred buffer out and back in by that width restores every other edge
+    and corner to roundoff (mitre_limit keeps corners down to ~0.1 degrees sharp).
+    """
+    minx, miny, maxx, maxy = domain_geom.bounds
+    width = fraction * max(maxx - minx, maxy - miny)
+    if width <= 0:
+        return domain_geom
+    closed = domain_geom.buffer(width, join_style='mitre', mitre_limit=1e3)
+    closed = closed.buffer(-width, join_style='mitre', mitre_limit=1e3)
+    if closed.is_empty or not closed.is_valid:
+        return domain_geom
+    return closed
+
+
+def _on_domain_tolerance(domain_geom, fraction: float = ZONE_EDGE_FRACTION) -> float:
+    """Distance within which a point lies on ``domain_geom``: ``fraction`` x its extent."""
+    minx, miny, maxx, maxy = domain_geom.bounds
+    return fraction * max(maxx - minx, maxy - miny)
+
+
 def _clip_to_domain(gdf, domain_geom):
     """Return the rows of ``gdf`` that intersect ``domain_geom``, clipped to it, in their original order.
 
     Replaces ``gpd.clip``, which with pandas 1.5 / GeoPandas 0.13 writes the
     clipped geometries back onto the wrong rows (its spatial-index query
     reorders them), so cells lose their generator's x/y and node_id.
+
+    A cell whose generator lies in the domain or on its boundary always
+    keeps some area. If the intersection loses it all (GEOS roundoff on a
+    domain with slivers), the cell is kept whole when the domain covers it,
+    and a warning names the cells otherwise, so no cell is dropped silently.
     """
     hits = np.sort(gdf.sindex.query(domain_geom, predicate='intersects'))
     clipped = gdf.iloc[hits].copy()
-    clipped[clipped.geometry.name] = clipped.geometry.intersection(domain_geom)
+    cells = clipped.geometry.to_numpy()
+    pieces = shapely.intersection(cells, domain_geom)
+    polygonal = np.isin(shapely.get_type_id(pieces), (3, 6, 7))
+    lost = ~polygonal | (shapely.area(pieces) <= 0.0)
+    if lost.any():
+        generators = shapely.points(clipped['x'].to_numpy(), clipped['y'].to_numpy())
+        lost &= shapely.dwithin(domain_geom, generators, _on_domain_tolerance(domain_geom))
+        covered = lost & shapely.covers(domain_geom, cells)
+        pieces[covered] = cells[covered]
+        dropped = lost & ~covered
+        if dropped.any():
+            warn_user(
+                f"Clipping to the domain lost {int(dropped.sum())} cell(s) whose generator lies in or on the domain "
+                f"(node_id {clipped['node_id'].to_numpy()[dropped][:10].tolist()}); the grid has gaps there."
+            )
+    clipped[clipped.geometry.name] = pieces
     return clipped
 
 
@@ -397,6 +478,81 @@ def _join_unmatched_to_nearest_zone(joined, pts_gdf, zones):
     return pd.concat([joined[matched], nearest])
 
 
+def _edge_cells_to_majority_zone(grid, zones, band, margin: float = ZONE_SHARE_MARGIN):
+    """Give each ``band`` cell whose generator lies on an edge between zones the one of them holding most of its area.
+
+    The generator join gives such a cell the zone of highest ``z_order``. Next
+    to a barrier, the cell of a node on a zone edge is lopsided (the barrier
+    sites bound it on one side), so it could take a zone it barely touches.
+    ``band`` marks the cells next to a barrier (``_barrier_band``); all other
+    cells keep the ``z_order`` rule, so meshes without barriers keep their
+    zones. Among the zones its generator lies on, a band cell keeps the
+    ``z_order`` zone unless another holds at least ``margin`` more of its
+    area. A zone's share sums all its polygon rows. A cell never takes a zone
+    its generator is not in.
+    """
+    if grid.empty or len(zones) < 2 or not np.any(band):
+        return grid
+    extent = float(max(np.ptp(np.asarray(zones.total_bounds).reshape(2, 2), axis=0)))
+    tol = max(ZONE_EDGE_FRACTION * extent, 1e-12)
+    codes, zone_ids = pd.factorize(zones["zone_id"])
+    geoms = zones.geometry.to_numpy()
+    candidates = np.flatnonzero(band)
+    generators = shapely.points(grid["x"].to_numpy()[candidates], grid["y"].to_numpy()[candidates])
+    on = np.zeros((len(candidates), len(zone_ids)), dtype=bool)
+    for code, zone in zip(codes, geoms):
+        on[:, code] |= shapely.dwithin(zone, generators, tol)
+    rows, on = candidates[on.sum(axis=1) >= 2], on[on.sum(axis=1) >= 2]
+    if len(rows) == 0:
+        return grid
+    cells = grid.geometry.to_numpy()[rows]
+    shares = np.zeros(on.shape)
+    for code, zone in zip(codes, geoms):
+        shares[:, code] += shapely.area(shapely.intersection(cells, zone))
+    shares = np.where(on, shares / np.maximum(shapely.area(cells), 1e-300)[:, None], -1.0)
+    current = pd.Index(zone_ids).get_indexer(grid["zone_id"].to_numpy()[rows])
+    own = np.where(current >= 0, shares[np.arange(len(rows)), current], 0.0)
+    best = np.argmax(shares, axis=1)
+    moved = shares[np.arange(len(rows)), best] - own >= margin
+    if not moved.any():
+        return grid
+    grid = grid.copy()
+    index = grid.index[rows[moved]]
+    grid.loc[index, "zone_id"] = zone_ids.to_numpy()[best[moved]]
+    if "z_order" in zones and "z_order" in grid:
+        z_order = zones["z_order"].groupby(codes).max().to_numpy()
+        grid.loc[index, "z_order"] = z_order[best[moved]]
+    logger.debug(f"  -> {int(moved.sum())} cell(s) next to a barrier given the zone holding most of their area.")
+    return grid
+
+
+def _far_ghost_nodes(nodes):
+    """Return four ghost nodes far outside the bounding box of nodes, so every node's Voronoi cell is finite."""
+    minx, miny = np.min(nodes, axis=0)
+    maxx, maxy = np.max(nodes, axis=0)
+    buffer = max(maxx - minx, maxy - miny) * 10
+    return np.array([
+        [minx - buffer, miny - buffer],
+        [maxx + buffer, miny - buffer],
+        [maxx + buffer, maxy + buffer],
+        [minx - buffer, maxy + buffer]
+    ])
+
+
+def _ghost_cell_domain_areas(nodes, ghosts, domain_geom):
+    """Return the area of the domain inside each ghost's Voronoi cell (nodes and ghosts as generators)."""
+    generators = np.vstack([nodes, ghosts, _far_ghost_nodes(nodes)])
+    origin = (generators.min(axis=0) + generators.max(axis=0)) / 2.0
+    vor = Voronoi(generators - origin)
+    regions = [vor.regions[vor.point_region[len(nodes) + i]] for i in range(len(ghosts))]
+    # The far ghosts enclose the boundary ghosts, so their cells are finite.
+    assert all(region and -1 not in region for region in regions), "boundary ghost cell is unbounded"
+    ring_of = np.repeat(np.arange(len(regions)), [len(region) for region in regions])
+    rings = shapely.linearrings(vor.vertices[np.concatenate(regions)] + origin, indices=ring_of)
+    cells = shapely.make_valid(shapely.polygons(rings))
+    return shapely.area(shapely.intersection(cells, domain_geom))
+
+
 def _mirror_metadata(tags, mirrors):
     """Return node metadata rows for barrier mirror generators (never boundary-centred)."""
     return pd.DataFrame(
@@ -412,7 +568,15 @@ def _mirror_metadata(tags, mirrors):
 
 
 def _explode_with_unique_ids(grid_gdf):
-    """Explode multipart cells into polygons, giving every non-primary part a fresh node_id."""
+    """Explode multipart and pinched cells into polygons, giving every non-primary part a fresh node_id."""
+    if not grid_gdf.empty:
+        geoms = grid_gdf.geometry.to_numpy()
+        coords = shapely.get_coordinates(geoms)
+        scale = max(float(np.ptp(coords, axis=0).max()), float(np.abs(coords).max()), 1.0)
+        grid_gdf = grid_gdf.copy()
+        grid_gdf[grid_gdf.geometry.name] = gpd.GeoSeries(
+            split_pinches(geoms, VERTEX_MERGE_FRACTION * scale), index=grid_gdf.index, crs=grid_gdf.crs
+        )
     exploded = grid_gdf.explode(index_parts=False)
     # GeometryCollections from clipping can carry line/point slivers; drop them.
     exploded = exploded[exploded.geom_type == 'Polygon'].reset_index(drop=True)
@@ -441,43 +605,6 @@ def _explode_with_unique_ids(grid_gdf):
     return exploded
 
 
-def _zone_pieces(polygons, footprints):
-    """Polygon parts of ``polygons`` (zones) with the quad-buffer ``footprints`` (or None) cut out."""
-    pieces = []
-    for geom in polygons:
-        if geom is None or geom.is_empty:
-            continue
-        if footprints is not None and geom.intersects(footprints):
-            geom = make_valid(geom.difference(footprints))
-        pieces.extend(polygon_parts(geom))
-    return [piece for piece in pieces if piece.area > 0]
-
-
-def _owner_polygons(nodes, free, pieces):
-    """Owner polygon of each free node (the zone piece containing it) and the free mask of nodes that have one.
-
-    Returns (owners (len(nodes),) object array, None for fixed nodes; free).
-    A free node in no piece (or on a piece boundary) is made fixed.
-    """
-    owners = np.full(len(nodes), None, dtype=object)
-    free = np.asarray(free, dtype=bool).copy()
-    free_idx = np.flatnonzero(free)
-    if len(free_idx) == 0 or not pieces:
-        free[:] = False
-        return owners, free
-    piece_array = np.empty(len(pieces), dtype=object)
-    piece_array[:] = pieces
-    point_pos, piece_pos = shapely.STRtree(piece_array).query(
-        shapely.points(nodes[free_idx]), predicate='within'
-    )
-    # Clean polygons do not overlap; keep the first piece should two touch.
-    point_pos, first = np.unique(point_pos, return_index=True)
-    owners[free_idx[point_pos]] = piece_array[piece_pos[first]]
-    free[free_idx] = False
-    free[free_idx[point_pos]] = True
-    return owners, free
-
-
 class VoronoiTessellator:
     """
     Builds the Voronoi grid from a triangular mesh.
@@ -501,7 +628,13 @@ class VoronoiTessellator:
             centroid-to-centroid orthogonality error of boundary
             connections from about 6 to under 2 degrees. Nodes at sharp
             corners stay in place, so the worst connections next to
-            corners do not improve.
+            corners do not improve. Nodes whose ghost would land inside
+            the domain, or whose ghost's cell would cover part of it (at
+            reflex vertices, where the boundary bends into the domain),
+            also stay in place and are clipped. Every hole vertex of a
+            polygonised circle is reflex, so its nodes are all clipped.
+            Each output cell's mode is in its ``boundary_centering``
+            column (``"inset_mirror"`` or ``"clip"``).
         boundary_inset_fraction (float): Fraction of local boundary-node
             spacing used for the inward shift in ``"inset_mirror"`` mode.
             A boundary cell reaches about halfway to the first interior
@@ -527,8 +660,8 @@ class VoronoiTessellator:
             the cell sizes. Only free nodes move: mesh
             nodes inside the embedded polygon surfaces. Nodes on the domain
             and zone boundaries, embedded points (and their hex-ring
-            seeds), embedded and barrier lines (including straddle pairs)
-            and the quad-buffer strips and bands stay fixed. A move is
+            seeds), embedded and barrier lines (including the generators
+            placed on either side of a barrier) and the quad-buffer strips and bands stay fixed. A move is
             rejected if it would leave the node's zone or cross an embedded
             line. With Lloyd on, the cells are no longer the exact dual of
             the triangle mesh (``MeshGenerator.get_element_grid()``) and
@@ -585,6 +718,42 @@ class VoronoiTessellator:
             holds the ``initial`` and ``final`` short-face counts,
             ``passes`` and ``rejected`` moves, and the grid gets a
             ``lloyd_shift`` column with the total move of each node.
+        split_concave (False or str): Split concave cells into convex
+            pieces after the grid is built (False, the default, turns it
+            off). Clipping makes a cell concave where the domain boundary
+            or a hole has a reflex corner (an L- or V-shaped cell around
+            the node on that corner). ``"hidden_face"`` splits only the
+            concave cells with a face that cannot be seen from the cell
+            centroid (``star_from_centroid`` False in
+            ``vorflow.utils.calculate_mesh_quality``); MODFLOW 6 particle
+            tracking (PRT) can loop forever in such a cell without an
+            error. ``"all"`` splits every concave cell. Each cut runs from
+            the reflex corner along a diagonal of the cell where one works;
+            otherwise it follows the corner's angle bisector, and the
+            neighbour across that face gains a vertex where the cut ends
+            (its shape is unchanged). Where that face is on a barrier,
+            two diagonals to its ends cut it off instead, so every barrier
+            segment stays one face. A zero-width spike (as a barrier end
+            can leave) is removed first. The largest piece holding the
+            generator keeps the cell's ``node_id`` and zone; the others get
+            new IDs above the maximum and the zone that holds most of their
+            area. A cell that cannot be split (e.g. one with a
+            hole, which no DISV cell can represent) is left as it is with a
+            warning, in either mode. Unlike every other cell, a piece of a
+            split cell usually carries its centroid as ``x``/``y``: the
+            generator sits on the reflex corner, at the end of the cut, and
+            a cell centre there makes MODFLOW 6 XT3D crash. A piece that
+            holds the generator clear of its boundary (as next to a
+            barrier, whose sites move it off the corner) keeps it, and a
+            piece with one barrier face takes a point on that face's normal
+            through the generator, so barrier faces stay orthogonal. With the split on, the
+            grid gets a ``concave_split`` column marking the pieces, and
+            ``source_x``/``source_y`` (the mesh node) if it lacks them. The new faces are poor for the flow solution (CVFD
+            skewness about 0.5), so in a test with an exact linear head the
+            error rose from round-off to about 1e-5; use this for particle
+            tracking, not as a general improvement. ``concave_split_report``
+            lists the split cells (``node_id``, ``convexity``,
+            ``n_pieces``, ``piece_ids``, ``min_piece_fraction``).
     """
 
     def __init__(
@@ -601,6 +770,7 @@ class VoronoiTessellator:
         lloyd_tolerance=1e-3,
         lloyd_size_smoothing=5,
         min_face_fraction=0.0,
+        split_concave=False,
     ):
         if boundary_centering not in {"clip", "inset_mirror"}:
             raise ValueError("boundary_centering must be either 'clip' or 'inset_mirror'.")
@@ -614,6 +784,11 @@ class VoronoiTessellator:
                                  size_smoothing=lloyd_size_smoothing)
         if not (0.0 <= float(min_face_fraction) < 1.0):
             raise ValueError(f"min_face_fraction must be in [0, 1). Got {min_face_fraction!r}.")
+        split_off = isinstance(split_concave, (bool, np.bool_)) and not split_concave
+        if not (split_off or (isinstance(split_concave, str) and split_concave in SPLIT_CONCAVE_MODES)):
+            raise ValueError(
+                f"split_concave must be False, 'hidden_face' or 'all'. Got {split_concave!r}."
+            )
 
         if conceptual_mesh is None:
             conceptual_mesh = getattr(mesh_generator, 'conceptual_mesh', None)
@@ -628,6 +803,9 @@ class VoronoiTessellator:
         self.voronoi_gdf = None
         self.final_grid = None
         self.n_barrier_mirrors = 0
+        # Safety-net repairs on exact barrier faces (should stay 0; see _report_barrier_repairs).
+        self.n_exact_barrier_mirrors = 0
+        self.n_exact_barrier_cuts = 0
         self.nodes = mesh_generator.nodes
         self.node_tags = mesh_generator.node_tags
         # Lloyd inputs, captured with the nodes so they stay paired with them;
@@ -636,6 +814,10 @@ class VoronoiTessellator:
         self.node_sizes = getattr(mesh_generator, 'node_sizes', None)
         self.node_edges = getattr(mesh_generator, 'node_edges', None)
         self.buffer_footprints = getattr(mesh_generator, 'buffer_footprints', None)
+        # Barrier construction, captured with the nodes for the same reason.
+        self.node_is_site = getattr(mesh_generator, 'node_is_site', None)
+        self.barrier_lines = getattr(mesh_generator, 'barrier_lines', None)
+        self.barrier_circles = getattr(mesh_generator, 'barrier_circles', None)
         self.zones_gdf = mesh_generator.zones_gdf
         self.clip_to_boundary = clip_to_boundary
         self.boundary_centering = boundary_centering
@@ -653,6 +835,9 @@ class VoronoiTessellator:
         self.min_face_fraction = float(min_face_fraction)
         # {"initial", "final", "passes", "rejected"} after a short-face cleanup.
         self.short_face_report = None
+        self.split_concave = False if split_off else split_concave
+        # One row per split cell after a run with split_concave on.
+        self.concave_split_report = None
 
     def _lloyd_mesh_inputs(self, n_nodes):
         """(node_is_free, node_sizes, buffer_footprints) captured from the mesh generator, checked against ``n_nodes``."""
@@ -707,10 +892,10 @@ class VoronoiTessellator:
         return unary_union(geoms) if geoms else None
 
     def _free_generators(self, nodes):
-        """(owners, free) for the movable mesh nodes: see ``_owner_polygons``."""
+        """(owners, free) for the movable mesh nodes: see ``_lloyd.owner_polygons``."""
         node_is_free, _, footprints = self._lloyd_mesh_inputs(len(nodes))
-        pieces = _zone_pieces(self._embedded_polygons().geometry, footprints)
-        return _owner_polygons(nodes, node_is_free, pieces)
+        pieces = _lloyd.zone_pieces(self._embedded_polygons().geometry, footprints)
+        return _lloyd.owner_polygons(nodes, node_is_free, pieces)
 
     def _relax_generators(self, nodes):
         """Density-weighted Lloyd relaxation of the free mesh nodes (see ``lloyd_iterations``); returns the moved nodes."""
@@ -730,6 +915,7 @@ class VoronoiTessellator:
                 self.lloyd_iterations,
                 damping=self.lloyd_damping,
                 tolerance=self.lloyd_tolerance,
+                circles=self._barrier_circles(),
             )
             logger.info(
                 f"  -> {report['iterations']} passes, last max residual |centroid - node| "
@@ -742,7 +928,8 @@ class VoronoiTessellator:
         """Move free generators until no face is shorter than ``min_face_fraction`` x connector; returns the moved nodes."""
         owners, free = self._free_generators(nodes)
         nodes, report = _lloyd.remove_short_faces(
-            nodes, free, owners, self._lloyd_constraint_lines(), self.min_face_fraction
+            nodes, free, owners, self._lloyd_constraint_lines(), self.min_face_fraction,
+            circles=self._barrier_circles(),
         )
         logger.info(
             f"Short-face cleanup: {report['initial']} -> {report['final']} faces below "
@@ -767,7 +954,7 @@ class VoronoiTessellator:
             domain_geom = unary_union(polygons.geometry)
             if not domain_geom.is_valid:
                 domain_geom = make_valid(domain_geom)
-            return domain_geom
+            return _close_domain_slits(domain_geom)
         if hasattr(self.cm, 'domain_boundary') and self.cm.domain_boundary:
             domain_geom = self.cm.domain_boundary
             if not domain_geom.is_valid:
@@ -790,7 +977,9 @@ class VoronoiTessellator:
         Shift non-corner boundary nodes inward and add mirrored outside ghosts.
 
         A node whose mirror ghost would land inside the domain (e.g. across
-        a narrow hole) keeps its original position and gets no ghost.
+        a narrow hole), or whose ghost's Voronoi cell would cover part of
+        the domain (at a reflex boundary vertex), keeps its original
+        position and gets no ghost; its metadata row says ``"clip"``.
 
         Returns prepared nodes, prepared tags, and a metadata frame keyed by
         node_id. Tags only cover real nodes; appended ghosts receive -1 in
@@ -825,6 +1014,10 @@ class VoronoiTessellator:
         spacing = _boundary_node_spacing(nodes, boundary_indices)
         candidates = np.flatnonzero(spacing > 0)
 
+        # Barrier sites are placed exactly; moving one would bend its faces.
+        sites = self.node_is_site
+        if sites is not None and len(sites) == len(nodes):
+            candidates = candidates[~np.asarray(sites, dtype=bool)[candidates]]
         vertices, vertex_angles = _ring_vertex_angles(domain_geom)
         corner_angles = _ring_angles_at_points(nodes[candidates], vertices, vertex_angles, tolerance)
         # NaN (no matching ring vertex) compares False, so the node is not a corner.
@@ -839,12 +1032,38 @@ class VoronoiTessellator:
         # inside the domain; keep those nodes at their original position.
         ghost_inside = _strictly_inside(domain_geom, ghosts)
         keep = has_normal & ~ghost_inside
+        circles = self._barrier_circles()
+        if circles is not None and len(candidates):
+            # A ghost or inset node inside a barrier circle would bend the barrier faces there.
+            moved = nodes[candidates] + np.nan_to_num(normals) * inset[:, None]
+            keep &= ~_lloyd.inside_circles(ghosts, *circles) & ~_lloyd.inside_circles(moved, *circles)
         if ghost_inside.any():
             logger.info(f"  -> Left {int(ghost_inside.sum())} boundary nodes in place: mirror ghost inside domain")
 
-        centered_indices = candidates[keep]
-        prepared = nodes.astype(float, copy=True)
-        prepared[centered_indices] = nodes[centered_indices] + normals[keep] * inset[keep, None]
+        # A ghost outside the domain can still own part of it: at a reflex
+        # boundary vertex (one bending into the domain) the ghost's face
+        # runs along the averaged tangent, which cuts into the domain on
+        # both sides of the vertex. Ghost cells are discarded, so drop such
+        # ghosts until no ghost cell covers the domain, and put their nodes
+        # back on the boundary (plain clip). Leaving them inset without a
+        # ghost also covers the domain but gives worse face skewness on
+        # finely faceted curves. Reverting a node can open another ghost's
+        # cell, hence the loop.
+        n_leaking = 0
+        while True:
+            centered_indices = candidates[keep]
+            prepared = nodes.astype(float, copy=True)
+            prepared[centered_indices] = nodes[centered_indices] + normals[keep] * inset[keep, None]
+            if not keep.any():
+                break
+            leak = _ghost_cell_domain_areas(prepared, ghosts[keep], domain_geom)
+            leaking = leak > GHOST_LEAK_FRACTION * inset[keep] ** 2
+            if not leaking.any():
+                break
+            n_leaking += int(leaking.sum())
+            keep[np.flatnonzero(keep)[leaking]] = False
+        if n_leaking:
+            logger.info(f"  -> Left {n_leaking} boundary nodes in place: mirror ghost cell covers the domain")
 
         centered = np.zeros(len(nodes), dtype=bool)
         centered[centered_indices] = True
@@ -903,8 +1122,16 @@ class VoronoiTessellator:
         ring_of = np.repeat(np.arange(len(kept)), [len(region) for region in kept])
         ring_vertices = np.concatenate(kept) if kept else np.empty(0, dtype=int)
         polygons = shapely.polygons(shapely.linearrings(vertices[ring_vertices], indices=ring_of))
-        valid = shapely.is_valid(polygons)
+        # Voronoi cells are convex, but Qhull can return near-coincident
+        # vertices out of order (e.g. at a node on a polygonised hole vertex),
+        # so the ring crosses itself at roundoff scale; its hull is the cell.
+        crossed = ~shapely.is_valid(polygons)
+        polygons[crossed] = shapely.convex_hull(polygons[crossed])
+        valid = shapely.get_type_id(polygons) == 3
         generators = finite[valid]
+        n_lost = len(node_tags) - int(np.count_nonzero(generators < len(node_tags)))
+        if n_lost:
+            warn_user(f"The Voronoi diagram has no cell for {n_lost} mesh node(s); the grid has gaps there.")
 
         # Ghost nodes (used to bound the diagram) have no tag. An explicit
         # dtype: a list mixing uint64 tags and -1 infers object.
@@ -918,21 +1145,94 @@ class VoronoiTessellator:
         return gdf
 
     def _barrier_lines(self):
-        """Return the geometries of the clean lines marked is_barrier=True."""
+        """(geometry, exact) of every barrier the grid must respect.
+
+        ``exact`` lines are those whose faces ``MeshGenerator`` placed
+        exactly (its ``barrier_lines``, the lines the faces follow); the
+        other ``is_barrier`` clean lines (quad buffers, or mesh generators
+        without a barrier construction) come from ``clean_lines``.
+        """
+        exact = self.barrier_lines
+        done = set()
+        out = []
+        if exact is not None and not exact.empty:
+            done = {int(fid) for fid in exact['feature_id']}
+            out += [(geom, True) for geom, is_barrier in zip(exact.geometry, exact['is_barrier'])
+                    if is_barrier and geom is not None and not geom.is_empty]
         lines = self.cm.clean_lines
         if lines is None or lines.empty or 'is_barrier' not in lines.columns:
-            return []
+            return out
         mask = lines['is_barrier'].fillna(False).astype(bool)
-        return [geom for geom in lines.loc[mask].geometry if geom is not None and not geom.is_empty]
+        out += [(geom, False) for idx, geom in lines.loc[mask].geometry.items()
+                if int(idx) not in done and geom is not None and not geom.is_empty]
+        return out
+
+    def _barrier_circles(self):
+        """The mesh generator's barrier circles ``(centres, radii)``, or None."""
+        circles = self.barrier_circles
+        if circles is None or len(circles[0]) == 0:
+            return None
+        return np.asarray(circles[0], dtype=float), np.asarray(circles[1], dtype=float)
+
+    def _barrier_band(self, grid):
+        """Mask of the grid cells next to a barrier: the barrier sites' cells and the cells touching them."""
+        sites, tags = self.node_is_site, self.node_tags
+        if grid.empty or sites is None or tags is None or len(sites) != len(tags) or not np.any(sites):
+            return np.zeros(len(grid), dtype=bool)
+        is_site = np.isin(grid['node_id'].to_numpy(), np.asarray(tags)[np.asarray(sites, dtype=bool)])
+        cells = grid.geometry.to_numpy()
+        extent = float(max(np.ptp(np.asarray(grid.total_bounds).reshape(2, 2), axis=0)))
+        tree = shapely.STRtree(cells)
+        _, touching = tree.query(cells[is_site], predicate='dwithin', distance=max(ZONE_EDGE_FRACTION * extent, 1e-12))
+        band = is_site.copy()
+        band[touching] = True
+        return band
+
+    def _check_circles_empty(self, generators, all_generators=False):
+        """Raise BarrierMeshError if a generator other than a barrier site lies inside a barrier circle.
+
+        A cheap last check of the empty-circle rule on the generators the
+        Voronoi diagram is built from; ``all_generators`` for extra points
+        (boundary ghosts) that are never sites.
+        """
+        circles = self._barrier_circles()
+        if circles is None:
+            return
+        generators = np.asarray(generators, dtype=float).reshape(-1, 2)
+        inside = _lloyd.inside_circles(generators, *circles)
+        sites = self.node_is_site
+        if not all_generators and sites is not None and len(sites) == len(generators):
+            inside &= ~np.asarray(sites, dtype=bool)
+        if inside.any():
+            x, y = generators[np.flatnonzero(inside)[0]]
+            raise BarrierMeshError(
+                f"{int(inside.sum())} generator(s) lie inside the barrier circles (first at ({x:.2f}, {y:.2f})), "
+                "so the barrier faces there would not be exact. Please report this with the model."
+            )
+
+    def _report_barrier_repairs(self):
+        """Warn (or raise, with _STRICT_BARRIERS) when the safety net touched an exact barrier."""
+        mirrors, cuts = self.n_exact_barrier_mirrors, self.n_exact_barrier_cuts
+        if mirrors == 0 and cuts == 0:
+            return
+        message = (
+            f"Exact barrier faces needed {mirrors} mirror generator(s) and {cuts} cut cell(s) from the "
+            "tessellator's safety net; the barrier sites did not make every barrier segment a face. "
+            "Please report this with the model."
+        )
+        if _STRICT_BARRIERS:
+            raise BarrierMeshError(message)
+        warn_user(message)
 
     def _barrier_mirror_points(self, raw_gdf, generators, domain_geom):
         """
-        Return mirror generators for nodes whose Voronoi cell a barrier crosses.
+        Return (mirror generators, how many are for exact barriers) for nodes whose Voronoi cell a barrier crosses.
 
-        The straddle mechanism in MeshGenerator puts node pairs on either
-        side of a barrier so that their shared Voronoi face lies on it. Other
-        nodes near the line (mesh nodes between the pairs, nodes of a line
-        crossing the barrier) have no partner, and their cells straddle it.
+        A safety net: with exact barrier faces (``MeshGenerator.barrier_lines``)
+        no cell crosses a barrier, and any mirror here is reported by
+        ``_report_barrier_repairs``. For other barriers (quad buffers, or
+        nodes from elsewhere), a node near the line can have a cell that
+        straddles it.
         Reflecting such a node across the barrier gives it that partner: the
         bisector of the two is the barrier line, so after re-tessellation
         both cells stop at the line and every face stays a Voronoi bisector.
@@ -944,21 +1244,21 @@ class VoronoiTessellator:
         the line is large enough to stay a cell of its own after that split
         (see BARRIER_FRAGMENT_MERGE_FRACTION): every point of the piece is
         nearer to the mirror than to any other node, so the mirror's clipped
-        cell covers it. That cell's x/y then lies outside the cell, as with
-        the engine's straddle pair at a barrier end. A smaller piece would
+        cell covers it. That cell's x/y then lies outside the cell. A smaller piece would
         leave the mirror a corner cell of a few thousandths of lc^2; the
         split merges it into a neighbour instead.
         """
         barriers = self._barrier_lines()
         cells = raw_gdf[raw_gdf['node_id'] != -1]
         if not barriers or cells.empty:
-            return np.empty((0, 2))
+            return np.empty((0, 2)), 0
 
         scale = max(float(np.ptp(generators, axis=0).max()), 1.0)
         tolerance = scale * 1e-8
         tree = cKDTree(generators)
         mirrors = []
-        for line in barriers:
+        n_exact = 0
+        for line, exact in barriers:
             for position in cells.sindex.query(line, predicate='intersects'):
                 cell = cells.iloc[position]
                 # A barrier ending on the domain boundary ends inside the raw
@@ -986,7 +1286,8 @@ class VoronoiTessellator:
                 if any(np.hypot(*(mirror - other)) < merge_distance for other in mirrors):
                     continue
                 mirrors.append(mirror)
-        return np.array(mirrors) if mirrors else np.empty((0, 2))
+                n_exact += int(exact)
+        return (np.array(mirrors) if mirrors else np.empty((0, 2))), n_exact
 
     def _build_barrier_conforming_voronoi(self, nodes, tags, boundary_ghosts, far_ghosts, node_metadata):
         """
@@ -1002,12 +1303,14 @@ class VoronoiTessellator:
         domain_geom = self._domain_geometry() if self.clip_to_boundary else None
         raw_gdf = self._build_raw_voronoi(np.vstack([nodes, boundary_ghosts, far_ghosts]), tags)
         self.n_barrier_mirrors = 0
+        self.n_exact_barrier_mirrors = 0
         if raw_gdf.empty:
             return raw_gdf, node_metadata
 
         for _ in range(BARRIER_MIRROR_PASSES):
             generators = np.vstack([nodes, boundary_ghosts])
-            mirrors = self._barrier_mirror_points(raw_gdf, generators, domain_geom)
+            mirrors, n_exact = self._barrier_mirror_points(raw_gdf, generators, domain_geom)
+            self.n_exact_barrier_mirrors += n_exact
             if len(mirrors) == 0:
                 break
             # Python ints avoid NumPy scalar overflow for large (e.g. uint64) node IDs.
@@ -1031,11 +1334,9 @@ class VoronoiTessellator:
 
         Every line marked `is_barrier=True` is checked, whatever its meshing
         method. Barrier mirror generators (_barrier_mirror_points) already
-        stop most cells at the line; what is left here is mainly nodes that
-        lie on the line itself (quad_buffer_thickness=2 puts a node row on
-        it), cells the mirror passes did not finish, and the bulges of a
-        curved barrier across its straddle pairs' faces (chords of the
-        curve). A cell is split only when the line leaves at least two
+        stop most cells at the line; what is left here is mainly cells the
+        mirror passes did not finish, such as those at a bend of a
+        quad-buffer barrier. A cell is split only when the line leaves at least two
         pieces larger than BARRIER_SLIVER_FRACTION of its area; cells the
         line merely runs along are left untouched. Cut points within
         roundoff of a cell vertex are merged into it, so the split adds no
@@ -1057,21 +1358,15 @@ class VoronoiTessellator:
         Returns:
             gpd.GeoDataFrame: An updated grid with cells split along barrier lines.
         """
-        if self.cm.clean_lines.empty:
-            return grid_gdf
-
-        # fillna keeps the old `== True` semantics: rows with a missing
-        # is_barrier value are treated as non-barriers, not as errors.
-        mask_barrier = self.cm.clean_lines['is_barrier'].fillna(False).astype(bool)
-        barriers_to_cut = self.cm.clean_lines[mask_barrier]
-
-        if barriers_to_cut.empty:
+        self.n_exact_barrier_cuts = 0
+        barriers_to_cut = self._barrier_lines()
+        if not barriers_to_cut:
             return grid_gdf
 
         logger.info(f"Enforcing Barrier Cuts on {len(barriers_to_cut)} lines...")
 
         current_grid = grid_gdf
-        barrier_lines = list(barriers_to_cut.geometry)
+        barrier_lines = [line for line, _ in barriers_to_cut]
 
         # Keep the caller's integer dtype while assigning fragment IDs with
         # Python integers, avoiding NumPy scalar arithmetic during increments.
@@ -1079,9 +1374,7 @@ class VoronoiTessellator:
         max_id = int(grid_gdf['node_id'].max())
         n_merged = 0
 
-        for idx, row in barriers_to_cut.iterrows():
-            line = row.geometry
-
+        for line, exact in barriers_to_cut:
             # Use a spatial index to quickly find cells that might intersect the line.
             possible_matches_index = list(current_grid.sindex.query(line, predicate='intersects'))
             candidate_cells = current_grid.iloc[possible_matches_index]
@@ -1121,6 +1414,7 @@ class VoronoiTessellator:
 
             if not cells_to_remove_indices:
                 continue
+            self.n_exact_barrier_cuts += len(cells_to_remove_indices) if exact else 0
 
             # Rebuild the grid with the primary pieces, then let small
             # fragments join a neighbour on their side of the barrier.
@@ -1179,10 +1473,12 @@ class VoronoiTessellator:
         7. Enforcing barrier lines by splitting cells that still straddle them.
         8. Merging cell vertices a roundoff distance apart, so no cell has
            a zero-length edge.
-        9. Calculating final cell properties. After Lloyd relaxation this
-           includes ``lloyd_shift``: how far each mesh node moved (0 for fixed
-           nodes; NaN for cells without a mesh node of their own: barrier
-           mirrors, barrier fragments and detached cell parts).
+        9. With ``split_concave``, cutting concave cells into convex pieces.
+        10. Calculating final cell properties. After Lloyd relaxation this
+            includes ``lloyd_shift``: how far each mesh node moved (0 for
+            fixed nodes; NaN for cells without a mesh node of their own:
+            barrier mirrors, barrier fragments, detached cell parts and the
+            new pieces of split concave cells).
 
         Returns:
             gpd.GeoDataFrame: The final, clean Voronoi grid.
@@ -1208,6 +1504,7 @@ class VoronoiTessellator:
 
         self.lloyd_report = None
         self.short_face_report = None
+        self.concave_split_report = None
         lloyd_shift = None
         if self.lloyd_iterations > 0 or self.min_face_fraction > 0:
             relaxed = nodes
@@ -1218,22 +1515,15 @@ class VoronoiTessellator:
             lloyd_shift = pd.Series(np.hypot(*(relaxed - nodes).T), index=tags)
             nodes = relaxed
 
+        self._check_circles_empty(nodes)
         nodes, tags, boundary_ghost_nodes, node_metadata = self._prepare_boundary_centered_nodes(nodes, tags)
+        if len(boundary_ghost_nodes):
+            self._check_circles_empty(boundary_ghost_nodes, all_generators=True)
         
         # To create a bounded Voronoi diagram from a finite set of points, a common
         # technique is to add "ghost" nodes far outside the area of interest. The
         # large, unwanted cells generated by these ghosts can then be clipped away.
-        minx, miny = np.min(nodes, axis=0)
-        maxx, maxy = np.max(nodes, axis=0)
-        w, h = maxx - minx, maxy - miny
-        buffer = max(w, h) * 10
-        
-        ghost_nodes = np.array([
-            [minx - buffer, miny - buffer],
-            [maxx + buffer, miny - buffer],
-            [maxx + buffer, maxy + buffer],
-            [minx - buffer, maxy + buffer]
-        ])
+        ghost_nodes = _far_ghost_nodes(nodes)
         
         logger.info("Computing Mathematical Voronoi...")
         raw_gdf, node_metadata = self._build_barrier_conforming_voronoi(
@@ -1317,6 +1607,7 @@ class VoronoiTessellator:
                 how="left",
             )
         
+        zoned_grid = _edge_cells_to_majority_zone(zoned_grid, zones, self._barrier_band(zoned_grid))
         logger.info(f"  -> Zones Assigned: {len(zoned_grid)}")
         
         # Clipping can create MultiPolygons; explode them into single parts
@@ -1326,22 +1617,43 @@ class VoronoiTessellator:
         # Enforce barriers by splitting cells.
         self.final_grid = self._enforce_barriers(zoned_grid)
         logger.info(f"  -> After Barrier Cuts: {len(self.final_grid)}")
+        self._report_barrier_repairs()
 
         # Final cleanup after potential splits.
         self.final_grid = _explode_with_unique_ids(self.final_grid)
         self.final_grid = _merge_close_vertices(self.final_grid)
+        if self.split_concave:
+            self.final_grid = self._split_concave_cells(self.final_grid)
         if lloyd_shift is not None:
             # Cells with a node_id that is no mesh node get NaN.
             self.final_grid['lloyd_shift'] = self.final_grid['node_id'].map(lloyd_shift)
 
-        # The 'x' and 'y' columns should always refer to the generator point
-        # coordinates, which are essential for quality analysis. We add separate
-        # columns for the geometric centroid of the final cell.
+        # The 'x' and 'y' columns refer to the generator point coordinates,
+        # which are essential for quality analysis (except on most split
+        # concave pieces, which carry their centroid). We add separate columns for the
+        # geometric centroid of the final cell.
         self.final_grid['centroid_x'] = self.final_grid.geometry.centroid.x
         self.final_grid['centroid_y'] = self.final_grid.geometry.centroid.y
         
         logger.info(f"Final Voronoi Grid Generated: {len(self.final_grid)} cells.")
         return self.final_grid
+
+    def _split_concave_cells(self, grid):
+        """Grid with the concave cells selected by ``split_concave`` cut into convex pieces."""
+        geoms = grid.geometry.to_numpy()
+        concave = shapely.area(geoms) / shapely.area(shapely.convex_hull(geoms)) < 1.0 - CONCAVE_TOLERANCE
+        if self.split_concave == "hidden_face":
+            concave &= ~(centroid_fan_fraction(geoms) > 0.0)
+        targets = np.flatnonzero(concave)
+        lines = [line for line, _ in self._barrier_lines()]
+        barriers = shapely.union_all(lines) if lines else None
+        grid, self.concave_split_report = split_concave_cells(grid, targets, barriers)
+        report = self.concave_split_report
+        new_pieces = [i for ids in report['piece_ids'] for i in ids[1:]]
+        grid = zone_by_area(grid, new_pieces, self._embedded_polygons()[['geometry', 'zone_id', 'z_order']])
+        added = int(report['n_pieces'].sum()) - len(report)
+        logger.info(f"  -> Split {len(report)} concave cells into convex pieces (+{added} cells)")
+        return grid
 
     def to_file(self, filepath, **kwargs):
         """
@@ -1441,6 +1753,104 @@ class VoronoiTessellator:
             botm=botm,
             **kwargs,
         )
+
+    def to_mfusg_disu(self, top, botm, nlay=1, gsf_path=None):
+        """Return MODFLOW-USG DISU arrays and metadata for the last grid.
+
+        See :func:`vorflow.utils.grid_to_mfusg_disu` for shapes, validation,
+        node mapping and face diagnostics. FloPy is not required. The arrays
+        use USG ``IVSD``/``FAHL`` conventions, **not MF6 DISU** conventions.
+        Bent or disconnected shared faces are rejected.
+
+        Args:
+            top: Scalar or one value per horizontal cell.
+            botm: Scalar, one bottom per layer, or ``(nlay, ncpl)`` array.
+            nlay (int): Number of stacked layers. Default 1.
+            gsf_path (str or Path, optional): Also write the matching GSF
+                file here, from the same validated grid.
+
+        Returns:
+            dict: USG DISU arguments plus ``node_id``, ``cell_map`` and
+            ``connectivity`` metadata. Node numbers are zero-based.
+
+        Raises:
+            RuntimeError: If ``generate()`` has not run.
+            ValueError: If geometry or elevations are unsupported.
+        """
+        return grid_to_mfusg_disu(self.grid, top, botm, nlay, gsf_path=gsf_path)
+
+    def to_mfusgdisu(self, model, top, botm, nlay=1, gsf_path=None, **kwargs):
+        """Attach a FloPy ``MfUsgDisU`` package to a MODFLOW-USG model.
+
+        FloPy is imported only here. Mapping/diagnostic metadata are excluded
+        from the constructor arguments. Use ``model.write_input()`` or the
+        returned package's ``write_file()`` to write DISU. This method does
+        not create an MF6 ``ModflowGwfdisu`` package.
+
+        Args:
+            model (flopy.mfusg.MfUsg): An unstructured (``structured=False``)
+                MODFLOW-USG model.
+            top: Scalar or one value per horizontal cell.
+            botm: Scalar, one bottom per layer, or ``(nlay, ncpl)`` array.
+            nlay (int): Number of stacked layers. Default 1.
+            gsf_path (str or Path, optional): Also write the matching GSF
+                file here, from the same validated grid.
+            **kwargs: Other ``MfUsgDisU`` options, e.g. ``nper``, ``perlen``,
+                ``steady``, ``itmuni`` and ``lenuni``. Grid arrays/flags and
+                confining beds cannot be overridden.
+
+        Returns:
+            flopy.mfusg.MfUsgDisU: The attached package.
+
+        Raises:
+            ImportError: If FloPy is not installed.
+            RuntimeError: If ``generate()`` has not run.
+            ValueError: For invalid model, grid or conflicting options.
+        """
+        try:
+            import flopy
+        except ImportError as err:
+            raise ImportError(
+                "to_mfusgdisu() needs flopy; install `vorflow[examples]` or "
+                "`flopy`, or use to_mfusg_disu() for the plain arrays."
+            ) from err
+        from ._mfusg import METADATA_KEYS, PACKAGE_KEYS
+
+        if not isinstance(model, flopy.mfusg.MfUsg) or model.structured:
+            raise ValueError("model must be a flopy.mfusg.MfUsg with structured=False, not an MF6 model.")
+        # Check options before exporting, so a rejected call writes no GSF.
+        protected = PACKAGE_KEYS | METADATA_KEYS | {"ivc", "cl1", "cl2"}
+        conflicts = protected.intersection(kwargs)
+        if conflicts:
+            raise ValueError(f"Cannot override generated MFUSG grid arguments: {sorted(conflicts)}.")
+        if np.any(np.asarray(kwargs.get("laycbd", 0)) != 0):
+            raise ValueError("Confining beds (laycbd != 0) are not supported.")
+        grid = self.to_mfusg_disu(top, botm, nlay, gsf_path=gsf_path)
+        args = {key: grid[key] for key in PACKAGE_KEYS}
+        return flopy.mfusg.MfUsgDisU(model, **args, **kwargs)
+
+    def to_gsf(self, filepath, top, botm, nlay=1):
+        """Write original 3D GSF geometry matching :meth:`to_mfusg_disu`.
+
+        See :func:`vorflow.utils.grid_to_gsf`. FloPy is not required. To
+        write DISU and GSF together, pass ``gsf_path`` to
+        :meth:`to_mfusg_disu` or :meth:`to_mfusgdisu` instead; the grid is
+        then validated once. Bent and disconnected shared faces are rejected.
+
+        Args:
+            filepath (str or Path): Destination file.
+            top: Scalar or one value per horizontal cell.
+            botm: Scalar, one bottom per layer, or ``(nlay, ncpl)`` array.
+            nlay (int): Number of stacked layers. Default 1.
+
+        Returns:
+            pathlib.Path: The written file.
+
+        Raises:
+            RuntimeError: If ``generate()`` has not run.
+            ValueError: If geometry or elevations are unsupported.
+        """
+        return grid_to_gsf(self.grid, filepath, top, botm, nlay)
 
     def plot(self, ax=None, column="zone_id", show_generators=False, **kwargs):
         """

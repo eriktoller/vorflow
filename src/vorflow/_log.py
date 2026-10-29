@@ -20,9 +20,13 @@ console handler and let messages propagate to the application's handlers
 from __future__ import annotations
 
 import logging
+import os
+import sys
+import warnings
 from contextlib import contextmanager
 
 LOGGER_NAME = "vorflow"
+PACKAGE_DIR = os.path.dirname(os.path.abspath(__file__)) + os.sep
 
 _LEVELS = {0: logging.WARNING, 1: logging.INFO}
 
@@ -82,3 +86,18 @@ def verbosity_scope(verbosity):
         yield
     finally:
         logger.setLevel(previous)
+
+
+def warn_user(message: str, category: type = UserWarning, package_dir: str = PACKAGE_DIR) -> None:
+    """``warnings.warn`` attributed to the first caller outside vorflow.
+
+    A fixed ``stacklevel`` is wrong whenever the same warning can be reached
+    along call chains of different depth (``ConceptualMesh.generate()``
+    directly, or through ``MeshGenerator.generate()``), so count the vorflow
+    frames instead.
+    """
+    level, frame = 2, sys._getframe(1)
+    while frame is not None and frame.f_code.co_filename.startswith(package_dir):
+        frame = frame.f_back
+        level += 1
+    warnings.warn(message, category, stacklevel=level)

@@ -16,6 +16,11 @@ from shapely.geometry import LineString, MultiLineString, MultiPolygon, Polygon
 from shapely.validation import make_valid
 
 DEFAULT_CONNECTIVITY_TOLERANCE = 1e-3
+# A hex_ring point's ring seeds sit at 1 x lc; every other node-bearing feature
+# (barrier sites included) must stay at least HEX_RING_CLEARANCE x lc away, so
+# at least one cell width separates the ring from foreign nodes (closer ones
+# would cut the hexagon).
+HEX_RING_CLEARANCE = 2.0
 
 
 def is_embedded(row) -> bool:
@@ -44,6 +49,14 @@ def positive_number(value) -> float | None:
         # Non-numeric column content means "not set".
         return None
     return value if value > 0 else None
+
+
+def is_face_line(row) -> bool:
+    """True for a line whose cell faces follow it exactly: an embedded barrier (or a line with the
+    deprecated ``straddle_width``) without a quad buffer. These go through ``vorflow._barrier``."""
+    if row_bool(row, 'quad_buffer', False) or not is_embedded(row):
+        return False
+    return row_bool(row, 'is_barrier', False) or positive_number(row.get('straddle_width')) is not None
 
 
 def ring_seed_coords(row) -> list:

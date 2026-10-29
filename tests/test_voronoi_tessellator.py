@@ -5,13 +5,15 @@ import numpy as np
 import pandas as pd
 import pytest
 import shapely
-from shapely.geometry import LineString, Point, Polygon
+from shapely.affinity import translate
+from shapely.geometry import LineString, Point, Polygon, box
 from shapely.ops import unary_union
 
 from vorflow.blueprint import ConceptualMesh
+from vorflow.engine import MeshGenerator
 import vorflow.tessellator as tessellator_module
 from vorflow.tessellator import VoronoiTessellator
-from vorflow.utils import boundary_connectivity_report, build_connectivity
+from vorflow.utils import boundary_connectivity_report, build_connectivity, grid_to_mfusg_disu
 
 
 class DummyMeshGenerator:
@@ -39,6 +41,148 @@ def _plain_barrier_tessellator():
     cm.generate()
     mesh_gen = DummyMeshGenerator(nodes=np.empty((0, 2)), tags=[], zones_gdf=cm.clean_polygons)
     return VoronoiTessellator(mesh_gen, cm), cm.clean_lines.iloc[0].geometry
+
+
+def test_close_domain_slits_removes_seams_and_keeps_vertices():
+    # Cookie-cut zones leave the union with a zero-width hole and parts that meet only along a seam.
+    slit_hole = Polygon([(0, 0), (4, 0), (4, 2), (0, 2)], [[(1, 1), (3, 1 + 1e-13), (3, 1)]])
+    seam_part = Polygon([(4 + 1e-14, 0), (6, 0), (6, 2), (4 + 1e-14, 2)])
+    domain = shapely.MultiPolygon([slit_hole, seam_part])
+
+    closed = tessellator_module._close_domain_slits(domain)
+
+    assert closed.geom_type == "Polygon" and not closed.interiors
+    assert closed.area == pytest.approx(12.0)
+    assert closed.symmetric_difference(box(0, 0, 6, 2)).area < 1e-9
+    assert closed.hausdorff_distance(box(0, 0, 6, 2)) < 1e-9
+
+
+def _clip_frame(cells, generators):
+    return gpd.GeoDataFrame(
+        {"node_id": np.arange(len(cells)), "x": [g[0] for g in generators], "y": [g[1] for g in generators]},
+        geometry=cells,
+    )
+
+
+def test_clip_to_domain_keeps_a_covered_cell_that_intersection_loses(monkeypatch):
+    # GEOS 3.14 intersected a cell that a domain with a 4e-12 sliver hole fully covers into a LineString.
+    domain = box(0, 0, 4, 2)
+    cells = [box(0, 0, 1, 1), box(3, 1, 5, 3)]
+    intersection = shapely.intersection
+
+    def lossy_intersection(a, b, **kwargs):
+        pieces = np.array(intersection(a, b, **kwargs), dtype=object)
+        pieces[0] = LineString([(0, 0), (1, 1)])
+        return pieces
+
+    monkeypatch.setattr(tessellator_module.shapely, "intersection", lossy_intersection)
+    clipped = tessellator_module._clip_to_domain(_clip_frame(cells, [(0.5, 0.5), (3.5, 1.5)]), domain)
+
+    assert clipped.geometry.iloc[0].equals(cells[0])
+    assert clipped.geometry.iloc[1].area == pytest.approx(1.0)
+
+
+def test_clip_to_domain_warns_when_a_cell_with_its_generator_inside_is_lost(monkeypatch):
+    domain = box(0, 0, 4, 2)
+    cells = [box(3, 1, 5, 3)]
+    monkeypatch.setattr(tessellator_module.shapely, "intersection", lambda a, b, **kwargs: np.array([Point(4, 2)]))
+
+    with pytest.warns(UserWarning, match="lost 1 cell"):
+        tessellator_module._clip_to_domain(_clip_frame(cells, [(3.5, 1.5)]), domain)
+
+
+def test_clip_to_domain_warns_when_a_cell_with_its_generator_on_the_boundary_is_lost(monkeypatch):
+    # A generator on a slanted edge can test as just outside the domain by roundoff.
+    domain = Polygon([(0, 0), (3, 0), (0, 7)])
+    generator = (0.7, 7.0 - 7.0 * 0.7 / 3.0)
+    assert not shapely.intersects(domain, Point(generator))
+    cells = [box(0.2, 4.9, 1.2, 5.9)]
+    monkeypatch.setattr(tessellator_module.shapely, "intersection", lambda a, b, **kwargs: np.array([Point(0.2, 4.9)]))
+
+    with pytest.warns(UserWarning, match="lost 1 cell"):
+        tessellator_module._clip_to_domain(_clip_frame(cells, [generator]), domain)
+
+
+@pytest.mark.slow
+def test_node_on_a_polygonised_hole_vertex_keeps_its_cell():
+    # Fuzz case 149: Qhull returned a node's cell, at a vertex of a polygonised hole with a UTM offset,
+    # with three near-coincident vertices out of order. The ring crossed itself, and the invalid cell
+    # was dropped without a warning, leaving a gap of 0.09% of the domain.
+    square_with_hole = shapely.from_wkt(
+        "POLYGON ((0 0, 0 2.128642845508457, 2.128642845508457 2.128642845508457, "
+        "2.128642845508457 0, 0 0), (0.9456124990914114 1.3916865080097216, "
+        "0.9039352981909929 1.454060847049055, 0.8415609591516595 1.4957380479494735, "
+        "0.767985409667358 1.510373134678655, 0.6944098601830563 1.4957380479494735, "
+        "0.6320355211437229 1.454060847049055, 0.5903583202433045 1.3916865080097216, "
+        "0.5757232335141229 1.31811095852542, 0.5903583202433045 1.2445354090411185, "
+        "0.632035521143723 1.182161070001785, 0.6944098601830564 1.1404838691013666, "
+        "0.767985409667358 1.125848782372185, 0.8415609591516595 1.1404838691013666, "
+        "0.903935298190993 1.182161070001785, 0.9456124990914114 1.2445354090411185, "
+        "0.960247585820593 1.31811095852542, 0.9456124990914114 1.3916865080097216))"
+    )
+    cm = ConceptualMesh()
+    cm.add_polygon(translate(square_with_hole, 603698.3659436753, 1700226.9461342595),
+                   zone_id=1, resolution=0.187152851766405)
+    polys, lines, points = cm.generate()
+    mg = MeshGenerator(background_lc=0.187152851766405, verbosity=0)
+    mg.generate(polys, lines, points)
+
+    grid = VoronoiTessellator(mg, cm).generate()
+
+    domain = shapely.union_all(polys.geometry.to_numpy())
+    assert set(np.asarray(mg.node_tags, dtype=np.int64)) <= set(grid["node_id"])
+    assert domain.difference(shapely.union_all(grid.geometry.to_numpy())).area < 1e-9 * domain.area
+
+
+@pytest.mark.slow
+def test_zones_overhanging_the_domain_lose_no_cells():
+    # Fuzz case 66: the cookie-cut zones overhang the domain polygon, and their union carried roundoff
+    # slits that dropped a fully covered cell (0.04% of the area) and split others along a seam, which
+    # broke the MFUSG export ("Centres must lie on opposite sides of the shared face").
+    cm = ConceptualMesh()
+    cm.add_polygon(shapely.from_wkt(
+        "POLYGON ((707.8171713013712 1256.8154133818819, 509.38719578475093 2167.3960044846585, "
+        "361.30183440750034 3092.407445374673, 683.8132508300083 3624.485715630085, "
+        "2278.9538122697886 4501.929830679173, 3922.2791548812697 2624.123455160941, "
+        "707.8171713013712 1256.8154133818819))"), zone_id=1, resolution=310.04995695889556)
+    cm.add_polygon(shapely.from_wkt(
+        "POLYGON ((2445.454842801927 1855.7144392388266, 2146.5987642541936 2853.414296097322, "
+        "151.19905053720345 2255.7021390018554, 450.05512908493677 1258.0022821433597, "
+        "2445.454842801927 1855.7144392388266))"), zone_id=2, resolution=61.44363850514341, z_order=1)
+    cm.add_polygon(shapely.from_wkt(
+        "POLYGON ((451.42571161748265 3851.8313499106816, -145.43927314813618 2829.068561365194, "
+        "1900.0863039428386 1635.3385918339563, 2496.9512887084575 2658.101380379444, "
+        "451.42571161748265 3851.8313499106816))"), zone_id=3, resolution=131.5819756549956, z_order=2)
+    polys, lines, points = cm.generate()
+    mg = MeshGenerator(background_lc=310.04995695889556, verbosity=0)
+    mg.generate(polys, lines, points)
+
+    grid = VoronoiTessellator(mg, cm).generate()
+
+    domain = shapely.union_all(polys.geometry.to_numpy())
+    assert len(grid) == len(mg.nodes)
+    assert abs(grid.geometry.area.sum() - domain.area) < 1e-9 * domain.area
+    grid_to_mfusg_disu(grid, 10.0, 0.0)
+
+
+def test_generate_uses_the_mesh_generator_state_captured_at_construction():
+    # A mesh generator re-run after the tessellator was built must not mix its new barrier
+    # sites and circles with the captured nodes.
+    cm = _build_conceptual_mesh()
+    clean_polys, _, _ = cm.generate()
+    nodes = np.array([[0.25, 0.25], [0.75, 0.25], [0.25, 0.75], [0.75, 0.75]])
+    mesh_gen = DummyMeshGenerator(nodes=nodes, tags=np.arange(1, 5), zones_gdf=clean_polys)
+    tessellator = VoronoiTessellator(mesh_gen, cm)
+
+    mesh_gen.node_is_site = np.array([True, False])
+    mesh_gen.barrier_circles = (np.array([[0.5, 0.5]]), np.array([1.0]))
+    mesh_gen.barrier_lines = gpd.GeoDataFrame(
+        {"feature_id": [0], "is_barrier": [True]}, geometry=[LineString([(0.5, 0), (0.5, 1)])]
+    )
+    grid = tessellator.generate()
+
+    assert len(grid) == 4
+    assert tessellator.n_barrier_mirrors == 0
 
 
 def test_enforce_barriers_preserves_uint64_ids_and_split_fragments():
@@ -429,6 +573,8 @@ def test_boundary_inset_mirror_offsets_scale_with_local_spacing():
     # Default fraction 0.25 of the nearest boundary-node spacing (0.5 and 0.2).
     assert np.isclose(coarse_inset, 0.125)
     assert np.isclose(fine_inset, 0.05)
+    # One ghost per centred node on any domain: a node whose ghost is
+    # dropped (lands inside, or its cell leaks) is not centred either.
     assert len(ghosts) == int(metadata["boundary_centered"].sum())
     assert not np.allclose(prepared, nodes)
 
@@ -487,6 +633,90 @@ def test_boundary_inset_mirror_keeps_node_when_ghost_lands_inside_domain():
     grid = tessellator.generate()
     assert grid["node_id"].is_unique
     assert grid.geometry.area.sum() == pytest.approx(domain.area)
+
+
+def _unshared_interior_edges(grid, domain):
+    """Return cell edges used by one cell only that do not lie on the domain boundary (MF6 disconnected faces)."""
+    counts = {}
+    for geom in grid.geometry:
+        coords = np.round(np.asarray(geom.exterior.coords), 9)
+        for a, b in zip(map(tuple, coords[:-1]), map(tuple, coords[1:])):
+            key = (min(a, b), max(a, b))
+            counts[key] = counts.get(key, 0) + 1
+    boundary = domain.boundary.buffer(1e-9)
+    return [edge for edge, count in counts.items() if count == 1 and not boundary.covers(LineString(edge))]
+
+
+def test_boundary_inset_mirror_covers_domain_around_irregular_hole():
+    """Catches ghost cells that reach into the domain at the reflex vertices of an irregular hole (issue #71)."""
+    hole = [(3, 3), (7, 3.5), (6, 5), (7.5, 7), (4, 6.5), (4.5, 5)]
+    domain = Polygon([(0, 0), (10, 0), (10, 10), (0, 10)], [hole])
+    cm = ConceptualMesh()
+    cm.add_polygon(domain, zone_id=1, densify=False)
+    clean_polys, _, _ = cm.generate()
+
+    # Every hole vertex is reflex seen from the domain; there a mirror
+    # ghost's face cuts into the domain. Hole nodes alternate short and
+    # long gaps, so neighbouring insets differ and those strips are wide.
+    ring = domain.interiors[0]
+    distances = np.cumsum(np.r_[0.0, np.tile([0.25, 0.25, 1.2, 0.6], 20)])
+    hole_nodes = [ring.interpolate(d).coords[0] for d in distances[distances < ring.length]]
+    outer_nodes = [domain.exterior.interpolate(d).coords[0] for d in np.arange(0.0, 40.0, 1.0)]
+    lattice = np.mgrid[0.5:10:1.0, 0.5:10:1.0].reshape(2, -1).T
+    inner = domain.buffer(-0.3)
+    interior_nodes = lattice[shapely.contains_xy(inner, lattice[:, 0], lattice[:, 1])]
+    nodes = np.vstack([hole_nodes, outer_nodes, interior_nodes])
+    tags = np.arange(1, len(nodes) + 1)
+    mesh_gen = DummyMeshGenerator(nodes=nodes, tags=tags, zones_gdf=clean_polys)
+
+    grid = VoronoiTessellator(mesh_gen, cm, boundary_centering="inset_mirror").generate()
+
+    covered = unary_union(list(grid.geometry))
+    assert domain.difference(covered).area < 1e-9
+    assert grid.geometry.area.sum() == pytest.approx(domain.area, rel=1e-12)
+    assert _unshared_interior_edges(grid, domain) == []
+    # Nodes whose ghost leaked go back on the boundary and are clipped; the
+    # rest keep their mirror ghost.
+    hole_rows = grid["source_x"].round(9).isin(np.round(np.asarray(hole_nodes)[:, 0], 9))
+    hole_modes = grid.loc[hole_rows, "boundary_centering"]
+    assert (hole_modes == "clip").any()
+    assert (hole_modes == "inset_mirror").mean() > 0.5
+    # Detached parts of a clipped cell get fresh node_ids and their own centroid.
+    clipped = grid[(grid["boundary_centering"] == "clip") & grid["node_id"].isin(tags)]
+    assert not clipped["boundary_centered"].any()
+    assert np.allclose(clipped[["x", "y"]].to_numpy(), clipped[["source_x", "source_y"]].to_numpy())
+
+
+def test_boundary_inset_mirror_clips_every_node_on_a_circular_hole():
+    """Catches ghost cells leaking at a circular hole, whose vertices are all reflex (issue #71)."""
+    angles = np.linspace(0.0, 2 * np.pi, 32, endpoint=False)
+    hole_nodes = np.c_[5 + 2.5 * np.cos(angles), 5 + 2.5 * np.sin(angles)]
+    domain = Polygon([(0, 0), (10, 0), (10, 10), (0, 10)], [hole_nodes])
+    cm = ConceptualMesh()
+    cm.add_polygon(domain, zone_id=1, densify=False)
+    clean_polys, _, _ = cm.generate()
+
+    outer_nodes = [domain.exterior.interpolate(d).coords[0] for d in np.arange(0.0, 40.0, 0.5)]
+    lattice = np.mgrid[0.25:10:0.5, 0.25:10:0.5].reshape(2, -1).T
+    inner = domain.buffer(-0.3)
+    interior_nodes = lattice[shapely.contains_xy(inner, lattice[:, 0], lattice[:, 1])]
+    nodes = np.vstack([hole_nodes, outer_nodes, interior_nodes])
+    tags = np.arange(1, len(nodes) + 1)
+    mesh_gen = DummyMeshGenerator(nodes=nodes, tags=tags, zones_gdf=clean_polys)
+
+    grid = VoronoiTessellator(mesh_gen, cm, boundary_centering="inset_mirror").generate()
+
+    covered = unary_union(list(grid.geometry))
+    assert domain.difference(covered).area < 1e-9
+    assert grid.geometry.area.sum() == pytest.approx(domain.area, rel=1e-12)
+    assert _unshared_interior_edges(grid, domain) == []
+    on_hole = np.isclose(np.hypot(grid["source_x"] - 5, grid["source_y"] - 5), 2.5)
+    assert on_hole.sum() == len(hole_nodes)
+    assert (grid.loc[on_hole, "boundary_centering"] == "clip").all()
+    # The straight outer edges keep their mirror ghosts (corners excepted).
+    on_outer = ~on_hole & grid["source_x"].notna() & (grid["boundary_inset"] > 0)
+    assert on_outer.sum() == len(outer_nodes) - 4
+    assert (grid.loc[on_outer, "boundary_centering"] == "inset_mirror").all()
 
 
 def _staggered_lattice_nodes():
@@ -755,3 +985,58 @@ def test_real_mesh_on_slanted_domain_assigns_every_cell_a_zone():
     assert mesher.generate(*clean)
     grid = VoronoiTessellator(mesher, cm).generate()
     assert grid["zone_id"].eq("dom").all()
+
+
+@pytest.mark.slow
+def test_straight_zone_edge_with_a_size_jump_keeps_its_z_order_zone():
+    # A resolution-5 zone against a resolution-20 background, edge at x = 150, no barriers: every cell
+    # centred on the edge keeps the inner zone, as on develop (8987f7d gave 10 of 59 to the outer zone).
+    from vorflow.engine import MeshGenerator
+
+    cm = ConceptualMesh()
+    cm.add_polygon(Polygon([(0, 0), (300, 0), (300, 300), (0, 300)]), zone_id=1, resolution=20.0)
+    cm.add_polygon(Polygon([(0, 0), (150, 0), (150, 300), (0, 300)]), zone_id=2, resolution=5.0, z_order=1)
+    mesher = MeshGenerator(background_lc=20.0, verbosity=0)
+    assert mesher.generate(*cm.generate())
+    grid = VoronoiTessellator(mesher, cm).generate()
+    on_edge = np.isclose(grid["x"], 150.0, atol=1e-6) & (grid["y"] > 1) & (grid["y"] < 299)
+    assert on_edge.sum() > 50
+    assert (grid.loc[on_edge, "zone_id"] == 2).all()
+
+
+@pytest.mark.parametrize("next_to_a_barrier", [False, True])
+def test_cell_spanning_a_zone_edge_next_to_a_barrier_takes_the_zone_holding_most_of_it(next_to_a_barrier):
+    # Node 2 sits on the corner of the inner zone, so its cell is about a quarter inside it. Away from barriers
+    # the z_order rule gives it the inner zone, as before. When it touches a barrier site's cell (node 4) it
+    # goes to the outer zone, which holds most of it. Node 3, on a straight stretch of the edge, splits evenly
+    # and keeps the z_order zone either way.
+    cm = ConceptualMesh()
+    cm.add_polygon(Polygon([(0, 0), (4, 0), (4, 4), (0, 4)]), zone_id="outer")
+    cm.add_polygon(Polygon([(0, 0), (2, 0), (2, 2), (0, 2)]), zone_id="inner", z_order=1)
+    clean_polys, _, _ = cm.generate()
+    nodes = np.array([[1.0, 1.0], [2.0, 2.0], [2.0, 1.0], [3.0, 3.0], [3.0, 1.0], [1.0, 3.0]])
+    mesh_gen = DummyMeshGenerator(nodes=nodes, tags=np.arange(1, len(nodes) + 1), zones_gdf=clean_polys)
+    mesh_gen.node_is_site = np.arange(1, len(nodes) + 1) == 4 if next_to_a_barrier else None
+
+    grid = VoronoiTessellator(mesh_gen, cm, clip_to_boundary=True).generate().set_index("node_id")
+
+    assert grid.loc[1, "zone_id"] == "inner"
+    assert grid.loc[2, "zone_id"] == ("outer" if next_to_a_barrier else "inner")
+    assert grid.loc[3, "zone_id"] == "inner"
+
+
+def test_zone_share_sums_every_polygon_row_of_a_zone():
+    # Zone 2 is three tiles meeting zone 3 at (150, 150). The cell centred there is 62.5% zone 2 (25% + 25% +
+    # 12.5%) and 37.5% zone 3, more than any one tile: it keeps zone 2.
+    zones = gpd.GeoDataFrame({"zone_id": [2, 2, 2, 3], "z_order": [2, 2, 2, 1]}, geometry=[
+        Polygon([(150, 150), (100, 150), (100, 200), (150, 200)]),
+        Polygon([(150, 150), (150, 100), (100, 100), (100, 150)]),
+        Polygon([(150, 150), (200, 100), (150, 100)]),
+        Polygon([(150, 150), (150, 200), (200, 200), (200, 100)]),
+    ])
+    grid = gpd.GeoDataFrame({"node_id": [1], "x": [150.0], "y": [150.0], "zone_id": [2], "z_order": [2]},
+                            geometry=[shapely.box(140, 140, 160, 160)])
+
+    out = tessellator_module._edge_cells_to_majority_zone(grid, zones, band=np.array([True]))
+
+    assert out["zone_id"].tolist() == [2]

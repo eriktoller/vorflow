@@ -31,7 +31,7 @@ The library is built around three main classes that work in sequence:
 
 2.  **`MeshGenerator`**: This is the engine that generates a triangular mesh based on the blueprint from `ConceptualMesh`. It uses `Gmsh` as its backend to create a quality-conforming Delaunay triangulation.
 
-3.  **`VoronoiTessellator`**: This class takes the triangular mesh from `MeshGenerator` and computes its dual: the Voronoi diagram. The result is a grid of polygonal cells. It includes logic to clip the grid to the domain boundary and enforce barrier features by cutting through cells.
+3.  **`VoronoiTessellator`**: This class takes the triangular mesh from `MeshGenerator` and computes its dual: the Voronoi diagram. The result is a grid of polygonal cells. It clips the grid to the domain boundary. Barrier lines are already made of whole cell faces at this stage, because `MeshGenerator` placed the cell generators on either side of them.
 
 ## Workflow
 
@@ -188,6 +188,116 @@ plt.show()
        width="60%">
 </p>
 
+### Barriers
+
+A line added with `is_barrier=True`, such as a fault, becomes a line of cell
+faces, so that a horizontal flow barrier (HFB) can be placed on them. vorflow
+places a pair of cell generators across each barrier segment, on circles
+drawn around the segment ends. When no other generator lies inside any
+circle, each segment is exactly the face between its pair. This is the
+empty-circle rule of the UPR method
+([Berge et al., 2019](https://doi.org/10.1007/s10596-018-9790-0)).
+`MeshGenerator.generate()` places these generators and checks the rule
+before Gmsh runs. As a result, each barrier segment is one straight face with
+an orthogonality error of 0, also at corners, junctions, crossings and on
+finely drawn curves, and the barrier cells need no cutting. This does not
+hold for two kinds of barrier, which still go through the tessellator's
+mirror generators and cut, so their faces are not always exact: a barrier with
+`quad_buffer=True`, and a barrier added with `embed=False`, which only sets
+the mesh size.
+
+Before meshing, `ConceptualMesh.generate()` cleans the barrier lines:
+
+- an end within `max(connectivity_tolerance, simplify_tolerance)` of another
+  barrier or of the domain boundary is snapped onto it, and a short
+  overshoot is trimmed back. A branch no longer than that distance, which
+  snaps onto the barrier it starts on, is dropped as a stub. An end is not
+  snapped onto a barrier it runs alongside;
+- a part of a barrier that lies on the domain boundary (within the same
+  distance) is dropped with a warning, because a barrier there separates
+  nothing. The end left behind is moved onto the boundary, so a barrier that
+  ended on the boundary still does;
+- junctions and crossings become vertices shared by both lines, and so does
+  a point where a line crosses or touches itself;
+- with `simplify_tolerance` above 0, the line is simplified after the
+  junctions are joined, so a splay stays on the fault it starts on;
+- a vertex closer than 0.1 x `resolution` to its neighbour is dropped as
+  digitising noise, with a warning, even when `simplify_tolerance` is 0. A
+  vertex is kept where dropping it would leave a fold sharper than
+  18 degrees, so the corner of a narrow U-turn stays.
+
+`MeshGenerator.barrier_report` lists each of these changes with its place.
+It also lists what the construction changed or gave up while placing the
+faces. Each kind raises one `UserWarning` with its count:
+
+- the tip of a spike sharper than `sharp_angle` (18 degrees by default) is
+  left inside a few cells without faces (`tips`);
+- barrier legs that meet at a junction, or leave the domain boundary or a
+  hole, at less than `sharp_angle` share a short stem instead of bounding a
+  sliver, and so do fans of legs closer than 29 degrees (`collapsed`). No
+  point of a line moves more than 0.1 x `resolution`;
+- two nearly parallel barriers closer than about 1.2 x `resolution` share
+  one row of cells between them, and so do the close legs of one barrier (a
+  U-turn, a thin loop, a lens) and a barrier within about 0.6 x `resolution`
+  of the domain boundary (`corridors`). No barrier is moved, and flow along
+  the gap stays connected. The cells of the row are at most `resolution`
+  and at most 3 x the gap long, so a narrow gap adds cells: about
+  `length / (3 x gap)` in the row, and the mesh around it is graded down to
+  match. Rows of cells shorter than 0.5 x `resolution` raise one warning
+  with their cell count. With `MeshGenerator(gap_field=...)`, a gap where
+  `GapField` asks for more than one cell across gets no corridor: each
+  barrier gets its own faces, sized by `GapField`, with its rows of cells
+  between them (see Narrow gaps). A gap that narrows below the `GapField`
+  `min_size` somewhere keeps its one row all along.
+
+Check the report before you build HFB input.
+
+Standard lines, zone edges and quad-buffer strips next to a barrier keep
+their nodes: the barrier faces are made shorter there, so the circles do not
+reach them. Where such a line crosses a barrier, the crossing takes its
+nodes over. If a node of one is removed anyway, `generate()` warns and
+`barrier_report["fixed_nodes"]` names the line.
+
+```python
+mesher = MeshGenerator(background_lc=100, conceptual_mesh=blueprint,
+                       sharp_angle=18, barrier_gradation=0.3)
+mesher.generate()
+print(mesher.barrier_report["snaps"], mesher.barrier_report["tips"])
+```
+
+When the faces would have to be far shorter than `resolution`, `generate()`
+raises `vorflow.BarrierMeshError`. The message gives the place, what makes
+the faces that short there and what helps for that cause. For example: an
+end that nearly meets another barrier is snapped onto it by a
+`simplify_tolerance` of at least the gap; a barrier running close to the
+boundary is dropped there by the same tolerance; next to the boundary, a
+point or a fixed line, the message gives a barrier `resolution` at which
+the faces fit. Where barrier legs meet or fold back at angles too narrow for
+cells between them (a narrow spike or zigzag, or many legs at one point),
+the message gives the `simplify_tolerance` that removes a short fold there,
+if it is digitising noise, and otherwise `quad_buffer=True` on the barrier
+meshes it with a structured strip of cells instead, whose faces are not
+exact.
+
+**Breaking:** a point feature, such as a well, on a barrier or at its end
+(closer than about 0.05 x `resolution`) now raises `BarrierMeshError`,
+naming the point and the barrier. In 0.3.0 it meshed, with mirrored
+generators and cut cells around the point. A cell centre cannot sit on a
+barrier face, so move the point off the line, or, where it marks the
+barrier's end, end the barrier that far short of it.
+
+Quad buffers on barriers (`quad_buffer=True`) do not use the exact faces
+yet. On a straight stretch their cells meet on the barrier, with no node
+row on it (`quad_buffer_thickness` counts the cell rows on each side). At
+corners, and where the barrier leaves the domain at a slant, they still
+rely on mirrored generators and on cutting cells, so they can leave cut
+cells and bent faces there. `straddle_width` is deprecated, with a
+`FutureWarning`, and its value is ignored, so remove it from barriers. A
+non-barrier line that sets it still gets exact faces along it.
+
+[examples/barrier_meshing.ipynb](https://github.com/rhugman/vorflow/blob/main/examples/barrier_meshing.ipynb)
+shows each case, the report and these limits.
+
 ### MODFLOW 6 export
 
 `to_disv()` returns the grid as MODFLOW 6 DISV arrays (`ncpl`, `nvert`,
@@ -209,6 +319,75 @@ sim = flopy.mf6.MFSimulation(sim_ws="model")
 gwf = flopy.mf6.ModflowGwf(sim, modelname="vorflow")
 tessellator.to_modflowgwfdisv(gwf, top=10.0, botm=[0.0, -10.0], nlay=2)
 ```
+
+### MODFLOW-USG DISU and GSF export
+
+MODFLOW-USG and MODFLOW 6 both have a package called **DISU**, but their
+input formats differ. `to_mfusg_disu()` explicitly targets **MODFLOW-USG**;
+its arrays must not be passed to `flopy.mf6.ModflowGwfdisu`.
+
+```python
+grid = tessellator.to_mfusg_disu(top=10.0, botm=[0.0, -10.0], nlay=2)
+```
+
+The result contains `MfUsgDisU` grid inputs, including zero-based `ja`,
+`iac`, `cl12`, `fahl`, `ivsd=-1` and `idsymrd=0`. `fahl` is interface
+**area**, including thickness for horizontal connections; MF6's `hwva`
+uses horizontal **width** instead. The flags for vertical connections also
+differ between engines. Geometry helpers can be shared; solver inputs cannot
+be interchanged.
+
+As with DISV, final `x`/`y` centres and grid row order are preserved. Layers
+repeat the same horizontal mesh, with nodes numbered by layer then cell.
+`node_id`, `cell_map` and `connectivity` are metadata, **not** FloPy package
+arguments: `cell_map` relates each zero-based model node to its layer, input
+row and original index/IDs; `connectivity` reports face lengths, distances
+and orthogonality errors. Review these diagnostics before modelling; the
+exporter does not generate ghost-node corrections.
+
+With FloPy installed (`pip install "vorflow[examples]"`), the package wrapper
+excludes metadata automatically:
+
+```python
+import flopy
+
+model = flopy.mfusg.MfUsg(modelname="model", model_ws="model", structured=False)
+disu = tessellator.to_mfusgdisu(
+    model, top=10.0, botm=[0.0, -10.0], nlay=2, gsf_path="model/model.gsf"
+)
+disu.write_file()  # Or model.write_input() after adding the other packages.
+```
+
+`gsf_path` (also accepted by `to_mfusg_disu()`) writes the matching GSF from
+the same validated grid. `to_gsf()` writes the GSF on its own; use the same
+elevations as for DISU. GSF stores original 3D cell
+geometry with one-based IDs and XYZ vertices; it is not a solver input or
+the particle-tracking-specific GSF variant. FloPy can read it using
+`UnstructuredGrid.from_gridspec()`. The DISU/GSF pair is intended for external
+mesh import into Groundwater Vistas, but has not been manually verified in
+Vistas. GSF does not retain CRS metadata, so keep your projected CRS separately.
+
+`top` accepts a scalar or `(ncpl,)`; `botm` accepts a scalar, `(nlay,)`, or
+`(nlay, ncpl)`. All cells must have finite, positive thickness. Pinch-outs,
+pass-through cells, confining beds and different meshes per layer are not
+supported. Grid arrays cannot be overridden through the FloPy wrapper;
+time settings and units can be passed as extra keywords. Barrier geometry
+does not assign hydraulic resistance automatically.
+
+DISU and GSF require contiguous, straight shared faces. Bent faces, such as
+those left where a barrier corner is cut inside a cell, and disconnected
+shared faces are rejected. Centre and overlap checks allow coordinate
+roundoff while preserving the supplied centres and polygons.
+
+For an existing GeoDataFrame, use `vorflow.utils.grid_to_mfusg_disu()` and
+`vorflow.utils.grid_to_gsf()`. Plain arrays and GSF output do not need FloPy.
+The [simple MFUSG notebook](examples/basic_example_mfusg.ipynb) runs a
+single confined layer between two fixed heads, plots the result and checks
+analytical heads and the 500 m³/day flow rate as well as budget balance. From
+the repository root, install `python -m pip install -e ".[examples]"` in the
+notebook kernel's environment. The example
+requires the separate `mfusg` executable on PATH or an `MFUSG_EXE` path;
+install it outside the notebook with `get-modflow /path/to/bin --subset mfusg`.
 
 ### Optional file export
 
@@ -269,6 +448,75 @@ than 2 x `resolution`, or when a finer size field reaches the ring (below
 point's). After meshing, `MeshGenerator.diagnostics["hex_rings"]` records
 whether each ring came out intact.
 
+### Narrow gaps
+
+Where two features run close together, the mesh between them is only as fine
+as their resolutions and the background make it, so a narrow gap can end up
+one or two cells across. `GapField` finds the gaps between embedded features
+and caps the size there at gap / `cells_across`. It is model-wide, so it goes
+on the mesh generator rather than on a feature:
+
+```python
+from vorflow import GapField
+
+mesher = MeshGenerator(
+    background_lc=40,
+    conceptual_mesh=blueprint,
+    gap_field=GapField(cells_across=3, min_size=2.0),
+)
+mesher.generate()
+print(mesher.diagnostics["gap_field"])  # field_created, min_gap, n_floor_bound, ...
+```
+
+- **What is a gap.** The local distance between embedded polygon
+  boundaries, lines and points, measured on an approximate medial axis of
+  their linework. Separation is measured along the linework, so a junction or
+  corner wider than about 30 degrees is not a gap, while a polygon's own
+  narrow neck is. Field-only (`embed=False`) features are never a side of a
+  gap. Barrier, straddle and quad-buffered lines count as plain lines (the
+  points vorflow places along a barrier do not).
+- **Barriers.** Where `GapField` asks for more than one cell across a gap
+  between two barriers, or between a barrier and the domain boundary, that
+  gap gets no shared row of cells (see Barriers): each barrier gets its own
+  faces, no longer than the `GapField` size there, with the rows of cells
+  between them. A gap that narrows below `min_size` somewhere keeps its
+  shared row all along, as without `GapField`. Elsewhere along a barrier the faces follow the `GapField`
+  size too, so the cells along it match Gmsh's. If the faces would have to
+  be far shorter than the barrier's `resolution`, `generate()` raises
+  `BarrierMeshError` and gives a `min_size` that works.
+- **Size.** Across a gap of width w the size is `w / cells_across`, graded
+  away from it at `growth_factor` (default 1.2), and Gmsh still takes the
+  smallest of this and the model's own fields. With `cells_across=3`, about
+  three cells lie wholly between the two walls, plus the cells centred on
+  them.
+- **No narrow gap, no change.** Only gaps narrower than `cells_across` times
+  the local size (the background, or a feature's default size field where it
+  is finer) are refined. When there are none, no Gmsh field is added and the
+  mesh is identical to one built without `gap_field`.
+- **`min_size`** (model units, default 0.1 x `background_lc`) is the floor on
+  the size. It is needed because wedges, such as a line meeting the boundary
+  at under about 30 degrees, narrow to zero at the tip. Wherever gap /
+  `cells_across` is below it, a warning names the place and the cells across
+  it gets. The linework is sampled every `min_size / 2`, so a smaller
+  `min_size` costs more.
+- **Opting features out.** The field cannot tell an oversight from a
+  deliberate coarse region. Add `gap_wall=False` to features whose gaps should
+  not be refined, such as a boundary-condition line digitised just inside the
+  domain edge or a sliver polygon:
+
+  ```python
+  blueprint.add_line(river_bc, line_id="river", resolution=40, gap_wall=False)
+  ```
+
+  A `gap_wall=False` feature is never a side of a gap; for a polygon, that
+  covers its whole boundary, including edges it shares with other polygons.
+
+Refining a gap costs cells. In a 1000 x 600 m domain at `background_lc=40`,
+two lines 15 m apart get about three cells across with `GapField(3)`, and the
+grid grows from about 550 to 2400 cells. Vertex jitter larger than
+`min_size / 4` can read as small notches, which the field refines down to
+`min_size`; simplify such input first (`simplify_tolerance`).
+
 ### Lloyd relaxation
 
 `lloyd_iterations` moves the free generators (interior nodes of the zones)
@@ -302,6 +550,55 @@ steady radial-flow (Thiem) test
 threefold, while 100 Lloyd passes improved it by at most about 5%. Lower
 `growth_factor` (or the resolution) where accuracy matters.
 
+### Concave cells and particle tracking
+
+Clipping to the domain makes a cell concave wherever the boundary or a hole
+has a reflex corner (one that bends into the domain): Gmsh puts a node on
+that corner, so its cell is cut into an L or V shape. Flow models handle
+these cells, but MODFLOW 6 particle tracking (PRT) can loop forever, with no
+error, in a cell where a face cannot be seen from the cell centroid. PRT
+splits each cell into triangles that meet at the centroid, and a hidden face
+gives one of them a negative area.
+
+`calculate_mesh_quality` flags both cases: `is_concave` and
+`star_from_centroid` (False where a face is hidden from the centroid).
+
+```python
+from vorflow.utils import calculate_mesh_quality
+
+quality = calculate_mesh_quality(grid_gdf)
+print(quality["is_concave"].sum(), (~quality["star_from_centroid"]).sum())
+```
+
+For PRT, `split_concave="hidden_face"` cuts only the cells with a hidden
+face into convex pieces; `split_concave="all"` cuts every concave cell. Cuts
+run from the reflex corner along a diagonal of the cell where one works.
+Otherwise the cut follows the corner's angle bisector, and the neighbouring
+cell gains a vertex where the cut ends (its shape does not change). Where the
+bisector would end on a barrier face, two diagonals to the ends of that face
+cut it off instead, so every barrier segment stays one face. The
+largest piece holding the generator keeps the cell's `node_id` and zone; the
+others get new IDs and the zone that holds most of their area. Pieces usually carry their centroid as `x`/`y`, unlike every
+other cell: the generator sits on the corner, at the end of the cut, and a
+cell centre there makes XT3D crash. A piece that holds the generator clear of
+its boundary keeps it, and a piece with one barrier face takes a point on the
+normal to that face through the generator, so barrier faces stay orthogonal.
+The mesh node stays in `source_x`/`source_y`,
+and a `concave_split` column marks the pieces. A cell that cannot be split
+(for example one with a hole, which a DISV cell cannot represent) is left as
+it is, with a warning.
+
+```python
+tessellator = VoronoiTessellator(mesher, blueprint, split_concave="hidden_face")
+grid_gdf = tessellator.generate()
+print(tessellator.concave_split_report)  # split cells and their piece IDs
+```
+
+The split is off by default because it costs some flow accuracy: the new
+faces have a CVFD skewness of about 0.5. In a test with an exact linear head
+solution, the head error rose from round-off to about 1e-5. Use it when you
+run particle tracking, not as a general improvement.
+
 <!-- docs:usage-end -->
 
 ## Examples
@@ -313,6 +610,9 @@ buffers, active-domain workflows, and triangular element-grid export.
 [examples/point_centring_demo.ipynb](https://github.com/rhugman/vorflow/blob/main/examples/point_centring_demo.ipynb)
 compares Gmsh smoothing, `hex_ring` and `lloyd_iterations` for centring cells
 around wells.
+[examples/barrier_meshing.ipynb](https://github.com/rhugman/vorflow/blob/main/examples/barrier_meshing.ipynb)
+shows how barrier faces are placed, what `barrier_report` lists and the
+remaining limits.
 
 ## Contributing
 

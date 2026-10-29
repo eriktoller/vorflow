@@ -5,6 +5,7 @@ import numpy as np
 import pandas as pd
 import pytest
 import shapely
+from shapely.affinity import translate
 from shapely.geometry import LineString, Point, Polygon, box
 from shapely.ops import unary_union
 
@@ -88,6 +89,49 @@ def test_clip_to_domain_warns_when_a_cell_with_its_generator_inside_is_lost(monk
 
     with pytest.warns(UserWarning, match="lost 1 cell"):
         tessellator_module._clip_to_domain(_clip_frame(cells, [(3.5, 1.5)]), domain)
+
+
+def test_clip_to_domain_warns_when_a_cell_with_its_generator_on_the_boundary_is_lost(monkeypatch):
+    # A generator on a slanted edge can test as just outside the domain by roundoff.
+    domain = Polygon([(0, 0), (3, 0), (0, 7)])
+    generator = (0.7, 7.0 - 7.0 * 0.7 / 3.0)
+    assert not shapely.intersects(domain, Point(generator))
+    cells = [box(0.2, 4.9, 1.2, 5.9)]
+    monkeypatch.setattr(tessellator_module.shapely, "intersection", lambda a, b, **kwargs: np.array([Point(0.2, 4.9)]))
+
+    with pytest.warns(UserWarning, match="lost 1 cell"):
+        tessellator_module._clip_to_domain(_clip_frame(cells, [generator]), domain)
+
+
+@pytest.mark.slow
+def test_node_on_a_polygonised_hole_vertex_keeps_its_cell():
+    # Fuzz case 149: Qhull returned a node's cell, at a vertex of a polygonised hole with a UTM offset,
+    # with three near-coincident vertices out of order. The ring crossed itself, and the invalid cell
+    # was dropped without a warning, leaving a gap of 0.09% of the domain.
+    square_with_hole = shapely.from_wkt(
+        "POLYGON ((0 0, 0 2.128642845508457, 2.128642845508457 2.128642845508457, "
+        "2.128642845508457 0, 0 0), (0.9456124990914114 1.3916865080097216, "
+        "0.9039352981909929 1.454060847049055, 0.8415609591516595 1.4957380479494735, "
+        "0.767985409667358 1.510373134678655, 0.6944098601830563 1.4957380479494735, "
+        "0.6320355211437229 1.454060847049055, 0.5903583202433045 1.3916865080097216, "
+        "0.5757232335141229 1.31811095852542, 0.5903583202433045 1.2445354090411185, "
+        "0.632035521143723 1.182161070001785, 0.6944098601830564 1.1404838691013666, "
+        "0.767985409667358 1.125848782372185, 0.8415609591516595 1.1404838691013666, "
+        "0.903935298190993 1.182161070001785, 0.9456124990914114 1.2445354090411185, "
+        "0.960247585820593 1.31811095852542, 0.9456124990914114 1.3916865080097216))"
+    )
+    cm = ConceptualMesh()
+    cm.add_polygon(translate(square_with_hole, 603698.3659436753, 1700226.9461342595),
+                   zone_id=1, resolution=0.187152851766405)
+    polys, lines, points = cm.generate()
+    mg = MeshGenerator(background_lc=0.187152851766405, verbosity=0)
+    mg.generate(polys, lines, points)
+
+    grid = VoronoiTessellator(mg, cm).generate()
+
+    domain = shapely.union_all(polys.geometry.to_numpy())
+    assert set(np.asarray(mg.node_tags, dtype=np.int64)) <= set(grid["node_id"])
+    assert domain.difference(shapely.union_all(grid.geometry.to_numpy())).area < 1e-9 * domain.area
 
 
 @pytest.mark.slow

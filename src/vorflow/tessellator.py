@@ -395,6 +395,12 @@ def _close_domain_slits(domain_geom, fraction: float = DOMAIN_SLIT_FRACTION):
     return closed
 
 
+def _on_domain_tolerance(domain_geom, fraction: float = ZONE_EDGE_FRACTION) -> float:
+    """Distance within which a point lies on ``domain_geom``: ``fraction`` x its extent."""
+    minx, miny, maxx, maxy = domain_geom.bounds
+    return fraction * max(maxx - minx, maxy - miny)
+
+
 def _clip_to_domain(gdf, domain_geom):
     """Return the rows of ``gdf`` that intersect ``domain_geom``, clipped to it, in their original order.
 
@@ -402,10 +408,10 @@ def _clip_to_domain(gdf, domain_geom):
     clipped geometries back onto the wrong rows (its spatial-index query
     reorders them), so cells lose their generator's x/y and node_id.
 
-    A cell whose generator lies in the domain always keeps some area. If
-    the intersection loses it all (GEOS roundoff on a domain with slivers),
-    the cell is kept whole when the domain covers it, and a warning names
-    the cells otherwise, so no cell is dropped silently.
+    A cell whose generator lies in the domain or on its boundary always
+    keeps some area. If the intersection loses it all (GEOS roundoff on a
+    domain with slivers), the cell is kept whole when the domain covers it,
+    and a warning names the cells otherwise, so no cell is dropped silently.
     """
     hits = np.sort(gdf.sindex.query(domain_geom, predicate='intersects'))
     clipped = gdf.iloc[hits].copy()
@@ -415,13 +421,13 @@ def _clip_to_domain(gdf, domain_geom):
     lost = ~polygonal | (shapely.area(pieces) <= 0.0)
     if lost.any():
         generators = shapely.points(clipped['x'].to_numpy(), clipped['y'].to_numpy())
-        lost &= shapely.intersects(domain_geom, generators)
+        lost &= shapely.dwithin(domain_geom, generators, _on_domain_tolerance(domain_geom))
         covered = lost & shapely.covers(domain_geom, cells)
         pieces[covered] = cells[covered]
         dropped = lost & ~covered
         if dropped.any():
             warn_user(
-                f"Clipping to the domain lost {int(dropped.sum())} cell(s) whose generator lies in the domain "
+                f"Clipping to the domain lost {int(dropped.sum())} cell(s) whose generator lies in or on the domain "
                 f"(node_id {clipped['node_id'].to_numpy()[dropped][:10].tolist()}); the grid has gaps there."
             )
     clipped[clipped.geometry.name] = pieces
@@ -1116,8 +1122,16 @@ class VoronoiTessellator:
         ring_of = np.repeat(np.arange(len(kept)), [len(region) for region in kept])
         ring_vertices = np.concatenate(kept) if kept else np.empty(0, dtype=int)
         polygons = shapely.polygons(shapely.linearrings(vertices[ring_vertices], indices=ring_of))
-        valid = shapely.is_valid(polygons)
+        # Voronoi cells are convex, but Qhull can return near-coincident
+        # vertices out of order (e.g. at a node on a polygonised hole vertex),
+        # so the ring crosses itself at roundoff scale; its hull is the cell.
+        crossed = ~shapely.is_valid(polygons)
+        polygons[crossed] = shapely.convex_hull(polygons[crossed])
+        valid = shapely.get_type_id(polygons) == 3
         generators = finite[valid]
+        n_lost = len(node_tags) - int(np.count_nonzero(generators < len(node_tags)))
+        if n_lost:
+            warn_user(f"The Voronoi diagram has no cell for {n_lost} mesh node(s); the grid has gaps there.")
 
         # Ghost nodes (used to bound the diagram) have no tag. An explicit
         # dtype: a list mixing uint64 tags and -1 infers object.

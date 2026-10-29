@@ -306,7 +306,12 @@ and the project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   MODFLOW-USG export fail with "Centres must lie on opposite sides of the
   shared face". The clip domain is now closed over gaps narrower than 1e-9
   x its extent, a cell the domain covers is kept whole, and any other cell
-  lost with its generator inside the domain is named in a warning.
+  lost with its generator inside or on the domain is named in a warning.
+  Separately, a node on a vertex of a polygonised hole could lose its cell
+  before clipping: Qhull returned near-coincident cell vertices out of
+  order, the ring crossed itself, and the invalid cell was dropped without
+  a warning (0.09% of the domain in one case). Such a ring is now replaced
+  by its convex hull, and a mesh node left without a cell is warned about.
 - A cell clipped around a sharp notch tip no longer passes twice through the
   tip. Clipping computed the tip twice, a roundoff apart, so the cell was two
   lobes joined by a neck of near-zero width: DISV listed one vertex twice,

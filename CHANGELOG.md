@@ -79,6 +79,22 @@ and the project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - The notebook `examples/barrier_meshing.ipynb` shows how barrier faces are
   placed, what `barrier_report` lists and the remaining limits. The README
   has a new "Barriers" section.
+- MODFLOW-USG-specific `to_mfusg_disu()` / `grid_to_mfusg_disu()` arrays and
+  mapping/orthogonality diagnostics, plus optional `to_mfusgdisu()` FloPy
+  package creation. These use USG DISU conventions, not MF6 DISU. Stacked
+  layers share one horizontal mesh; invalid geometry, bent or disconnected
+  shared faces and nonpositive thickness are rejected. Coordinate roundoff
+  at clipped boundary centres and overlapping boundary slivers is accepted
+  without moving the input centres or polygons.
+- Original 3D GSF geometry export with `to_gsf()` / `grid_to_gsf()`, using
+  the same centres, elevations and node numbering as USG DISU. Pass
+  `gsf_path` to the DISU exports to write both from one validation pass.
+  FloPy and MFUSG executables remain optional.
+- A simple executed MODFLOW-USG notebook: one confined layer, two fixed-head
+  sides, paired DISU/GSF export, head plot and water-budget checks.
+- The Conda development environment includes FloPy and installs both the
+  `dev` and `examples` extras in editable mode, so model experiments use the
+  checkout selected when updating the environment.
 - `GapField(cells_across=3, growth_factor=None, min_size=None)`, passed as
   `MeshGenerator(gap_field=...)`, refines narrow gaps between embedded
   features to about `cells_across` cells. The gap is read off an approximate

@@ -547,6 +547,50 @@ steady radial-flow (Thiem) test
 threefold, while 100 Lloyd passes improved it by at most about 5%. Lower
 `growth_factor` (or the resolution) where accuracy matters.
 
+### Concave cells and particle tracking
+
+Clipping to the domain makes a cell concave wherever the boundary or a hole
+has a reflex corner (one that bends into the domain): Gmsh puts a node on
+that corner, so its cell is cut into an L or V shape. Flow models handle
+these cells, but MODFLOW 6 particle tracking (PRT) can loop forever, with no
+error, in a cell where a face cannot be seen from the cell centroid. PRT
+splits each cell into triangles that meet at the centroid, and a hidden face
+gives one of them a negative area.
+
+`calculate_mesh_quality` flags both cases: `is_concave` and
+`star_from_centroid` (False where a face is hidden from the centroid).
+
+```python
+from vorflow.utils import calculate_mesh_quality
+
+quality = calculate_mesh_quality(grid_gdf)
+print(quality["is_concave"].sum(), (~quality["star_from_centroid"]).sum())
+```
+
+For PRT, `split_concave="hidden_face"` cuts only the cells with a hidden
+face into convex pieces; `split_concave="all"` cuts every concave cell. Cuts
+run from the reflex corner along a diagonal of the cell where one works.
+Otherwise the cut follows the corner's angle bisector, and the neighbouring
+cell gains a vertex where the cut ends (its shape does not change). The
+largest piece holding the generator keeps the cell's `node_id`; the others
+get new IDs. All pieces carry their centroid as `x`/`y`, unlike every other
+cell: the generator sits on the corner, at the end of the cut, and a cell
+centre there makes XT3D crash; the mesh node stays in `source_x`/`source_y`,
+and a `concave_split` column marks the pieces. A cell that cannot be split
+(for example one with a hole, which a DISV cell cannot represent) is left as
+it is, with a warning.
+
+```python
+tessellator = VoronoiTessellator(mesher, blueprint, split_concave="hidden_face")
+grid_gdf = tessellator.generate()
+print(tessellator.concave_split_report)  # split cells and their piece IDs
+```
+
+The split is off by default because it costs some flow accuracy: the new
+faces have a CVFD skewness of about 0.5. In a test with an exact linear head
+solution, the head error rose from round-off to about 1e-5. Use it when you
+run particle tracking, not as a general improvement.
+
 <!-- docs:usage-end -->
 
 ## Examples

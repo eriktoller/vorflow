@@ -119,6 +119,23 @@ and the project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - `gap_wall=` on `ConceptualMesh.add_polygon`, `add_line` and `add_point`
   (default True): with `gap_wall=False` the feature is never a side of a gap
   for `GapField`, e.g. a boundary-condition line just inside the domain edge.
+- `calculate_mesh_quality` adds `is_concave` (convexity below 1 - 1e-6)
+  and `star_from_centroid` (every face visible from the cell centroid).
+  MODFLOW 6 particle tracking (PRT) can loop forever, without an error, in a
+  cell where a face is hidden from the centroid. `summarize_quality` logs the
+  counts.
+- `VoronoiTessellator(split_concave=False)`: `"hidden_face"` cuts the
+  concave cells with a face hidden from the centroid into convex pieces, and
+  `"all"` cuts every concave cell. Cuts run along diagonals from the reflex
+  corner (a bisector cut, with the new vertex added to the neighbour, where no
+  diagonal works). The largest piece holding the generator keeps `node_id`
+  and the others get new IDs; a cell that cannot be split is left as it is,
+  with a warning. Every piece carries its centroid as `x`/`y`, because the
+  generator sits at the end of the cut and XT3D crashes on a cell centre
+  there; the mesh node stays in `source_x`/`source_y`, and a `concave_split`
+  column marks the pieces. `concave_split_report` lists the split cells. Off by default: the new faces
+  have a skewness of about 0.5 and add about 1e-5 head error on a linear
+  problem, so it is meant for particle tracking.
 
 ### Changed
 

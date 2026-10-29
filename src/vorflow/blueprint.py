@@ -22,6 +22,7 @@ from ._features import HEX_RING_CLEARANCE, is_face_line, positive_number, row_bo
 from ._plot import features_frame, get_ax, plot_features
 from ._barrier import lines as _barrier_lines
 from ._barrier import pipeline as _barrier_pipeline
+from .buffer import strip_cells_across
 from .fields import DEFAULT_GROWTH_FACTOR, GapField, GeometricGrowthField, MeshField, ThresholdField
 from shapely.strtree import STRtree
 
@@ -238,7 +239,7 @@ def _hex_ring_seeds(point, lc: float) -> list[tuple[float, float]]:
 def _meshed_half_width(feature) -> float:
     """Half-width of the node band a line or polygon feature meshes about its geometry.
 
-    Quad buffers straddle the geometry by ``thickness * lc / 2``; plain
+    Quad buffers straddle the geometry by ``cells_across * lc / 2``; plain
     features put their nodes on the geometry itself, and barrier sites stay
     within half a face length of the line, which the barrier sizing keeps
     clear of every feature node (zero width here). An unset ``lc``
@@ -246,8 +247,7 @@ def _meshed_half_width(feature) -> float:
     """
     lc = positive_number(feature.get('lc'))
     if row_bool(feature, 'quad_buffer', False):
-        thickness = positive_number(feature.get('quad_buffer_thickness')) or 1
-        return thickness * lc / 2.0 if lc is not None else 0.0
+        return strip_cells_across(feature) * lc / 2.0 if lc is not None else 0.0
     return 0.0
 
 
@@ -684,15 +684,21 @@ class ConceptualMesh:
                 with ``2`` a node row lands on it, giving a row of ~square
                 Voronoi cells centered on the line. (For the triangular
                 element-grid deliverable the reading is opposite: ``2`` puts
-                element edges along the line.) When two quad buffers cross,
+                element edges along the line.) On a barrier
+                (``is_barrier=True``) no node row ever lands on the line:
+                ``quad_buffer_thickness`` is the number of cell rows on each
+                side of it, so ``2`` gives a strip three cells wide whose
+                middle faces follow the line. Where the line leaves the
+                domain, the strip runs to the boundary on both sides. When two quad buffers cross,
                 the higher-priority one stays continuous and only the other is
                 trimmed at the crossing with a warning (priority: ``z_order``,
                 then finer resolution, wider strip, lines over polygons,
                 insertion order). Strips crossing a barrier's corridor
                 are still trimmed there. Independent of ``is_barrier``.
             quad_buffer_thickness (int): Strip width in local cell widths
-                (multiples of ``resolution``, like gmshflow's ``cs_thick``).
-                Supported values are 1 and 2.
+                (multiples of ``resolution``, like gmshflow's ``cs_thick``);
+                on a barrier, cell rows on each side of the line (a strip
+                ``2 * thickness - 1`` cells wide). Supported values are 1 and 2.
             z_order (int): Crossing priority for quad buffers. When this
                 feature's quad buffer crosses another one, the feature with the
                 higher ``z_order`` keeps its strip continuous and the other is

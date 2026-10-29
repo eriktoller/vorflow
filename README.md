@@ -287,8 +287,11 @@ barrier face, so move the point off the line, or, where it marks the
 barrier's end, end the barrier that far short of it.
 
 Quad buffers on barriers (`quad_buffer=True`) do not use the exact faces
-yet. They still rely on mirrored generators and on cutting cells, so they
-can leave cut cells and bent faces. `straddle_width` is deprecated, with a
+yet. On a straight stretch their cells meet on the barrier, with no node
+row on it (`quad_buffer_thickness` counts the cell rows on each side). At
+corners, and where the barrier leaves the domain at a slant, they still
+rely on mirrored generators and on cutting cells, so they can leave cut
+cells and bent faces there. `straddle_width` is deprecated, with a
 `FutureWarning`, and its value is ignored, so remove it from barriers. A
 non-barrier line that sets it still gets exact faces along it.
 
@@ -571,11 +574,16 @@ For PRT, `split_concave="hidden_face"` cuts only the cells with a hidden
 face into convex pieces; `split_concave="all"` cuts every concave cell. Cuts
 run from the reflex corner along a diagonal of the cell where one works.
 Otherwise the cut follows the corner's angle bisector, and the neighbouring
-cell gains a vertex where the cut ends (its shape does not change). The
-largest piece holding the generator keeps the cell's `node_id`; the others
-get new IDs. All pieces carry their centroid as `x`/`y`, unlike every other
-cell: the generator sits on the corner, at the end of the cut, and a cell
-centre there makes XT3D crash; the mesh node stays in `source_x`/`source_y`,
+cell gains a vertex where the cut ends (its shape does not change). Where the
+bisector would end on a barrier face, two diagonals to the ends of that face
+cut it off instead, so every barrier segment stays one face. The
+largest piece holding the generator keeps the cell's `node_id` and zone; the
+others get new IDs and the zone that holds most of their area. Pieces usually carry their centroid as `x`/`y`, unlike every
+other cell: the generator sits on the corner, at the end of the cut, and a
+cell centre there makes XT3D crash. A piece that holds the generator clear of
+its boundary keeps it, and a piece with one barrier face takes a point on the
+normal to that face through the generator, so barrier faces stay orthogonal.
+The mesh node stays in `source_x`/`source_y`,
 and a `concave_split` column marks the pieces. A cell that cannot be split
 (for example one with a hole, which a DISV cell cannot represent) is left as
 it is, with a warning.

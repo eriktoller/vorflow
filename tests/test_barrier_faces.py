@@ -278,6 +278,18 @@ def test_near_miss_without_tolerance_raises_barrier_mesh_error():
     assert "(150.00, 150." in str(info.value)
 
 
+@pytest.mark.parametrize("kind", [B, {"straddle_width": 0.3}], ids=["barrier", "straddle_width"])
+def test_end_near_the_middle_of_a_long_barrier_meshes_exactly(kind):
+    # An end 0.4 (0.1 lc) from the middle of a 300 m barrier: the face ends there did not follow the size caps
+    # or the repair rounds, and BarrierMeshError blamed legs folding back (a straddle_width line in the fuzz).
+    lines = [([(0, 150), (300, 150)], {**B, "resolution": 4.0}),
+             ([(90, 280), (150, 150.4)], {**kind, "resolution": 4.0})]
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore", FutureWarning)
+        mg, vt, grid = _mesh(_model(lines))
+    _assert_exact(mg, vt, grid)
+
+
 def test_digitising_noise_is_cleaned_with_a_warning():
     noise = _ray(CENTRE, 60.0, 0.05 * LC)
     cm = _model([([(40, 100), CENTRE, noise, (260, 210)], B)])
@@ -758,6 +770,12 @@ def _wedge_cases() -> dict:
         out[f"hole{angle}"] = ([([(180, 150), _ray((180, 150), 90 - angle, 400)], B),
                                 ([(120, 150), _ray((120, 150), 270 - angle, 400)], B)],
                                [(260, 60), (40, 240)], DOMAIN.difference(hole))
+    for angle in (3, 12):
+        # A bend 120 before the exit: the merge used to reach past it and fail its bound.
+        exit_ = (200.0, 300.0)
+        bend = _ray(exit_, 180 + angle, 120)
+        out[f"bent_boundary{angle}"] = ([([(0, 150), bend, _ray(exit_, angle, 30)], B)], [(20, 280), (150, 100)],
+                                        DOMAIN)
     return out
 
 

@@ -30,8 +30,9 @@ and the project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   cell face, for example where the faces would have to be far shorter than
   the barrier's `resolution`. The message gives the place (x, y), what
   makes the faces that short there (another barrier part, the boundary, a
-  point, a fixed line, closely spaced vertices, or legs meeting at too
-  narrow an angle) and what helps for that cause: a `simplify_tolerance`
+  point, a fixed line, closely spaced vertices, a barrier leaving the
+  boundary at a narrow angle, or legs meeting at too narrow an angle) and
+  what helps for that cause: a `simplify_tolerance`
   that snaps the end or drops the part, the barrier `resolution` at which
   the faces fit next to the boundary, a point or a fixed line (rounded down,
   with a 10% margin, so the value given meshes), the `simplify_tolerance`
@@ -128,11 +129,16 @@ and the project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   concave cells with a face hidden from the centroid into convex pieces, and
   `"all"` cuts every concave cell. Cuts run along diagonals from the reflex
   corner (a bisector cut, with the new vertex added to the neighbour, where no
-  diagonal works). The largest piece holding the generator keeps `node_id`
-  and the others get new IDs; a cell that cannot be split is left as it is,
-  with a warning. Every piece carries its centroid as `x`/`y`, because the
+  diagonal works; where the bisector ends on a barrier face, diagonals to the
+  ends of that face instead, so each barrier segment stays one face). The largest piece holding the generator keeps `node_id`
+  and zone, and the others get new IDs and the zone holding most of their
+  area; a cell that cannot be split is left as it is,
+  with a warning. Pieces carry their centroid as `x`/`y`, because the
   generator sits at the end of the cut and XT3D crashes on a cell centre
-  there; the mesh node stays in `source_x`/`source_y`, and a `concave_split`
+  there, except that a piece holding the generator clear of its boundary
+  keeps it and a piece with one barrier face takes a point on that face's
+  normal through the generator, so barrier faces stay orthogonal; the mesh
+  node stays in `source_x`/`source_y`, and a `concave_split`
   column marks the pieces. `concave_split_report` lists the split cells. Off by default: the new faces
   have a skewness of about 0.5 and add about 1e-5 head error on a linear
   problem, so it is meant for particle tracking.
@@ -196,7 +202,10 @@ and the project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - Barrier legs that meet at a junction (a splay, a T-branch, a crossing),
   or leave the domain boundary or a hole edge, at less than `sharp_angle`
   share a short stem along the bisector and then part at 1.5 x
-  `sharp_angle`, so no sliver is left between them; fans and stars whose
+  `sharp_angle`, so no sliver is left between them (a boundary exit
+  slides along the boundary and parts from it at 1.5 x `sharp_angle`, or at
+  most 25 degrees more than its own angle, short of the next bend; a corner
+  within 0.1 x resolution of the exit counts); fans and stars whose
   neighbouring legs are closer than 29 degrees are merged the same way. No
   point of a line moves more than 0.1 x its resolution. One `UserWarning`
   gives the count; the details are in `barrier_report["collapsed"]`. This
@@ -289,6 +298,44 @@ and the project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   are now dropped and their nodes clipped (`boundary_centering` is `"clip"` in
   their row). Every vertex of a polygonised circular hole is reflex, so its
   nodes are all clipped.
+- Cells are no longer dropped from the grid, or split in two, where zone
+  polygons overhang the domain polygon. The union of the cookie-cut zones,
+  which cells are clipped to, kept roundoff slits along their shared edges.
+  GEOS could then intersect a cell the domain fully covered into a line,
+  leaving a gap of up to 0.2% of the domain area. The same slits made the
+  MODFLOW-USG export fail with "Centres must lie on opposite sides of the
+  shared face". The clip domain is now closed over gaps narrower than 1e-9
+  x its extent, a cell the domain covers is kept whole, and any other cell
+  lost with its generator inside or on the domain is named in a warning.
+  Separately, a node on a vertex of a polygonised hole could lose its cell
+  before clipping: Qhull returned near-coincident cell vertices out of
+  order, the ring crossed itself, and the invalid cell was dropped without
+  a warning (0.09% of the domain in one case). Such a ring is now replaced
+  by its convex hull, and a mesh node left without a cell is warned about.
+- A cell clipped around a sharp notch tip no longer passes twice through the
+  tip. Clipping computed the tip twice, a roundoff apart, so the cell was two
+  lobes joined by a neck of near-zero width: DISV listed one vertex twice,
+  `grid_to_mfusg_disu` rejected the grid, and a barrier from the tip made the
+  barrier safety net cut the cell. The lobe away from the generator now
+  becomes a cell of its own, as other detached parts of clipped cells do.
+- A barrier with `quad_buffer=True, quad_buffer_thickness=2` no longer puts
+  a row of mesh nodes on the barrier. The cells of that row were cut through
+  their generators, with no warning; `to_mfusg_disu()` then failed with an
+  error that did not name the barrier, and `to_disv()` wrote faces split
+  into two edges. On a barrier `quad_buffer_thickness` is now the number of
+  cell rows on each side of the line, so `2` gives a strip three cells wide
+  whose middle faces follow the line. Two changes keep those faces on the
+  line: the two sides of a strip carry their nodes at matching stations,
+  also around corners (each side used to spread its own count, which
+  sheared the rows wherever the sides' lengths differed), and Gmsh's
+  smoothing and optimization passes no longer move the node rows inside a
+  quad buffer off their transfinite positions.
+- A quad buffer whose line leaves the domain at a slant now runs to the
+  boundary on both sides. One side used to stop short, and on a barrier the
+  unstructured wedge left there could put nodes beside the line and leave
+  cells it crossed. The overlay with the domain also no longer adds a
+  vertex to the strip's end cap on the boundary, which made Gmsh give up
+  the structured strip and mesh it unstructured.
 
 ## [0.3.0] - 2026-10-15
 

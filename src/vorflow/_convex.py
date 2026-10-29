@@ -18,9 +18,19 @@ so the neighbouring cells do not change. When no diagonal resolves a reflex
 vertex (common where the cell has few vertices opposite the corner), the cut
 follows the angle bisector to the boundary and the new vertex is inserted into
 the neighbour that shares that face: the neighbour keeps its shape but gains a
-vertex. The cut always starts at the reflex vertex, where the generator sits,
-so the generator would lie at the end of the new face; every piece therefore
-takes its centroid as x/y. A zero-width spike (a vertex where the ring turns
+vertex. A barrier face never gains one, as each barrier segment must stay one
+face: where the bisector ends inside a barrier face, two diagonals to the ends
+of that face cut it off instead (both lie either side of the bisector, so they
+resolve the corner).
+
+The cuts start at the reflex vertex, where Gmsh puts the generator, so the
+generator usually lies on a corner of a piece, where it cannot be the cell
+centre (XT3D crashes on it). The piece that holds the generator clear of its
+boundary keeps it as x/y; the faces it kept from the cell, such as an exact
+barrier face, stay orthogonal. Any other piece with one barrier face takes
+the midpoint of the chord of the normal to that face through the generator,
+which keeps the barrier face orthogonal too; all other pieces take their
+centroid. A zero-width spike (a vertex where the ring turns
 straight back, as a barrier end can leave) is dropped first; the base of the
 spike is inserted into the neighbour in the same way. A cell that cannot be
 split (one with holes, or one where no cut makes progress) is left as it is
@@ -34,9 +44,11 @@ import logging
 import numpy as np
 import pandas as pd
 import shapely
-from shapely.geometry import LineString, Point, Polygon
+from scipy.spatial import cKDTree
+from shapely.geometry import LineString, MultiPolygon, Point, Polygon
 from shapely.geometry.polygon import orient
 from shapely.ops import split
+from shapely.validation import make_valid
 
 logger = logging.getLogger(__name__)
 
@@ -53,6 +65,15 @@ REFLEX_TOLERANCE = 1e-9
 # inside its polygon, to snap cut ends and to check that a split preserved
 # the area.
 SPLIT_TOLERANCE = 1e-9
+
+# The piece of a split cell that holds the generator keeps it as x/y when
+# the generator lies at least this fraction of the piece's size (square root
+# of its area) inside it. Pieces are convex, so every face is visible from
+# it, and its faces that were faces of the cell (such as an exact barrier
+# face) stay orthogonal. A generator on or near the boundary (the reflex
+# corner, or a cut through it) gives way to the centroid: XT3D crashes on a
+# cell centre on a face.
+GENERATOR_CLEARANCE = 0.01
 
 # Added distance relative to the coordinate magnitude: roundoff grows with the
 # coordinates (e.g. UTM northings), whatever the cell size.
@@ -150,6 +171,50 @@ def _drop_spikes(poly: Polygon) -> tuple[Polygon, list[np.ndarray]]:
     return Polygon(xy), bases
 
 
+def split_pinches(geoms: np.ndarray, tolerance: float) -> np.ndarray:
+    """``geoms`` with each polygon whose exterior passes twice through one point split there into its lobes.
+
+    Clipping a cell around a sharp notch tip can compute the tip twice, a
+    roundoff apart, so the ring touches itself through a neck of near-zero
+    width that GEOS still counts as valid. Two exterior vertices of one
+    polygon closer than ``tolerance`` that are not neighbours on the ring
+    are such a pinch. The pinched polygon becomes a MultiPolygon of its
+    lobes, which the caller explodes into cells; a polygon whose fix would
+    change its area or leave a lobe with a hole is kept as it is.
+    """
+    geoms = np.asarray(geoms, dtype=object).copy()
+    polygons = np.flatnonzero(shapely.get_type_id(geoms) == shapely.GeometryType.POLYGON)
+    coords, owner = shapely.get_coordinates(shapely.get_exterior_ring(geoms[polygons]), return_index=True)
+    # Without the closing repeat, a ring's first and last vertices are neighbours too.
+    closing = np.r_[owner[1:] != owner[:-1], True]
+    coords, owner = coords[~closing], owner[~closing]
+    pairs = cKDTree(coords).query_pairs(tolerance, output_type="ndarray")
+    if len(pairs) == 0:
+        return geoms
+    ring_size = np.bincount(owner)[owner[pairs[:, 0]]]
+    apart = np.ptp(pairs, axis=1)
+    pinch = (owner[pairs[:, 0]] == owner[pairs[:, 1]]) & (apart > 1) & (apart < ring_size - 1)
+    for k in polygons[np.unique(owner[pairs[pinch, 0]])]:
+        geoms[k] = _split_pinch(geoms[k], tolerance)
+    return geoms
+
+
+def _split_pinch(poly: Polygon, tolerance: float):
+    """``poly`` split into its lobes where non-neighbouring exterior vertices lie within ``tolerance``."""
+    xy = np.asarray(poly.exterior.coords)[:-1]
+    n = len(xy)
+    for i, j in cKDTree(xy).query_pairs(tolerance, output_type="ndarray"):
+        if 1 < abs(int(j) - int(i)) < n - 1:
+            xy[max(i, j)] = xy[min(i, j)]
+    parts = [part for part in shapely.get_parts(make_valid(Polygon(xy, poly.interiors)))
+             if part.geom_type == "Polygon" and part.area > 0.0]
+    if len(parts) < 2 or any(part.interiors for part in parts):
+        return poly
+    if abs(sum(part.area for part in parts) - poly.area) > SPLIT_TOLERANCE * poly.area:
+        return poly
+    return MultiPolygon(parts)
+
+
 def _compactness(poly: Polygon) -> float:
     return 4 * np.pi * poly.area / poly.length**2
 
@@ -198,8 +263,14 @@ def _best_diagonal(poly: Polygon, r: int):
     return best
 
 
-def _bisector_cut(poly: Polygon, r: int) -> tuple[list[Polygon], np.ndarray]:
-    """Pieces from cutting along the bisector of reflex vertex r, and the new vertex where it ends."""
+def _bisector_cut(poly: Polygon, r: int, barriers=None) -> tuple[list[Polygon], np.ndarray | None]:
+    """Pieces from cutting along the bisector of reflex vertex r, and the new vertex where it ends.
+
+    Where the bisector ends on a ``barriers`` line away from a vertex (inside
+    a barrier face, which the new vertex would cut in two), two diagonals to
+    the ends of that face cut it off instead, and no vertex is added (the
+    returned end is None).
+    """
     xy = _ring(poly)
     n = len(xy)
     vertex = xy[r]
@@ -215,10 +286,47 @@ def _bisector_cut(poly: Polygon, r: int) -> tuple[list[Polygon], np.ndarray]:
     if not ends:
         raise SplitError("the bisector of a reflex vertex meets no other boundary point")
     end = min(ends, key=lambda p: np.hypot(*(p - vertex)))
+    if _inside_barrier_face(end, xy, barriers, tolerance):
+        return _barrier_face_fan(poly, r, end), None
     snapped = shapely.snap(poly, Point(end), tolerance)
     pieces = list(shapely.get_parts(split(snapped, LineString([vertex, end]))))
     _check_progress(poly, pieces)
     return pieces, end
+
+
+def _barrier_face_fan(poly: Polygon, r: int, end: np.ndarray) -> list[Polygon]:
+    """Pieces from diagonals joining reflex vertex r to both ends of the edge that holds ``end``.
+
+    ``end`` is where the bisector of r meets that edge, so the two diagonals
+    lie either side of the bisector and leave every corner at r below 180
+    degrees, without a new vertex.
+    """
+    xy = _ring(poly)
+    n = len(xy)
+    tolerance = _tolerance(poly)
+    edges = [k for k in range(n) if LineString([xy[k], xy[(k + 1) % n]]).distance(Point(end)) <= tolerance]
+    if not edges:
+        raise SplitError("the bisector of a reflex vertex ends on no edge")
+    # Unwrapped ring positions r < a < a + 1 < r + n of the edge's ends.
+    a = edges[0] if edges[0] > r else edges[0] + n
+    shrunk = poly.buffer(-tolerance)
+    for j in (a, a + 1):
+        diagonal = LineString([xy[r], xy[j % n]])
+        is_edge = j - r < 2 or j - r > n - 2
+        if not is_edge and not (shrunk.intersects(diagonal) and poly.covers(diagonal)):
+            raise SplitError("the bisector of a reflex vertex ends inside a barrier face it cannot cut off")
+    rings = ([xy[k % n] for k in range(r, a + 1)], [xy[r], xy[a % n], xy[(a + 1) % n]],
+             [xy[k % n] for k in range(a + 1, r + n + 1)])
+    pieces = [Polygon(ring) for ring in rings if len(ring) >= 3]
+    _check_progress(poly, pieces)
+    return pieces
+
+
+def _inside_barrier_face(point: np.ndarray, xy: np.ndarray, barriers, tolerance: float) -> bool:
+    """True when ``point`` lies on ``barriers`` but on no vertex of the ring ``xy``."""
+    if barriers is None or barriers.distance(Point(point)) > tolerance:
+        return False
+    return bool(np.hypot(*(xy - point).T).min() > tolerance)
 
 
 def _check_progress(poly: Polygon, pieces: list[Polygon]) -> None:
@@ -229,11 +337,13 @@ def _check_progress(poly: Polygon, pieces: list[Polygon]) -> None:
         raise SplitError("a cut changed the cell area")
 
 
-def convex_pieces(poly: Polygon) -> tuple[list[Polygon], list[np.ndarray]]:
+def convex_pieces(poly: Polygon, barriers=None) -> tuple[list[Polygon], list[np.ndarray]]:
     """Convex pieces of ``poly`` and the boundary vertices its neighbours need.
 
-    Those are the ends of bisector cuts and the bases of removed spikes.
-    Raises SplitError for a polygon with holes or when no cut makes progress.
+    Those are the ends of bisector cuts and the bases of removed spikes. No
+    cut ends inside a face on the ``barriers`` lines, so each barrier face
+    stays one face. Raises SplitError for a polygon with holes or when no cut
+    makes progress.
     """
     if poly.geom_type != "Polygon" or poly.is_empty or len(poly.interiors) > 0:
         raise SplitError("only single polygons without holes can be split")
@@ -254,17 +364,18 @@ def convex_pieces(poly: Polygon) -> tuple[list[Polygon], list[np.ndarray]]:
         if candidates:
             stack.extend(min(candidates, key=lambda c: c[1])[0])
         else:
-            cut, end = _first_bisector_cut(piece, reflex)
-            added.append(end)
+            cut, end = _first_bisector_cut(piece, reflex, barriers)
+            if end is not None:
+                added.append(end)
             stack.extend(cut)
     return pieces, added
 
 
-def _first_bisector_cut(poly: Polygon, reflex: list[int]) -> tuple[list[Polygon], np.ndarray]:
+def _first_bisector_cut(poly: Polygon, reflex: list[int], barriers=None) -> tuple[list[Polygon], np.ndarray]:
     """The bisector cut of the first reflex vertex that has one; re-raise the last failure."""
     for r in reflex:
         try:
-            return _bisector_cut(poly, r)
+            return _bisector_cut(poly, r, barriers)
         except SplitError as error:
             last = error
     raise last
@@ -281,15 +392,20 @@ def _insert_vertex(poly: Polygon, point: np.ndarray, tolerance: float) -> Polygo
     return poly
 
 
-def split_concave_cells(grid, targets: np.ndarray) -> tuple:
+def split_concave_cells(grid, targets: np.ndarray, barriers=None) -> tuple:
     """Split the cells at row positions ``targets`` into convex pieces.
 
     The largest piece covering the generator (else the largest) keeps the
     row and its ``node_id``; the others are new rows with fresh IDs above the
-    maximum. Every piece of a split cell takes its centroid as x/y and is
-    marked in a ``concave_split`` column; the mesh node stays in
+    maximum. The piece that holds the generator clear of its boundary keeps
+    it as x/y; a piece with one face on the ``barriers`` lines takes a point
+    on the normal to that face through the generator; the others take their
+    centroid (see the module docstring). Every piece is marked in a
+    ``concave_split`` column; the mesh node stays in
     ``source_x``/``source_y``, which are added (equal to x/y) when the grid
-    lacks them. A cell that cannot be split stays as it is, with a warning. Returns the new grid
+    lacks them. No cut ends inside a face on the ``barriers`` lines (a
+    shapely geometry, or None). A cell that cannot be split stays as it is,
+    with a warning. Returns the new grid
     (fresh RangeIndex) and a report DataFrame with one row per split cell:
     ``node_id``, ``convexity``, ``n_pieces``, ``piece_ids`` and
     ``min_piece_fraction`` (smallest piece over the cell area).
@@ -307,7 +423,7 @@ def split_concave_cells(grid, targets: np.ndarray) -> tuple:
         row = grid.iloc[position]
         cell = row[geometry]
         try:
-            pieces, cut_ends = convex_pieces(cell)
+            pieces, cut_ends = convex_pieces(cell, barriers)
         except SplitError as error:
             failed.append(f"{row['node_id']} ({error})")
             continue
@@ -322,8 +438,8 @@ def split_concave_cells(grid, targets: np.ndarray) -> tuple:
 
         grid.at[position, geometry] = pieces[primary]
         grid.at[position, "concave_split"] = True
-        grid.at[position, "x"] = pieces[primary].centroid.x
-        grid.at[position, "y"] = pieces[primary].centroid.y
+        if not _holds_generator(pieces[primary], generator):
+            grid.at[position, "x"], grid.at[position, "y"] = _piece_centre(pieces[primary], generator, barriers)
         piece_ids = [int(row["node_id"])]
         for piece in others:
             max_id += 1
@@ -331,7 +447,7 @@ def split_concave_cells(grid, targets: np.ndarray) -> tuple:
             new[geometry] = piece
             new["node_id"] = max_id
             new["concave_split"] = True
-            new["x"], new["y"] = piece.centroid.x, piece.centroid.y
+            new["x"], new["y"] = _piece_centre(piece, generator, barriers)
             new_rows.append(new)
             piece_ids.append(max_id)
         report.append({
@@ -351,6 +467,66 @@ def split_concave_cells(grid, targets: np.ndarray) -> tuple:
     if failed:
         logger.warning(f"Left {len(failed)} concave cells unsplit, by node_id: {', '.join(failed)}.")
     return grid, _report_frame(report)
+
+
+def _holds_generator(piece: Polygon, generator: Point) -> bool:
+    """True when ``generator`` (or another centre) lies inside the convex ``piece``, clear of its boundary."""
+    clearance = piece.exterior.distance(generator)
+    return piece.contains(generator) and clearance > GENERATOR_CLEARANCE * np.sqrt(piece.area)
+
+
+def _piece_centre(piece: Polygon, generator: Point, barriers) -> tuple[float, float]:
+    """x/y for a piece that does not hold the generator: on the normal to its barrier face, else its centroid.
+
+    The cell's face on a barrier is the perpendicular bisector of the
+    generator and the neighbour's generator, so a centre on the normal
+    through the generator keeps that face orthogonal. A piece with no
+    barrier face, or more than one, or no point on that normal clear of its
+    boundary, takes its centroid.
+    """
+    if barriers is not None:
+        xy = _ring(piece)
+        tolerance = _tolerance(piece)
+        on_barrier = shapely.distance(shapely.points(xy), barriers) <= tolerance
+        faces = np.flatnonzero(on_barrier & np.roll(on_barrier, -1))
+        faces = [k for k in faces
+                 if barriers.distance(Point((xy[k] + xy[(k + 1) % len(xy)]) / 2)) <= tolerance]
+        if len(faces) == 1:
+            k = faces[0]
+            along = xy[(k + 1) % len(xy)] - xy[k]
+            normal = np.array([-along[1], along[0]]) / np.hypot(*along) * 2 * piece.length
+            g = np.array(generator.coords[0])
+            chord = LineString([g - normal, g + normal]).intersection(piece)
+            if chord.geom_type == "LineString" and not chord.is_empty:
+                centre = chord.interpolate(0.5, normalized=True)
+                if _holds_generator(piece, centre):
+                    return centre.x, centre.y
+    return piece.centroid.x, piece.centroid.y
+
+
+def zone_by_area(grid, node_ids: list[int], zones):
+    """``grid`` with the cells ``node_ids`` given the zone that holds most of their area.
+
+    For split pieces without the generator, whose zone the generator join
+    does not decide. ``zones`` has ``geometry``, ``zone_id`` and
+    ``z_order``; a zone's share sums all its polygon rows, and a tie goes to
+    the higher ``z_order``.
+    """
+    rows = np.flatnonzero(grid["node_id"].isin(node_ids).to_numpy())
+    if len(rows) == 0 or zones.empty or "zone_id" not in grid.columns:
+        return grid
+    zones = zones.sort_values("z_order", ascending=False, kind="mergesort")
+    codes, zone_ids = pd.factorize(zones["zone_id"])
+    cells = grid.geometry.to_numpy()[rows]
+    shares = np.zeros((len(rows), len(zone_ids)))
+    for code, zone in zip(codes, zones.geometry.to_numpy()):
+        shares[:, code] += shapely.area(shapely.intersection(cells, zone))
+    best = shares.argmax(axis=1)
+    grid = grid.copy()
+    grid.loc[grid.index[rows], "zone_id"] = zone_ids.to_numpy()[best]
+    if "z_order" in grid.columns:
+        grid.loc[grid.index[rows], "z_order"] = zones["z_order"].groupby(codes).max().to_numpy()[best]
+    return grid
 
 
 def _report_frame(rows: list[dict]) -> pd.DataFrame:

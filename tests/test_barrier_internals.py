@@ -13,7 +13,7 @@ import shapely
 from scipy.sparse.csgraph import dijkstra
 from shapely.geometry import LineString, box
 
-from vorflow._barrier import corridor, lines, network, pipeline, rung, sizing, validate
+from vorflow._barrier import corridor, lines, network, pipeline, rung, sites, sizing, validate
 
 DOMAIN = box(0, 0, 300, 300)
 LC = 8.0
@@ -72,6 +72,28 @@ def test_defects_find_a_bad_pair_and_a_site_outside_the_domain():
     assert kinds == {"site outside"}
 
 
+def test_reflex_corners_are_the_hole_corners_and_the_inner_corner_of_an_l():
+    hole = DOMAIN.difference(box(120, 120, 180, 180))
+    assert sorted(map(tuple, validate.reflex_corners(hole))) == [(120, 120), (120, 180), (180, 120), (180, 180)]
+    ell = DOMAIN.difference(box(150, 150, 300, 300))
+    assert list(map(tuple, validate.reflex_corners(ell))) == [(150, 150)]
+    assert len(validate.reflex_corners(DOMAIN)) == 0
+
+
+def test_no_circle_holds_a_hole_corner():
+    # A barrier leaving a hole edge 30 from its corner: Gmsh's node at the corner would be removed with a
+    # circle round it, and a site's cell could reach round the corner (a detached cell part).
+    domain = DOMAIN.difference(box(120, 120, 180, 180))
+    a = math.radians(80.0)
+    plan = _plan([[(180, 150), (180 + 150 / math.tan(a), 300)]], domain=domain)
+    layout = plan.layout
+    corners = validate.reflex_corners(domain)
+    d = np.hypot(*(layout.xy[:, None, :] - corners[None]).transpose(2, 0, 1))
+    assert (d >= layout.radius[:, None] * (1 - 1e-9)).all()
+    moved = dataclasses.replace(layout, radius=np.maximum(layout.radius, d.min(axis=1) * 1.01))
+    assert "corner in circle" in {k for k, _ in validate.defects(moved, np.empty((0, 2)), domain)}
+
+
 def test_arc_defect_when_a_site_on_a_node_circle_lies_inside_a_pair_arc():
     layout = _plan(STRAIGHT).layout
     seg = 5
@@ -114,6 +136,51 @@ def test_sharp_spike_tip_is_truncated_and_joined_by_a_ladder():
     assert [u[0] for u in net.uncovered] == ["spike tip"]
     assert len(net.rungs) == 1 and net.rungs[0].t0 > 0
     assert net.rungs[0].theta == pytest.approx(math.radians(10.0))
+
+
+def _shallow_exit(angle_deg: float, bend: float = 120.0) -> list:
+    """A barrier that bends ``bend`` from the top of DOMAIN and leaves it at (200, 300), ``angle_deg`` to it."""
+    a = math.radians(angle_deg)
+    return [[(40, 150), (200 - bend * math.cos(a), 300 - bend * math.sin(a)), (200, 300)]]
+
+
+@pytest.mark.parametrize("angle", [3.0, 12.0])
+def test_shallow_boundary_exit_is_merged_short_of_the_bend_before_it(angle):
+    # The reach used to run past the bend, where the chord moved the line far beyond the bound, so no merge
+    # was made and the plan failed with sites outside the domain.
+    plan = _plan(_shallow_exit(angle))
+    [record] = plan.net.collapsed
+    assert record["kind"] == "boundary" and record["deviation"] <= 0.1 * LC * (1 + 1e-6)
+    assert record["reach"] < 120.0
+
+
+def test_shallow_boundary_exit_is_merged_at_a_large_sharp_angle():
+    # At sharp_angle 57.5 the opening asked for (1.5 x sharp_angle) left the re-drawn leg shorter than
+    # wedge.MIN_LEG; the opening is now held to the exit angle plus wedge.EXIT_OPEN_MAX.
+    coords = [[(130, 0), (130 + 110 * math.cos(math.radians(3.5)), 110 * math.sin(math.radians(3.5)))]]
+    items = [(0, np.asarray(coords[0], dtype=float), LC)]
+    barriers = pipeline.barrier_lines(items, [], DOMAIN)
+    plan = pipeline.plan(barriers, [], DOMAIN, np.empty((0, 2)), sizing.size_function([], 20.0), ORIGIN,
+                         sharp_angle=math.radians(57.5))
+    assert [r["kind"] for r in plan.net.collapsed] == ["boundary"]
+
+
+def test_exit_next_to_a_corner_is_merged_along_the_edge_past_the_corner():
+    # The leg leaves the top edge 0.01 from the corner at 77 degrees to it, but runs at 13 degrees to the
+    # right edge just past the corner.
+    a = math.radians(77.0)
+    exit_ = (299.99, 300.0)
+    plan = _plan([[(exit_[0] - 100 * math.cos(a), 300 - 100 * math.sin(a)), exit_]])
+    [record] = plan.net.collapsed
+    assert record["kind"] == "boundary" and record["angle"] == pytest.approx(13.0, abs=1.0)
+
+
+def test_boundary_rays_are_measured_from_the_foot_on_the_boundary():
+    # A node a hair inside the boundary (within the touch tolerance) used to tilt the rays over the short
+    # probe, and a site shared with the ray fell outside the domain.
+    tol = pipeline.touch_tolerance(DOMAIN)
+    rays = network._boundary_rays(DOMAIN, np.array([150.0, 300.0 - 0.5 * tol]), tol)
+    assert max(abs(math.sin(r)) for r in rays) < 1e-12
 
 
 def test_narrow_wedge_at_a_junction_gets_a_rung():
@@ -164,6 +231,26 @@ def test_face_lengths_follow_the_size_field():
 # ---------------------------------------------------------------------------
 # corridor
 # ---------------------------------------------------------------------------
+def test_face_ends_follow_a_local_dip_of_h_on_a_long_piece():
+    # 64 even steps along a 1000 m piece stepped over a dip 4 m wide, so a cap or a repair round there did
+    # not move the face ends and the repair rounds ran out.
+    s = np.linspace(0.0, 1000.0, 2001)
+    h = np.where(np.abs(s - 500.0) < 2.0, 0.25, 8.0)
+    field = sizing.SizeField(np.zeros(len(s), dtype=int), s, h, np.column_stack([s, np.zeros_like(s)]),
+                             np.full(len(s), -1), set())
+    count = sites._count(field, 0, 0.0, 1000.0)
+    ends = sites._positions(field, 0, 0.0, 1000.0, count)
+    near = ends[np.abs(ends - 500.0) < 2.0]
+    assert len(near) >= 10 and np.diff(near).max() < 0.5
+
+
+@pytest.mark.parametrize("gap", [0.4, 1.0])
+def test_end_near_a_long_barrier_plans(gap):
+    # The end of one barrier (or straddle_width line) 0.1-0.25 lc from the middle of a long piece of another.
+    plan = _plan([[(0, 150), (300, 150)], [(90, 280), (150, 150 + gap)]], lc=4.0)
+    assert validate.defects(plan.layout, np.empty((0, 2)), DOMAIN) == []
+
+
 def test_collinear_pieces_have_no_bisector_and_no_corridor():
     a0, a1, b0, b1 = map(np.array, ([40.0, 150.0], [147.0, 150.0], [153.0, 150.0], [260.0, 150.0]))
     assert corridor.collinear(a0, a1, b0, b1)
@@ -205,6 +292,7 @@ def test_defects_left_after_the_repair_rounds_raise(monkeypatch):
 
     monkeypatch.setattr(pipeline, "defects", always_bad)
     monkeypatch.setattr(pipeline, "SITE_GROWTH_CAP", 1e9)
+    monkeypatch.setattr(pipeline, "MIN_H_FRACTION", 1e-6)  # each round halves the faces there: not the floor
     with pytest.raises(pipeline.BarrierMeshError,
                        match=f"1 defects \\(pair\\) are left after {pipeline.REPAIR_ROUNDS} local refinements"):
         _plan(STRAIGHT)
@@ -330,6 +418,17 @@ def test_advised_tolerance_for_a_short_fold_is_its_length_and_works():
                                        np.array([True, False, False, True]))
         lines.simplify_lines([simplified])
         _plan([simplified.xy])
+
+
+def test_shallow_exit_that_is_not_merged_is_named_in_the_error():
+    # 12 degrees is above sharp_angle 10, so the exit is not merged; the message used to blame folded legs.
+    items = [(0, np.asarray(_shallow_exit(12.0)[0], dtype=float), LC)]
+    barriers = pipeline.barrier_lines(items, [], DOMAIN)
+    with pytest.raises(pipeline.BarrierMeshError, match="leaves the domain boundary there at 12 degrees") as info:
+        pipeline.plan(barriers, [], DOMAIN, np.empty((0, 2)), sizing.size_function([], 20.0), ORIGIN,
+                      sharp_angle=math.radians(10.0))
+    assert "a sharp_angle above 12 merges the exit" in str(info.value)
+    assert "fold back" not in str(info.value)
 
 
 def test_repair_failure_points_at_narrow_angles_and_the_quad_buffer(monkeypatch):

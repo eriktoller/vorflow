@@ -290,15 +290,22 @@ def _cut_line(line: BarrierLine, cut: dict) -> list:
 # Legs and plans
 # ---------------------------------------------------------------------------
 def _boundary_rays(domain, xy: np.ndarray, tol: float) -> list:
-    """Angles of the domain boundary leaving the boundary point ``xy``."""
+    """Angles of the domain boundary leaving the boundary point ``xy``.
+
+    They are measured from the foot of ``xy`` on the boundary, not from
+    ``xy``: a node up to ``tol`` off the boundary would tilt rays over the
+    short probe by up to tol / step, and a shared site on such a ray falls
+    outside the domain.
+    """
     rings = [LineString(r.coords) for p in getattr(domain, "geoms", [domain]) for r in [p.exterior, *p.interiors]]
     ring = min(rings, key=lambda r: r.distance(Point(xy)))
     d = ring.project(Point(xy))
+    foot = np.array(ring.interpolate(d).coords[0])
     step = max(tol * 1e3, 1e-6 * ring.length)
     out = []
     for dd in ((d - step) % ring.length, (d + step) % ring.length):
         p = np.array(ring.interpolate(dd).coords[0])
-        out.append(math.atan2(p[1] - xy[1], p[0] - xy[0]))
+        out.append(math.atan2(p[1] - foot[1], p[0] - foot[0]))
     return out
 
 

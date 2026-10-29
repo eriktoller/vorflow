@@ -168,11 +168,11 @@ def test_bisector_cut_tries_the_next_reflex_vertex(monkeypatch):
     real = convex._bisector_cut
     tried = []
 
-    def first_fails(poly, r):
+    def first_fails(poly, r, barriers=None):
         tried.append(r)
         if len(tried) == 1:
             raise SplitError("no cut")
-        return real(poly, r)
+        return real(poly, r, barriers)
 
     monkeypatch.setattr(convex, "_bisector_cut", first_fails)
     reflex = reflex_vertices(THIN_L) + reflex_vertices(THIN_L)
@@ -183,7 +183,7 @@ def test_bisector_cut_tries_the_next_reflex_vertex(monkeypatch):
 
 def test_bisector_cut_raises_when_no_reflex_vertex_has_one(monkeypatch):
     """Catches the fallback swallowing the failure of every reflex vertex."""
-    def always_fails(poly, r):
+    def always_fails(poly, r, barriers=None):
         raise SplitError(f"no cut {r}")
 
     monkeypatch.setattr(convex, "_bisector_cut", always_fails)
@@ -269,6 +269,55 @@ def test_convex_pieces_fall_back_to_a_bisector_cut():
     assert sum(p.area for p in pieces) == pytest.approx(SLIT.area, rel=1e-12)
     assert len(added) == 1
     assert added[0] == pytest.approx([5.0, 0.0])
+
+
+def test_bisector_ending_on_a_barrier_face_cuts_the_face_off_whole():
+    """Catches a bisector cut adding a vertex inside a barrier face, which splits it into two faces."""
+    barrier = LineString([(0, 0), (10, 0)])
+    pieces, added = convex_pieces(SLIT, barrier)
+
+    assert added == []
+    assert len(pieces) == 3
+    assert all(_is_convex(p) for p in pieces)
+    assert sum(p.area for p in pieces) == pytest.approx(SLIT.area, rel=1e-12)
+    vertices = {tuple(c) for c in np.asarray(SLIT.exterior.coords)}
+    assert all({tuple(c) for c in np.asarray(p.exterior.coords)} <= vertices for p in pieces)
+    assert sum(p.boundary.intersection(barrier).length > 0 for p in pieces) == 1
+
+
+def test_split_leaves_the_neighbour_across_a_barrier_face_unchanged():
+    """Catches the neighbour across a barrier face gaining the bisector end as a vertex."""
+    below = box(0, -5, 10, 0)
+    grid = _grid([SLIT, below])
+
+    split, report = split_concave_cells(grid, np.array([0]), LineString([(0, 0), (10, 0)]))
+
+    assert split.geometry.iloc[1].equals_exact(below, 0)
+    assert report["n_pieces"].iloc[0] == 3
+
+
+def test_split_piece_holding_the_generator_keeps_it():
+    """Catches a piece replacing a generator well inside it with its centroid, which skews its old faces."""
+    grid = _grid([L_SHAPE])
+    grid.loc[0, ["x", "y"]] = [0.5, 0.2]
+
+    split, _ = split_concave_cells(grid, np.array([0]))
+
+    assert split[["x", "y"]].iloc[0].tolist() == [0.5, 0.2]
+    other = split.geometry.iloc[1].centroid
+    assert split[["x", "y"]].iloc[1].tolist() == pytest.approx([other.x, other.y])
+
+
+def test_split_piece_with_a_barrier_face_is_centred_on_its_normal():
+    """Catches a piece cut off with a barrier face taking its centroid, which skews that face."""
+    grid = _grid([SLIT])
+    grid.loc[0, ["x", "y"]] = [5.0, 1.0]
+
+    split, _ = split_concave_cells(grid, np.array([0]), LineString([(0, 0), (10, 0)]))
+
+    triangle = split[np.isclose(split.geometry.area, 5.0)]
+    assert len(triangle) == 1
+    assert triangle[["x", "y"]].iloc[0].tolist() == pytest.approx([5.0, 0.5])
 
 
 def _grid(cells):
@@ -467,3 +516,150 @@ def test_split_concave_on_gmsh_mesh_around_l_shaped_hole():
     assert grid["node_id"].is_unique
     assert grid.geometry.area.sum() == pytest.approx(domain.area, rel=1e-12)
     assert grid_to_disv(grid)["ncpl"] == len(grid)
+
+
+# A square and a triangle joined at (1, 1); the second copy of that vertex lies
+# 4e-14 away, as clipping a cell around a notch tip computes it.
+PINCHED = Polygon([(0, 0), (1, 0), (1, 1), (2, 1.5), (1.5, 2), (1 + 4e-14, 1 + 4e-14), (0, 1)])
+
+
+def test_split_pinches_separates_lobes_joined_through_a_roundoff_neck():
+    """Catches a pinched cell surviving as one ring that passes twice through one point."""
+    assert PINCHED.is_valid
+    out = convex.split_pinches(np.array([PINCHED, L_SHAPE, None], dtype=object), 1e-12)
+
+    assert out[0].geom_type == "MultiPolygon"
+    assert sorted(p.area for p in out[0].geoms) == pytest.approx([0.375, 1.0])
+    assert out[1] is L_SHAPE
+    assert out[2] is None
+
+
+def test_explode_gives_a_pinched_lobe_its_own_cell():
+    """Catches a pinched cell reaching DISV with a vertex listed twice."""
+    grid = gpd.GeoDataFrame({"node_id": [5], "x": [0.5], "y": [0.5]}, geometry=[PINCHED])
+
+    exploded = vorflow.tessellator._explode_with_unique_ids(grid)
+
+    assert list(exploded["node_id"]) == [5, 6]
+    assert exploded.geometry.iloc[0].covers(shapely.Point(0.5, 0.5))
+    assert exploded[["x", "y"]].iloc[1].tolist() == pytest.approx([1.5, 1.5])
+
+
+@pytest.mark.slow
+def test_barrier_from_a_notch_tip_leaves_no_pinched_cell():
+    """Catches the cell clipped around a notch tip pinching and the barrier safety net cutting it."""
+    domain = Polygon([(0, 0), (0, 300), (228.26, 300), (241.46, 189.16), (240.15, 300), (300, 300), (300, 0)])
+    cm = ConceptualMesh()
+    cm.add_polygon(domain, zone_id=1, resolution=20.0)
+    cm.add_line(LineString([(241.46, 189.16), (109.94977304865061, 152.87715312809004)]), line_id="b", resolution=8.0, is_barrier=True)
+    mg = MeshGenerator(background_lc=20.0, verbosity=0)
+    mg.generate(*cm.generate())
+
+    tessellator = VoronoiTessellator(mg, cm, split_concave="hidden_face")
+    grid = tessellator.generate()
+
+    assert (centroid_fan_fraction(grid.geometry.to_numpy()) > 0).all()
+    cell2d = grid_to_disv(grid)["cell2d"]
+    assert all(len(set(row[4:])) == row[3] for row in cell2d)
+    assert grid["node_id"].is_unique
+    assert grid.geometry.area.sum() == pytest.approx(domain.area, rel=1e-12)
+
+
+# Seed 17 of the reviewer's random barrier cases: a narrow notch whose tip lies
+# 0.8 above a barrier, so the tip cell's bisector cut ends on its barrier face.
+SEED17_DOMAIN = shapely.from_wkt(
+    "POLYGON ((0 0, 0 300, 156.23 300, 166.53 150.69, 168.15 300, 300 300, 300 0, 0 0), "
+    "(81.36 181.83, 55.42 163.85, 69.47 143.57, 95.41 161.55, 81.36 181.83), "
+    "(159.42 176.62, 153.33 191.07, 108.97 172.37, 115.07 157.92, 159.42 176.62), "
+    "(144.53 30.51, 204.33 33.97, 201.3 86.34, 141.5 82.88, 144.53 30.51))"
+)
+SEED17_BARRIERS = [
+    [(62.87977551686288, 140.1090564788047), (167.42094021909605, 137.49639819765943)],
+    [(108.97, 172.37), (231.88029378598097, 124.30317416998481)],
+    [(72.82200468007599, 113.16464001399362), (244.12910942171544, 110.69204419156041)],
+]
+
+
+def _barrier_faces(grid, barriers):
+    """Connectivity rows of the faces that lie on ``barriers``."""
+    from vorflow.utils import build_connectivity
+
+    faces = build_connectivity(grid, center="generator")
+    lines = faces.geometry.to_numpy()
+    on = np.ones(len(lines), dtype=bool)
+    for point in (shapely.get_point(lines, 0), shapely.get_point(lines, -1),
+                  shapely.line_interpolate_point(lines, 0.5, normalized=True)):
+        on &= shapely.distance(point, barriers) < 1e-6
+    return faces[on]
+
+
+@pytest.mark.slow
+def test_split_keeps_every_barrier_segment_one_face():
+    """Catches the split cutting an exact barrier face in two at a notch tip."""
+    cm = ConceptualMesh()
+    cm.add_polygon(SEED17_DOMAIN, zone_id=1, resolution=20.0)
+    for k, coords in enumerate(SEED17_BARRIERS):
+        cm.add_line(LineString(coords), line_id=f"b{k}", resolution=8.0, is_barrier=True)
+    mg = MeshGenerator(background_lc=20.0, verbosity=0)
+    mg.generate(*cm.generate())
+    barriers = shapely.MultiLineString(SEED17_BARRIERS)
+
+    plain = _barrier_faces(VoronoiTessellator(mg, cm).generate(), barriers)
+    tessellator = VoronoiTessellator(mg, cm, split_concave="all")
+    split = _barrier_faces(tessellator.generate(), barriers)
+
+    assert len(tessellator.concave_split_report) > 0
+    assert len(split) == len(plain)
+    assert split.geometry.length.sum() == pytest.approx(plain.geometry.length.sum(), rel=1e-9)
+    assert split["ortho_error"].max() < 1e-6
+
+
+@pytest.mark.slow
+def test_split_keeps_barrier_faces_orthogonal_at_a_notch_tip():
+    """Catches the split piece with a barrier face taking its centroid instead of the generator."""
+    domain = Polygon([(0, 0), (0, 300), (156.23, 300), (166.53, 150.69), (168.15, 300), (300, 300), (300, 0)])
+    barrier = LineString([(108.97, 172.37), (231.88, 124.30)])
+    cm = ConceptualMesh()
+    cm.add_polygon(domain, zone_id=1, resolution=20.0)
+    cm.add_line(barrier, line_id="b", resolution=8.0, is_barrier=True)
+    mg = MeshGenerator(background_lc=20.0, verbosity=0)
+    mg.generate(*cm.generate())
+
+    tessellator = VoronoiTessellator(mg, cm, split_concave="all")
+    faces = _barrier_faces(tessellator.generate(), barrier)
+
+    assert len(tessellator.concave_split_report) == 1
+    assert faces["ortho_error"].max() < 1e-6
+
+
+def test_zone_by_area_gives_pieces_the_zone_holding_most_of_them():
+    """Catches a split piece keeping its parent's zone when it lies mostly in another."""
+    zones = gpd.GeoDataFrame({"zone_id": [1, 2], "z_order": [0, 1]}, geometry=[box(0, 0, 2, 1), box(0, 1, 2, 2)])
+    grid = _grid([box(0, 0.2, 1, 1.2), box(1, 0.5, 2, 1.5), box(0, 0, 1, 0.2)])
+    grid["z_order"] = 0
+
+    out = convex.zone_by_area(grid, [10, 11], zones)
+
+    assert out["zone_id"].tolist() == [1, 2, 7]
+    assert out["z_order"].tolist() == [0, 1, 0]
+
+
+@pytest.mark.slow
+def test_split_pieces_take_the_zone_holding_most_of_their_area():
+    """Catches a piece cut from the cell at a zone corner keeping a zone it barely overlaps."""
+    lower, upper = box(0, 0, 300, 150), box(0, 150, 150, 300)
+    cm = ConceptualMesh()
+    cm.add_polygon(lower, zone_id=1, resolution=20.0)
+    cm.add_polygon(upper, zone_id=2, resolution=20.0)
+    mg = MeshGenerator(background_lc=20.0, verbosity=0)
+    mg.generate(*cm.generate())
+
+    tessellator = VoronoiTessellator(mg, cm, split_concave="all")
+    grid = tessellator.generate()
+
+    new_pieces = [i for ids in tessellator.concave_split_report["piece_ids"] for i in ids[1:]]
+    assert new_pieces
+    pieces = grid[grid["node_id"].isin(new_pieces)]
+    zones = {1: lower, 2: upper}
+    shares = [zones[z].intersection(p).area / p.area for z, p in zip(pieces["zone_id"], pieces.geometry)]
+    assert min(shares) > 0.5

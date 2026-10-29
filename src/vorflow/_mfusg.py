@@ -14,6 +14,13 @@ import shapely
 
 
 logger = logging.getLogger(__name__)
+
+# A cell centre may lie this fraction of sqrt(cell area) outside its polygon.
+# Barrier sites and boundary generators sit on a domain or barrier edge, and
+# clipping or cutting that edge leaves them up to ~1e-8 x the cell size
+# outside (absolute 1e-14..1e-7 m), well past coordinate roundoff. A centre
+# that is really outside its cell is off by a sizeable fraction of it.
+CENTRE_OUTSIDE_FRACTION = 1e-6
 METADATA_KEYS = {"node_id", "cell_map", "connectivity"}
 PACKAGE_KEYS = {
     "nodes", "nlay", "njag", "ivsd", "idsymrd", "nodelay",
@@ -147,11 +154,11 @@ def _prepare_grid(gdf, top, botm, nlay):
         raise ValueError("Cell centres must be finite.")
     coords = shapely.get_coordinates(geoms)
     tolerance = 32 * np.finfo(float).eps * max(1.0, float(np.abs(coords).max()))
-    for i, (geom, centre) in enumerate(zip(geoms, centres)):
-        # Clipping a slanted edge can leave a boundary generator a few ulps
-        # outside its polygon. Accept roundoff without moving the generator.
-        if not shapely.dwithin(geom, shapely.Point(centre), tolerance):
-            raise ValueError(f"Centre of cell {i} lies outside its polygon.")
+    # Accept edge generators just outside their cell without moving them.
+    centre_tolerance = np.maximum(tolerance, CENTRE_OUTSIDE_FRACTION * np.sqrt(shapely.area(geoms)))
+    outside = ~shapely.dwithin(geoms, shapely.points(centres), centre_tolerance)
+    if outside.any():
+        raise ValueError(f"Centre of cell {int(np.flatnonzero(outside)[0])} lies outside its polygon.")
     layer_top, bot = _layer_arrays(top, botm, nlay, len(gdf))
     # Reuse conforming rings, not MF6 solver semantics. Limit insertion to
     # coordinate roundoff: a looser map-scale tolerance can bend very short

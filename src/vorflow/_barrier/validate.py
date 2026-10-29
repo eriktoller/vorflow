@@ -12,7 +12,12 @@ each barrier segment exactly one Voronoi face:
   site lies inside that arc;
 - a site or feature node strictly inside any circle (``site in circle``,
   ``feature in circle``);
-- a site outside the domain (``site outside``).
+- a site outside the domain (``site outside``);
+- a reflex corner of the domain (a hole corner, the inner corner of an L)
+  strictly inside a circle whose centre is off the boundary (``corner in
+  circle``). Gmsh's node at the corner is then removed with the circle, and
+  the cell of a site on one side of the corner can reach round it and come
+  out, cut off, on the other side.
 
 When none is left, every segment is exactly a Voronoi face (Berge et al.
 2019, the fracture condition), whatever other generators lie outside the
@@ -29,6 +34,7 @@ from scipy.spatial import cKDTree
 from .sites import Layout
 
 INSIDE_EPS = 1e-9
+REFLEX_TURN = math.radians(20.0)  # a boundary turning away from the domain by more than this is a reflex corner
 
 
 # ---------------------------------------------------------------------------
@@ -77,6 +83,39 @@ def arc_defects(layout: Layout) -> list:
     return out
 
 
+def reflex_corners(domain) -> np.ndarray:
+    """Vertices where the domain boundary turns away from the domain by more than REFLEX_TURN."""
+    out = []
+    for poly in getattr(domain, "geoms", [domain]):
+        poly = shapely.geometry.polygon.orient(poly, 1.0)  # the domain on the left of every ring
+        for ring in [poly.exterior, *poly.interiors]:
+            xy = np.asarray(ring.coords)[:-1, :2]
+            a, b = xy - np.roll(xy, 1, axis=0), np.roll(xy, -1, axis=0) - xy
+            turn = np.arctan2(a[:, 0] * b[:, 1] - a[:, 1] * b[:, 0], (a * b).sum(axis=1))
+            out.append(xy[turn < -REFLEX_TURN])
+    return np.vstack(out) if out else np.empty((0, 2))
+
+
+def corner_defects(layout: Layout, domain, scale: float) -> list:
+    """Reflex corners of the domain strictly inside a circle whose centre is off the boundary, except corners
+    on a barrier segment."""
+    corners = reflex_corners(domain)
+    if len(corners) == 0:
+        return []
+    segments = shapely.linestrings(np.stack([layout.xy[layout.segments[:, 0]], layout.xy[layout.segments[:, 1]]],
+                                            axis=1))
+    on_barrier = shapely.distance(shapely.union_all(segments), shapely.points(corners)) <= scale
+    corners = corners[~on_barrier]
+    if len(corners) == 0:
+        return []
+    off = shapely.distance(domain.boundary, shapely.points(layout.xy)) > scale
+    out = []
+    hits = cKDTree(corners).query_ball_point(layout.xy[off], layout.radius[off] * (1 - INSIDE_EPS))
+    for c, idx in zip(np.flatnonzero(off), hits):
+        out += [("corner in circle", 0.5 * (layout.xy[c] + corners[k])) for k in idx]
+    return out
+
+
 def defects(layout: Layout, others: np.ndarray, domain) -> list:
     """[(kind, location)] of every defect: bad pairs, overlapping arcs, points inside circles, sites outside."""
     out = []
@@ -92,6 +131,7 @@ def defects(layout: Layout, others: np.ndarray, domain) -> list:
     scale = 1e-9 * max(1.0, float(np.abs(layout.xy).max()))
     outside = ~shapely.covers(domain.buffer(scale), shapely.points(layout.sites))
     out += [("site outside", p) for p in layout.sites[outside]]
+    out += corner_defects(layout, domain, scale)
     return out
 
 

@@ -102,6 +102,8 @@ _HEAL_MATCH_TOL = 1e-4
 _HEAL_MATCH_REL_TOL = 0.5
 # Vertices closer than this are one point when building OCC curve loops.
 _VERTEX_MERGE_TOL = 1e-5
+# Area fraction of a buffer footprint outside the domain that is roundoff.
+_COVERED_AREA_TOL = 1e-9
 
 
 def _entity_signature(dim, tag):
@@ -283,6 +285,15 @@ def _embedded_constraint_entities(gmsh_map, clean_points, clean_lines):
                         yield 1, int(dimtag[1])
 
 
+def _structured_surface_tags(gmsh_map) -> set:
+    """Tags of the quad-buffer surfaces (strips and bands)."""
+    return {
+        int(tag)
+        for dimtags in gmsh_map.get('structured_buffer_surfs', {}).values()
+        for tag in _dimtag_tags(dimtags)
+    }
+
+
 def _free_node_tags(gmsh_map, polygons_gdf):
     """Tags of the mesh nodes inside embedded polygon surfaces, off every curve and point.
 
@@ -294,11 +305,7 @@ def _free_node_tags(gmsh_map, polygons_gdf):
     """
     if polygons_gdf is None or polygons_gdf.empty:
         return set()
-    structured = {
-        int(tag)
-        for dimtags in gmsh_map.get('structured_buffer_surfs', {}).values()
-        for tag in _dimtag_tags(dimtags)
-    }
+    structured = _structured_surface_tags(gmsh_map)
     free = set()
     for surf_tag in sorted(_domain_surface_tags(gmsh_map, polygons_gdf) - structured):
         node_tags, _, _ = gmsh.model.mesh.getNodes(2, int(surf_tag), includeBoundary=False)
@@ -1766,7 +1773,7 @@ class MeshGenerator:
         if created:
             inventory.structured_buffer_specs[key] = {
                 'lc': lc,
-                'thickness': buffer.quad_buffer_thickness(row),
+                'thickness': buffer.strip_cells_across(row),
                 'kind': 'line',
                 'strips': [info for _, info in created],
                 'n_surfaces_created': len(created),
@@ -1939,8 +1946,14 @@ class MeshGenerator:
 
     def _add_buffer_surfaces(self, buffer_geom, feature_key, domain, inventory,
                              corners=None, side_lines=None):
-        """Create OCC surfaces for a buffer footprint clipped to the domain; returns [(key, strip_info)]."""
-        if domain is not None and not domain.is_empty:
+        """Create OCC surfaces for a buffer footprint clipped to the domain; returns [(key, strip_info)].
+
+        A footprint already inside the domain is not intersected: where its
+        end cap lies on the domain boundary, the overlay adds a spurious
+        vertex to the cap, and a split cap cannot carry the transfinite rows.
+        """
+        if domain is not None and not domain.is_empty and \
+                buffer_geom.difference(domain).area > _COVERED_AREA_TOL * buffer_geom.area:
             buffer_geom = buffer_geom.intersection(domain)
         buffer_geom = unpinch_polygons(make_valid(buffer_geom), _VERTEX_MERGE_TOL)
         parts = [
@@ -2437,6 +2450,25 @@ class MeshGenerator:
             return None
         return [s + 1 for s in segments]
 
+    @staticmethod
+    def _paired_side_points(side_lengths, lc):
+        """Per-curve point counts that put the two sides' nodes at matching stations, or None.
+
+        The side lines are offsets of the same vertices, so their curves pair
+        up; giving each pair the same count makes every rung of the strip run
+        from a vertex to its counterpart, also across corners (a count spread
+        over each whole side shears the rungs wherever the sides' lengths
+        differ). The count follows the shorter curve of each pair, so the end
+        piece of a strip cut obliquely by the domain boundary stays one
+        stretched quad rather than a fan of skewed rungs. None when the sides
+        have different curve counts.
+        """
+        first, second = side_lengths
+        if len(first) != len(second):
+            return None
+        points = [max(1, int(round(min(a, b) / max(lc, 1e-12)))) + 1 for a, b in zip(first, second)]
+        return [points, list(points)]
+
     def _apply_transfinite_strip(self, surf_tag, corner_tags, lc, thickness):
         """Apply a 4-corner transfinite structure to a relocated buffer strip.
 
@@ -2460,7 +2492,8 @@ class MeshGenerator:
         for start_corner, end_corner, curves in chains:
             role = roles.get(frozenset((start_corner, end_corner)))
             if role == 'side':
-                sides.append(curves)
+                # Both sides run from the cap at ct[3]-ct[0], so their curves pair up by index.
+                sides.append(curves if start_corner in (ct[0], ct[3]) else curves[::-1])
             elif role == 'cap':
                 caps.append(curves)
             else:
@@ -2497,11 +2530,14 @@ class MeshGenerator:
         if any(divisions is None for divisions in cap_divisions):
             return False
 
+        side_divisions = self._paired_side_points(side_lengths, lc)
+        if side_divisions is None:
+            side_divisions = [self._distribute_chain_points(lengths, total_points) for lengths in side_lengths]
+        if any(divisions is None for divisions in side_divisions):
+            return False
+
         try:
-            for curves, lengths in zip(sides, side_lengths):
-                divisions = self._distribute_chain_points(lengths, total_points)
-                if divisions is None:
-                    return False
+            for curves, divisions in zip(sides, side_divisions):
                 for curve, points in zip(curves, divisions):
                     gmsh.model.mesh.setTransfiniteCurve(int(curve), int(points))
             for curves, divisions in zip(caps, cap_divisions):
@@ -2614,6 +2650,8 @@ class MeshGenerator:
                         f"Could not apply recombination to buffer surface {surf_tag}: {e}"
                     )
                 if structured:
+                    # Smoothing would move the interior node rows off their rungs.
+                    gmsh.model.mesh.setSmoothing(2, int(surf_tag), 0)
                     transfinite_count += 1
                 else:
                     recombine_only_count += 1
@@ -3066,7 +3104,7 @@ class MeshGenerator:
             logger.info("Setting up Resolution Fields...")
             self._setup_fields(gmsh_map, clean_polys, gmsh_lines, gmsh_points, crossings=crossings)
 
-            self._mesh_2d()
+            self._mesh_2d(_structured_surface_tags(gmsh_map))
             self._check_hex_rings(gmsh_map, clean_points)
 
             meshed_surface_tags = self._meshed_surface_tags(gmsh_map, clean_polys)
@@ -3181,8 +3219,12 @@ class MeshGenerator:
                     stacklevel=4,
                 )
 
-    def _mesh_2d(self):
-        """Set the meshing options, generate the 2D mesh and run the optimization cycles."""
+    def _mesh_2d(self, frozen_surface_tags=frozenset()):
+        """Set the meshing options, generate the 2D mesh and run the optimization cycles.
+
+        The optimization cycles skip ``frozen_surface_tags`` (the quad
+        buffers), whose transfinite node rows must stay where they were put.
+        """
         gmsh.option.setNumber("Mesh.Algorithm", self.mesh_algorithm)
         # Laplacian smoothing passes over the triangle-mesh nodes.
         gmsh.option.setNumber("Mesh.Smoothing", self.smoothing_steps)
@@ -3193,16 +3235,19 @@ class MeshGenerator:
         logger.info("Generating Triangular Mesh...")
         gmsh.model.mesh.generate(2)
 
-        if self.optimization_cycles > 0:
+        optimize_dimtags = [
+            (2, int(tag)) for _, tag in gmsh.model.getEntities(2) if int(tag) not in frozen_surface_tags
+        ]
+        if self.optimization_cycles > 0 and optimize_dimtags:
             if self._verbosity > 0:
                 logger.info(f"Running {self.optimization_cycles} Optimization Cycles (Relocate2D & Laplace2D)...")
             for i in range(self.optimization_cycles):
                 if self._verbosity > 1:
                     logger.info(f"  -> Cycle {i+1}/{self.optimization_cycles}")
                 # Moves nodes to improve element shape (compactness).
-                gmsh.model.mesh.optimize("Relocate2D", niter=1)
+                gmsh.model.mesh.optimize("Relocate2D", niter=1, dimTags=optimize_dimtags)
                 # Laplacian smoothing: moves each free node towards the mean of its neighbours.
-                gmsh.model.mesh.optimize("Laplace2D", niter=1)
+                gmsh.model.mesh.optimize("Laplace2D", niter=1, dimTags=optimize_dimtags)
 
     @staticmethod
     def _collect_domain_nodes(gmsh_map, domain_surface_tags, clean_points, clean_lines):

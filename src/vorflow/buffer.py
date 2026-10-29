@@ -8,8 +8,10 @@ Methodology
 -----------
 *Footprints.* A quad-buffered line becomes one strip polygon per line part:
 the line is simplified (``1.5 * lc``) and segmentized (``lc``) so its two
-mitred offsets at ``+/- thickness * lc / 2`` are symmetric and split into
+mitred offsets at ``+/- cells * lc / 2`` are symmetric and split into
 ~lc-long segments, keeping the transfinite divisions equal on opposite sides.
+``cells`` is ``quad_buffer_thickness``, or ``2 * thickness - 1`` on a barrier
+line, so that no node row lies on the barrier (``strip_cells_across``).
 The offset lines (not the strip) are clipped to the domain so their endpoints
 stay the true strip corners. A quad-buffered polygon becomes an annular band
 between the +/- offsets of its simplified outline; bands have no 4-corner
@@ -44,8 +46,10 @@ import math
 import warnings
 from dataclasses import dataclass, field
 
+import numpy as np
 import pandas as pd
-from shapely.geometry import LineString, MultiLineString, MultiPolygon, Polygon
+import shapely
+from shapely.geometry import LineString, MultiLineString, MultiPolygon, Point, Polygon
 from shapely.ops import linemerge, unary_union
 from shapely.validation import make_valid
 
@@ -65,6 +69,15 @@ from ._features import (
 # against the winner's structured node row with one clean unstructured row in
 # between. Tunable; larger values widen the gap if slivers appear.
 QUAD_BUFFER_CROSSING_GAP = 0.5
+
+# Mitre limit of the strip's offset lines, in multiples of the offset.
+MITRE_LIMIT = 5.0
+
+# A strip end on the domain boundary is extended past it by this many strip
+# half-widths before offsetting, so both side lines reach the boundary and the
+# end cap lies on it. 5 (the offset mitre limit) covers boundaries crossed at
+# more than ~11 degrees to the line.
+STRIP_END_EXTENSION = 5.0
 
 # Rank used as the fourth priority-key element: lines win ties over polygons.
 _KIND_RANK = {'line': 0, 'poly': 1}
@@ -86,7 +99,7 @@ class BufferPlan:
     kind: str  # 'line' or 'poly'
     footprint: object
     lc: float
-    thickness: int
+    thickness: int  # quad rows across (strip_cells_across for lines)
     priority_key: tuple
     parts: list = field(default_factory=list)  # StripPart list (lines)
     band: object = None  # annular band geometry (polygons)
@@ -116,6 +129,20 @@ def quad_buffer_thickness(row) -> int:
     if value not in (1, 2):
         raise ValueError("quad_buffer_thickness must be either 1 or 2.")
     return value
+
+
+def strip_cells_across(row) -> int:
+    """Quad rows across the row's strip: ``quad_buffer_thickness``, or ``2 * thickness - 1`` on a barrier.
+
+    A strip of n quads has n + 1 node rows. On a barrier line the count must
+    be odd, so the line falls between the two middle node rows (on Voronoi
+    faces) and ``thickness`` cell rows sit on each side of it. An even count
+    would put a node row, and so the cell centres, on the barrier.
+    """
+    thickness = quad_buffer_thickness(row)
+    if row_bool(row, 'is_barrier', False):
+        return 2 * thickness - 1
+    return thickness
 
 
 def feature_z_order(row) -> float:
@@ -165,20 +192,16 @@ def plan_line_strip(line, lc, thickness, domain, feature_name) -> list[StripPart
             continue
         work = part.simplify(lc * 1.5)
         work = work.segmentize(lc)
-        pos = coerce_offset_line(
-            work.offset_curve(offset, quad_segs=1, join_style=2, mitre_limit=5.0)
-        )
-        neg = coerce_offset_line(
-            work.offset_curve(-offset, quad_segs=1, join_style=2, mitre_limit=5.0)
-        )
+        if domain is not None and not domain.is_empty:
+            work = extend_boundary_ends(work, domain.boundary, STRIP_END_EXTENSION * offset, 1e-6 * lc)
+        pos, neg = paired_offsets(work, offset)
         if pos is None or neg is None:
             warnings.warn(
                 f"Skipping structured buffer for line feature {feature_name} after offset split."
             )
             continue
         if domain is not None and not domain.is_empty:
-            pos = coerce_offset_line(pos.intersection(domain))
-            neg = coerce_offset_line(neg.intersection(domain))
+            pos, neg = clip_paired_sides(pos, neg, domain)
             if pos is None or neg is None:
                 warnings.warn(
                     f"Skipping structured buffer for line feature {feature_name} after domain clipping."
@@ -202,6 +225,88 @@ def plan_line_strip(line, lc, thickness, domain, feature_name) -> list[StripPart
         ]
         plans.append(StripPart(strip=strip, corners=corners, side_lines=(pos, neg)))
     return plans
+
+
+def paired_offsets(line: LineString, offset: float) -> tuple:
+    """(left, right) offset lines of ``line`` at ``+/- offset``, vertex for vertex where possible.
+
+    Each vertex moves along its corner bisector by the mitre length (capped
+    at ``MITRE_LIMIT * offset``), so vertex i of one side faces vertex i of
+    the other across the line and the transfinite rungs join them. Where
+    that self-intersects (the inside of a corner tighter than the offset),
+    shapely's mitred offset curves are used instead.
+    """
+    xy = np.asarray(sanitize_coords(list(line.coords), min_points=2), dtype=float)
+    if len(xy) >= 2:
+        tangents = np.diff(xy, axis=0)
+        tangents /= np.hypot(*tangents.T)[:, None]
+        normals = np.c_[-tangents[:, 1], tangents[:, 0]]
+        bisectors = np.vstack([normals[:1], normals[:-1] + normals[1:], normals[-1:]])
+        lengths = np.hypot(*bisectors.T)
+        if np.all(lengths > 1e-9):
+            bisectors /= lengths[:, None]
+            # cos of the half-angle between each bisector and its segment normal.
+            cos_half = np.einsum('ij,ij->i', bisectors, np.vstack([normals[:1], normals]))
+            shift = bisectors * (offset / np.maximum(cos_half, 1.0 / MITRE_LIMIT))[:, None]
+            left, right = LineString(xy + shift), LineString(xy - shift)
+            if left.is_simple and right.is_simple and not left.intersects(right):
+                return left, right
+    return (
+        coerce_offset_line(line.offset_curve(offset, quad_segs=1, join_style=2, mitre_limit=MITRE_LIMIT)),
+        coerce_offset_line(line.offset_curve(-offset, quad_segs=1, join_style=2, mitre_limit=MITRE_LIMIT)),
+    )
+
+
+def clip_paired_sides(left: LineString, right: LineString, domain) -> tuple:
+    """Both side lines clipped to ``domain``, keeping only the vertex stations both still have.
+
+    An oblique boundary cuts the two sides at different stations. A vertex
+    left on one side only would break the pairing of ``paired_offsets``, so
+    it is dropped and that side runs straight from the last shared station
+    to the boundary. Sides that do not pair up are just clipped.
+    """
+    clipped = [coerce_offset_line(side.intersection(domain)) for side in (left, right)]
+    if any(clip is None for clip in clipped) or len(left.coords) != len(right.coords):
+        return tuple(clipped)
+    sides_xy = [np.asarray(side.coords) for side in (left, right)]
+    inside = shapely.covers(domain, shapely.points(sides_xy[0])) & shapely.covers(domain, shapely.points(sides_xy[1]))
+    keep = np.flatnonzero(inside)
+    if len(keep) == 0 or np.any(np.diff(keep) != 1):
+        return tuple(clipped)
+    paired = []
+    for xy, clip in zip(sides_xy, clipped):
+        ends = np.asarray(clip.coords)[[0, -1]]
+        if np.hypot(*(ends[0] - xy[keep[0]])) > np.hypot(*(ends[1] - xy[keep[0]])):
+            ends = ends[::-1]
+        coords = sanitize_coords(np.vstack([ends[:1], xy[keep], ends[1:]]).tolist(), min_points=2)
+        paired.append(LineString(coords) if len(coords) >= 2 else None)
+    return tuple(paired)
+
+
+def extend_boundary_ends(line: LineString, boundary, length: float, tol: float) -> LineString:
+    """``line`` with each end within ``tol`` of ``boundary`` extended straight on by ``length``.
+
+    Without it, the side line on the obtuse side of an oblique boundary stops
+    short of it, and the strip leaves an unstructured wedge whose nodes can
+    fall on the line itself.
+    """
+    coords = [tuple(c) for c in line.coords]
+    if len(coords) < 2:
+        return line
+    for end, prev in ((0, 1), (-1, -2)):
+        if Point(coords[end]).distance(boundary) > tol:
+            continue
+        dx = coords[end][0] - coords[prev][0]
+        dy = coords[end][1] - coords[prev][1]
+        norm = math.hypot(dx, dy)
+        if norm <= 0:
+            continue
+        tip = (coords[end][0] + dx / norm * length, coords[end][1] + dy / norm * length)
+        if end == 0:
+            coords.insert(0, tip)
+        else:
+            coords.append(tip)
+    return LineString(coords)
 
 
 def plan_polygon_band(geom, lc, thickness, feature_name):
@@ -245,7 +350,7 @@ def plan_quad_buffers(polygons_gdf, lines_gdf, background_lc, domain) -> dict:
         if not row_bool(row, 'quad_buffer', False):
             continue
         lc = feature_lc(row, background_lc)
-        thickness = quad_buffer_thickness(row)
+        thickness = strip_cells_across(row)
         parts = plan_line_strip(row.geometry, lc, thickness, domain, row.name)
         if not parts:
             continue
@@ -287,7 +392,7 @@ def protection_epsilon(row, background_lc) -> float:
     """
     lc = feature_lc(row, background_lc)
     if row_bool(row, 'quad_buffer', False):
-        return quad_buffer_thickness(row) * lc / 2.0
+        return strip_cells_across(row) * lc / 2.0
     return lc * 0.20
 
 

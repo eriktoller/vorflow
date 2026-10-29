@@ -65,11 +65,20 @@ def _rot(u: np.ndarray, angle: float) -> np.ndarray:
     return np.array([c * u[0] - s * u[1], s * u[0] + c * u[1]])
 
 
+def _grid(s: np.ndarray, lo: float, hi: float) -> np.ndarray:
+    """Positions in [lo, hi] to integrate 1/h on: 64 even steps and every sample between.
+
+    The samples keep a local dip of h (a cap or a repair round) that 64
+    steps along a long piece would step over.
+    """
+    return np.unique(np.concatenate([np.linspace(lo, hi, 64), s[(s > lo) & (s < hi)]]))
+
+
 def _positions(field: SizeField, piece: int, lo: float, hi: float, count: int) -> np.ndarray:
     """``count - 1`` interior positions in [lo, hi] at equal steps of the integral of 1/h."""
     sel = field.piece == piece
     s, h = field.s[sel], field.h[sel]
-    grid = np.linspace(lo, hi, 64)
+    grid = _grid(s, lo, hi)
     inv = 1.0 / np.interp(grid, s, h)
     cum = np.concatenate([[0.0], np.cumsum(0.5 * (inv[1:] + inv[:-1]) * np.diff(grid))])
     return np.interp(cum[-1] * np.arange(1, count) / count, cum, grid)
@@ -79,7 +88,7 @@ def _count(field: SizeField, piece: int, lo: float, hi: float) -> int:
     """round of the integral of 1/h over [lo, hi], at least 1."""
     sel = field.piece == piece
     s, h = field.s[sel], field.h[sel]
-    grid = np.linspace(lo, hi, 64)
+    grid = _grid(s, lo, hi)
     return max(1, int(round(integral(1.0 / np.interp(grid, s, h), grid))))
 
 

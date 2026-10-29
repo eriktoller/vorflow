@@ -5,6 +5,7 @@ import numpy as np
 import pytest
 from shapely.geometry import LineString, MultiLineString, Point, Polygon
 
+from vorflow.blueprint import ConceptualMesh
 from vorflow.utils import (
     build_connectivity,
     calculate_mesh_quality,
@@ -49,22 +50,16 @@ def test_calculate_mesh_quality_computes_expected_scalar_metrics(paired_polygons
     "line",
     [
         LineString([(-1, 0.5), (3, 0.5)]),
-        MultiLineString([[(-1, 0.5), (1, 0.5)], [(1, 0.5), (3, 0.5)]]),
-        Polygon([(-1, -1), (3, -1), (3, 2), (-1, 2)]),
+        MultiLineString([[(-1, 0.5), (1, 0.5)], [(1, 0.5), (3, 0.5)]])
 
     ],
 )
 def test_cells_on_line_returns_cell_areas_and_intersection_lengths(paired_polygons, line):
     cells = cells_on(paired_polygons, line)
 
-    if isinstance(line, Polygon):
-        # length is perimeter 
-        assert cells["cell_area"].tolist() == pytest.approx([1.0, 1.0])
-        assert cells["length"].tolist() == pytest.approx([4.0, 4.0])
-    else:
-        # length of line
-        assert cells["cell_area"].tolist() == pytest.approx([1.0, 1.0])
-        assert cells["length"].tolist() == pytest.approx([1.0, 1.0])
+    # length of line
+    assert cells["cell_area"].tolist() == pytest.approx([1.0, 1.0])
+    assert cells["length"].tolist() == pytest.approx([1.0, 1.0])
 
 
 def test_cells_on_point_returns_containing_cell_and_zero_length(paired_polygons):
@@ -75,20 +70,59 @@ def test_cells_on_point_returns_containing_cell_and_zero_length(paired_polygons)
     assert cells["length"].tolist() == pytest.approx([0.0])
 
 
-def test_cells_on_point_on_shared_edge_returns_both_touching_cells(paired_polygons):
+def test_cells_on_point_on_shared_edge_returns_single_cell(paired_polygons):
     cells = cells_on(paired_polygons, Point(1.0, 0.5))
 
     assert len(cells) == 1
 
 
 def test_cells_on_rejects_unsupported_geometry(paired_polygons):
-    with pytest.raises(ValueError, match="Point, LineString, MultiLineString, or Polygon"):
-        cells_on(paired_polygons, [1.0, 2.0, 3.0])
+    with pytest.raises(ValueError, match="Point, LineString, or MultiLineString"):
+        cells_on(paired_polygons, Polygon([(0, 0), (2, 0), (2, 1), (0, 1)]))
 
 
-def test_cells_on_rejects_missing_columns_geometry(paired_polygons):
-    with pytest.raises(ValueError, match="the geometry GeoDataFrame must conatain the columns feature_type and feature_id."):
-        cells_on(paired_polygons, paired_polygons)
+def test_cells_on_accepts_features_from_conceptual_mesh(paired_polygons):
+    cm = ConceptualMesh()
+    cm.add_polygon(Polygon([(0, 0), (2, 0), (2, 1), (0, 1)]), zone_id="domain")
+    cm.add_line(
+        LineString([(0.25, 0.5), (1.75, 0.5)]),
+        line_id="river",
+        resolution=1.0,
+    )
+    cm.add_point(Point(0.5, 0.5), point_id="well", resolution=1.0)
+    cm.generate()
+
+    features = cm.features()
+    cells = cells_on(paired_polygons, features)
+
+    assert set(cells["feature_id"]) == {"river", "well"}
+    assert cells.groupby("feature_id")["feature_type"].first().to_dict() == {
+        "river": "line",
+        "well": "point",
+    }
+
+
+def test_cells_on_infers_feature_metadata_from_geometry_and_index(paired_polygons):
+    cm = ConceptualMesh()
+    cm.add_polygon(Polygon([(0, 0), (2, 0), (2, 1), (0, 1)]), zone_id="domain")
+    cm.add_line(
+        LineString([(0.25, 0.5), (1.75, 0.5)]),
+        line_id="river",
+        resolution=1.0,
+    )
+    cm.add_point(Point(0.5, 0.5), point_id="well", resolution=1.0)
+    cm.generate()
+
+    features = cm.features().drop(columns=["feature_type", "feature_id"])
+    expected_types = {
+        index: geometry.geom_type
+        for index, geometry in features.geometry.items()
+        if geometry.geom_type in {"LineString", "Point"}
+    }
+
+    cells = cells_on(paired_polygons, features)
+
+    assert cells.groupby("feature_id")["feature_type"].first().to_dict() == expected_types
 
 
 def test_cells_on_rejects_geometry_outside_grid(paired_polygons):

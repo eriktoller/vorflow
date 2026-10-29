@@ -836,9 +836,9 @@ def _insert_hanging_vertices(cell_vertices, vertex_xy, tolerance):
 
 def cells_on(
     gdf: gpd.GeoDataFrame,
-    geometry: shapely.Point | shapely.LineString | shapely.MultiLineString | shapely.Polygon | gpd.GeoDataFrame,
+    geometry: shapely.Point | shapely.LineString | shapely.MultiLineString | gpd.GeoDataFrame,
 ) -> gpd.GeoDataFrame:
-    """Returns a GeoPandas DataFrame for the cells that lies on the geometry object. For a Point a single series will be returned.
+    """Returns a GeoPandas DataFrame for the cells that lies on the geometry object.
 
     Args:
         gdf (GeoDataFrame): Grid of single-part polygons without holes, with
@@ -856,25 +856,28 @@ def cells_on(
         ValueError: If ``geometry`` is outside of the grid.
     """
     if isinstance(geometry, gpd.GeoDataFrame):
-        if not {'feature_type', 'feature_id'}.issubset(geometry.columns):
-            raise ValueError("the geometry GeoDataFrame must conatain the columns feature_type and feature_id.")
+        if not {'feature_type'}.issubset(geometry.columns):
+            geometry['feature_type'] = [g.geom_type for g in geometry.geometry]
+        if not {'feature_id'}.issubset(geometry.columns):
+            geometry['feature_id'] = [g for g in geometry.index]
         res = []
         for _, row in geometry.iterrows():
+            if not isinstance(row.geometry, (Point, LineString, MultiLineString)):
+                logger.info(f"[WARNING] {row.geometry.geom_type} is not suported and is skipped.")
+                continue
             cells_gdf = cells_on(gdf, row.geometry)
             cells_gdf["feature_type"] = row["feature_type"]
             cells_gdf["feature_id"] = row["feature_id"]
             res.append(cells_gdf)
-        cells = gpd.GeoDataFrame(pd.concat(res, ignore_index=False))
+        if len(res) == 0:
+            return gpd.GeoDataFrame()
+        cells = gpd.GeoDataFrame(pd.concat(res, ignore_index=True))
         return cells
     
-    if not isinstance(geometry, (Point, LineString, MultiLineString, Polygon)):
-        raise ValueError("geometry must be a Point, LineString, MultiLineString, or Polygon.")
+    if not isinstance(geometry, (Point, LineString, MultiLineString)):
+        raise ValueError("geometry must be a Point, LineString, or MultiLineString.")
 
-    if isinstance(geometry, Polygon):
-        mask = gdf.geometry.within(geometry).to_numpy()
-    else:
-        mask = gdf.geometry.intersects(geometry).to_numpy()
-
+    mask = gdf.geometry.intersects(geometry).to_numpy()
     cells = gdf.loc[mask].copy()
     if cells.empty:
             raise ValueError("the geometry is outside the grid")
@@ -895,6 +898,9 @@ def cells_on(
         cells["cell_id"] = np.flatnonzero(mask)
         cells["cell_area"] = cells.geometry.area
         cells["length"] = cells.geometry.intersection(geometry).length
+
+    # Reset the index
+    cells.reset_index(drop=True, inplace=True)
 
     return cells
 
@@ -951,4 +957,8 @@ def faces_on(gdf, geometry, tolerance=None, predicate="within"):
         mask = gdf["shared_edge"].within(geometry.buffer(tolerance))
     faces = gdf.loc[mask].copy()
     faces["face_length"] = faces["shared_edge"].length
+
+    # Reset the index
+    faces.reset_index(drop=True, inplace=True)
+
     return faces

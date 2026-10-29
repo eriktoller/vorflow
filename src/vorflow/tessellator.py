@@ -725,7 +725,9 @@ class VoronoiTessellator:
             the reflex corner along a diagonal of the cell where one works;
             otherwise it follows the corner's angle bisector, and the
             neighbour across that face gains a vertex where the cut ends
-            (its shape is unchanged). A zero-width spike (as a barrier end
+            (its shape is unchanged). Where that face is on a barrier,
+            two diagonals to its ends cut it off instead, so every barrier
+            segment stays one face. A zero-width spike (as a barrier end
             can leave) is removed first. The largest piece holding the
             generator keeps the cell's ``node_id``; the others get new IDs
             above the maximum. A cell that cannot be split (e.g. one with a
@@ -1626,7 +1628,9 @@ class VoronoiTessellator:
         if self.split_concave == "hidden_face":
             concave &= ~(centroid_fan_fraction(geoms) > 0.0)
         targets = np.flatnonzero(concave)
-        grid, self.concave_split_report = split_concave_cells(grid, targets)
+        lines = [line for line, _ in self._barrier_lines()]
+        barriers = shapely.union_all(lines) if lines else None
+        grid, self.concave_split_report = split_concave_cells(grid, targets, barriers)
         report = self.concave_split_report
         added = int(report['n_pieces'].sum()) - len(report)
         logger.info(f"  -> Split {len(report)} concave cells into convex pieces (+{added} cells)")

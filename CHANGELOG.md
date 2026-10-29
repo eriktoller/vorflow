@@ -128,7 +128,8 @@ and the project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   concave cells with a face hidden from the centroid into convex pieces, and
   `"all"` cuts every concave cell. Cuts run along diagonals from the reflex
   corner (a bisector cut, with the new vertex added to the neighbour, where no
-  diagonal works). The largest piece holding the generator keeps `node_id`
+  diagonal works; where the bisector ends on a barrier face, diagonals to the
+  ends of that face instead, so each barrier segment stays one face). The largest piece holding the generator keeps `node_id`
   and the others get new IDs; a cell that cannot be split is left as it is,
   with a warning. Every piece carries its centroid as `x`/`y`, because the
   generator sits at the end of the cut and XT3D crashes on a cell centre

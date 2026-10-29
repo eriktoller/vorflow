@@ -571,7 +571,9 @@ For PRT, `split_concave="hidden_face"` cuts only the cells with a hidden
 face into convex pieces; `split_concave="all"` cuts every concave cell. Cuts
 run from the reflex corner along a diagonal of the cell where one works.
 Otherwise the cut follows the corner's angle bisector, and the neighbouring
-cell gains a vertex where the cut ends (its shape does not change). The
+cell gains a vertex where the cut ends (its shape does not change). Where the
+bisector would end on a barrier face, two diagonals to the ends of that face
+cut it off instead, so every barrier segment stays one face. The
 largest piece holding the generator keeps the cell's `node_id`; the others
 get new IDs. All pieces carry their centroid as `x`/`y`, unlike every other
 cell: the generator sits on the corner, at the end of the cut, and a cell

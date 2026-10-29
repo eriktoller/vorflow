@@ -18,7 +18,10 @@ so the neighbouring cells do not change. When no diagonal resolves a reflex
 vertex (common where the cell has few vertices opposite the corner), the cut
 follows the angle bisector to the boundary and the new vertex is inserted into
 the neighbour that shares that face: the neighbour keeps its shape but gains a
-vertex. The cut always starts at the reflex vertex, where the generator sits,
+vertex. A barrier face never gains one, as each barrier segment must stay one
+face: where the bisector ends inside a barrier face, two diagonals to the ends
+of that face cut it off instead (both lie either side of the bisector, so they
+resolve the corner). The cut always starts at the reflex vertex, where the generator sits,
 so the generator would lie at the end of the new face; every piece therefore
 takes its centroid as x/y. A zero-width spike (a vertex where the ring turns
 straight back, as a barrier end can leave) is dropped first; the base of the
@@ -244,8 +247,14 @@ def _best_diagonal(poly: Polygon, r: int):
     return best
 
 
-def _bisector_cut(poly: Polygon, r: int) -> tuple[list[Polygon], np.ndarray]:
-    """Pieces from cutting along the bisector of reflex vertex r, and the new vertex where it ends."""
+def _bisector_cut(poly: Polygon, r: int, barriers=None) -> tuple[list[Polygon], np.ndarray | None]:
+    """Pieces from cutting along the bisector of reflex vertex r, and the new vertex where it ends.
+
+    Where the bisector ends on a ``barriers`` line away from a vertex (inside
+    a barrier face, which the new vertex would cut in two), two diagonals to
+    the ends of that face cut it off instead, and no vertex is added (the
+    returned end is None).
+    """
     xy = _ring(poly)
     n = len(xy)
     vertex = xy[r]
@@ -261,10 +270,47 @@ def _bisector_cut(poly: Polygon, r: int) -> tuple[list[Polygon], np.ndarray]:
     if not ends:
         raise SplitError("the bisector of a reflex vertex meets no other boundary point")
     end = min(ends, key=lambda p: np.hypot(*(p - vertex)))
+    if _inside_barrier_face(end, xy, barriers, tolerance):
+        return _barrier_face_fan(poly, r, end), None
     snapped = shapely.snap(poly, Point(end), tolerance)
     pieces = list(shapely.get_parts(split(snapped, LineString([vertex, end]))))
     _check_progress(poly, pieces)
     return pieces, end
+
+
+def _barrier_face_fan(poly: Polygon, r: int, end: np.ndarray) -> list[Polygon]:
+    """Pieces from diagonals joining reflex vertex r to both ends of the edge that holds ``end``.
+
+    ``end`` is where the bisector of r meets that edge, so the two diagonals
+    lie either side of the bisector and leave every corner at r below 180
+    degrees, without a new vertex.
+    """
+    xy = _ring(poly)
+    n = len(xy)
+    tolerance = _tolerance(poly)
+    edges = [k for k in range(n) if LineString([xy[k], xy[(k + 1) % n]]).distance(Point(end)) <= tolerance]
+    if not edges:
+        raise SplitError("the bisector of a reflex vertex ends on no edge")
+    # Unwrapped ring positions r < a < a + 1 < r + n of the edge's ends.
+    a = edges[0] if edges[0] > r else edges[0] + n
+    shrunk = poly.buffer(-tolerance)
+    for j in (a, a + 1):
+        diagonal = LineString([xy[r], xy[j % n]])
+        is_edge = j - r < 2 or j - r > n - 2
+        if not is_edge and not (shrunk.intersects(diagonal) and poly.covers(diagonal)):
+            raise SplitError("the bisector of a reflex vertex ends inside a barrier face it cannot cut off")
+    rings = ([xy[k % n] for k in range(r, a + 1)], [xy[r], xy[a % n], xy[(a + 1) % n]],
+             [xy[k % n] for k in range(a + 1, r + n + 1)])
+    pieces = [Polygon(ring) for ring in rings if len(ring) >= 3]
+    _check_progress(poly, pieces)
+    return pieces
+
+
+def _inside_barrier_face(point: np.ndarray, xy: np.ndarray, barriers, tolerance: float) -> bool:
+    """True when ``point`` lies on ``barriers`` but on no vertex of the ring ``xy``."""
+    if barriers is None or barriers.distance(Point(point)) > tolerance:
+        return False
+    return bool(np.hypot(*(xy - point).T).min() > tolerance)
 
 
 def _check_progress(poly: Polygon, pieces: list[Polygon]) -> None:
@@ -275,11 +321,13 @@ def _check_progress(poly: Polygon, pieces: list[Polygon]) -> None:
         raise SplitError("a cut changed the cell area")
 
 
-def convex_pieces(poly: Polygon) -> tuple[list[Polygon], list[np.ndarray]]:
+def convex_pieces(poly: Polygon, barriers=None) -> tuple[list[Polygon], list[np.ndarray]]:
     """Convex pieces of ``poly`` and the boundary vertices its neighbours need.
 
-    Those are the ends of bisector cuts and the bases of removed spikes.
-    Raises SplitError for a polygon with holes or when no cut makes progress.
+    Those are the ends of bisector cuts and the bases of removed spikes. No
+    cut ends inside a face on the ``barriers`` lines, so each barrier face
+    stays one face. Raises SplitError for a polygon with holes or when no cut
+    makes progress.
     """
     if poly.geom_type != "Polygon" or poly.is_empty or len(poly.interiors) > 0:
         raise SplitError("only single polygons without holes can be split")
@@ -300,17 +348,18 @@ def convex_pieces(poly: Polygon) -> tuple[list[Polygon], list[np.ndarray]]:
         if candidates:
             stack.extend(min(candidates, key=lambda c: c[1])[0])
         else:
-            cut, end = _first_bisector_cut(piece, reflex)
-            added.append(end)
+            cut, end = _first_bisector_cut(piece, reflex, barriers)
+            if end is not None:
+                added.append(end)
             stack.extend(cut)
     return pieces, added
 
 
-def _first_bisector_cut(poly: Polygon, reflex: list[int]) -> tuple[list[Polygon], np.ndarray]:
+def _first_bisector_cut(poly: Polygon, reflex: list[int], barriers=None) -> tuple[list[Polygon], np.ndarray]:
     """The bisector cut of the first reflex vertex that has one; re-raise the last failure."""
     for r in reflex:
         try:
-            return _bisector_cut(poly, r)
+            return _bisector_cut(poly, r, barriers)
         except SplitError as error:
             last = error
     raise last
@@ -327,7 +376,7 @@ def _insert_vertex(poly: Polygon, point: np.ndarray, tolerance: float) -> Polygo
     return poly
 
 
-def split_concave_cells(grid, targets: np.ndarray) -> tuple:
+def split_concave_cells(grid, targets: np.ndarray, barriers=None) -> tuple:
     """Split the cells at row positions ``targets`` into convex pieces.
 
     The largest piece covering the generator (else the largest) keeps the
@@ -335,7 +384,9 @@ def split_concave_cells(grid, targets: np.ndarray) -> tuple:
     maximum. Every piece of a split cell takes its centroid as x/y and is
     marked in a ``concave_split`` column; the mesh node stays in
     ``source_x``/``source_y``, which are added (equal to x/y) when the grid
-    lacks them. A cell that cannot be split stays as it is, with a warning. Returns the new grid
+    lacks them. No cut ends inside a face on the ``barriers`` lines (a
+    shapely geometry, or None). A cell that cannot be split stays as it is,
+    with a warning. Returns the new grid
     (fresh RangeIndex) and a report DataFrame with one row per split cell:
     ``node_id``, ``convexity``, ``n_pieces``, ``piece_ids`` and
     ``min_piece_fraction`` (smallest piece over the cell area).
@@ -353,7 +404,7 @@ def split_concave_cells(grid, targets: np.ndarray) -> tuple:
         row = grid.iloc[position]
         cell = row[geometry]
         try:
-            pieces, cut_ends = convex_pieces(cell)
+            pieces, cut_ends = convex_pieces(cell, barriers)
         except SplitError as error:
             failed.append(f"{row['node_id']} ({error})")
             continue

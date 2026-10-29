@@ -14,6 +14,7 @@ from shapely.ops import unary_union, split
 from shapely.validation import make_valid
 
 from . import _lloyd
+from ._convex import CONCAVE_TOLERANCE, centroid_fan_fraction, split_concave_cells
 from ._features import polygon_parts
 from ._plot import get_ax
 from .utils import grid_to_disv, grid_to_gsf, grid_to_mfusg_disu
@@ -23,6 +24,10 @@ logger = logging.getLogger(__name__)
 # Split pieces smaller than this fraction of the cell area are treated as
 # floating-point slivers from a barrier that runs along a cell face.
 BARRIER_SLIVER_FRACTION = 1e-6
+
+# split_concave settings other than False: split only cells with a face
+# hidden from the centroid, or every concave cell.
+SPLIT_CONCAVE_MODES = ("hidden_face", "all")
 
 # Split pieces without the generator smaller than this fraction of the cell
 # area join the neighbouring cell on their side of the barrier instead of
@@ -627,6 +632,35 @@ class VoronoiTessellator:
             holds the ``initial`` and ``final`` short-face counts,
             ``passes`` and ``rejected`` moves, and the grid gets a
             ``lloyd_shift`` column with the total move of each node.
+        split_concave (False or str): Split concave cells into convex
+            pieces after the grid is built (False, the default, turns it
+            off). Clipping makes a cell concave where the domain boundary
+            or a hole has a reflex corner (an L- or V-shaped cell around
+            the node on that corner). ``"hidden_face"`` splits only the
+            concave cells with a face that cannot be seen from the cell
+            centroid (``star_from_centroid`` False in
+            ``vorflow.utils.calculate_mesh_quality``); MODFLOW 6 particle
+            tracking (PRT) can loop forever in such a cell without an
+            error. ``"all"`` splits every concave cell. Each cut runs from
+            the reflex corner along a diagonal of the cell where one works;
+            otherwise it follows the corner's angle bisector, and the
+            neighbour across that face gains a vertex where the cut ends
+            (its shape is unchanged). A zero-width spike (as a barrier end
+            can leave) is removed first. The largest piece holding the
+            generator keeps the cell's ``node_id``; the others get new IDs
+            above the maximum. A cell that cannot be split (e.g. one with a
+            hole, which no DISV cell can represent) is left as it is with a
+            warning, in either mode. Unlike every other cell, all pieces of
+            a split cell carry their centroid as ``x``/``y``: the generator
+            sits on the reflex corner, at the end of the cut, and a cell
+            centre there makes MODFLOW 6 XT3D crash. With the split on, the
+            grid gets a ``concave_split`` column marking the pieces, and
+            ``source_x``/``source_y`` (the mesh node) if it lacks them. The new faces are poor for the flow solution (CVFD
+            skewness about 0.5), so in a test with an exact linear head the
+            error rose from round-off to about 1e-5; use this for particle
+            tracking, not as a general improvement. ``concave_split_report``
+            lists the split cells (``node_id``, ``convexity``,
+            ``n_pieces``, ``piece_ids``, ``min_piece_fraction``).
     """
 
     def __init__(
@@ -643,6 +677,7 @@ class VoronoiTessellator:
         lloyd_tolerance=1e-3,
         lloyd_size_smoothing=5,
         min_face_fraction=0.0,
+        split_concave=False,
     ):
         if boundary_centering not in {"clip", "inset_mirror"}:
             raise ValueError("boundary_centering must be either 'clip' or 'inset_mirror'.")
@@ -656,6 +691,11 @@ class VoronoiTessellator:
                                  size_smoothing=lloyd_size_smoothing)
         if not (0.0 <= float(min_face_fraction) < 1.0):
             raise ValueError(f"min_face_fraction must be in [0, 1). Got {min_face_fraction!r}.")
+        split_off = isinstance(split_concave, (bool, np.bool_)) and not split_concave
+        if not (split_off or (isinstance(split_concave, str) and split_concave in SPLIT_CONCAVE_MODES)):
+            raise ValueError(
+                f"split_concave must be False, 'hidden_face' or 'all'. Got {split_concave!r}."
+            )
 
         if conceptual_mesh is None:
             conceptual_mesh = getattr(mesh_generator, 'conceptual_mesh', None)
@@ -695,6 +735,9 @@ class VoronoiTessellator:
         self.min_face_fraction = float(min_face_fraction)
         # {"initial", "final", "passes", "rejected"} after a short-face cleanup.
         self.short_face_report = None
+        self.split_concave = False if split_off else split_concave
+        # One row per split cell after a run with split_concave on.
+        self.concave_split_report = None
 
     def _lloyd_mesh_inputs(self, n_nodes):
         """(node_is_free, node_sizes, buffer_footprints) captured from the mesh generator, checked against ``n_nodes``."""
@@ -1244,10 +1287,12 @@ class VoronoiTessellator:
         7. Enforcing barrier lines by splitting cells that still straddle them.
         8. Merging cell vertices a roundoff distance apart, so no cell has
            a zero-length edge.
-        9. Calculating final cell properties. After Lloyd relaxation this
-           includes ``lloyd_shift``: how far each mesh node moved (0 for fixed
-           nodes; NaN for cells without a mesh node of their own: barrier
-           mirrors, barrier fragments and detached cell parts).
+        9. With ``split_concave``, cutting concave cells into convex pieces.
+        10. Calculating final cell properties. After Lloyd relaxation this
+            includes ``lloyd_shift``: how far each mesh node moved (0 for
+            fixed nodes; NaN for cells without a mesh node of their own:
+            barrier mirrors, barrier fragments, detached cell parts and the
+            new pieces of split concave cells).
 
         Returns:
             gpd.GeoDataFrame: The final, clean Voronoi grid.
@@ -1273,6 +1318,7 @@ class VoronoiTessellator:
 
         self.lloyd_report = None
         self.short_face_report = None
+        self.concave_split_report = None
         lloyd_shift = None
         if self.lloyd_iterations > 0 or self.min_face_fraction > 0:
             relaxed = nodes
@@ -1385,18 +1431,34 @@ class VoronoiTessellator:
         # Final cleanup after potential splits.
         self.final_grid = _explode_with_unique_ids(self.final_grid)
         self.final_grid = _merge_close_vertices(self.final_grid)
+        if self.split_concave:
+            self.final_grid = self._split_concave_cells(self.final_grid)
         if lloyd_shift is not None:
             # Cells with a node_id that is no mesh node get NaN.
             self.final_grid['lloyd_shift'] = self.final_grid['node_id'].map(lloyd_shift)
 
-        # The 'x' and 'y' columns should always refer to the generator point
-        # coordinates, which are essential for quality analysis. We add separate
-        # columns for the geometric centroid of the final cell.
+        # The 'x' and 'y' columns refer to the generator point coordinates,
+        # which are essential for quality analysis (except on split concave
+        # cells, which carry their centroid). We add separate columns for the
+        # geometric centroid of the final cell.
         self.final_grid['centroid_x'] = self.final_grid.geometry.centroid.x
         self.final_grid['centroid_y'] = self.final_grid.geometry.centroid.y
         
         logger.info(f"Final Voronoi Grid Generated: {len(self.final_grid)} cells.")
         return self.final_grid
+
+    def _split_concave_cells(self, grid):
+        """Grid with the concave cells selected by ``split_concave`` cut into convex pieces."""
+        geoms = grid.geometry.to_numpy()
+        concave = shapely.area(geoms) / shapely.area(shapely.convex_hull(geoms)) < 1.0 - CONCAVE_TOLERANCE
+        if self.split_concave == "hidden_face":
+            concave &= ~(centroid_fan_fraction(geoms) > 0.0)
+        targets = np.flatnonzero(concave)
+        grid, self.concave_split_report = split_concave_cells(grid, targets)
+        report = self.concave_split_report
+        added = int(report['n_pieces'].sum()) - len(report)
+        logger.info(f"  -> Split {len(report)} concave cells into convex pieces (+{added} cells)")
+        return grid
 
     def to_file(self, filepath, **kwargs):
         """

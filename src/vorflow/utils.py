@@ -9,6 +9,8 @@ import pandas as pd
 import shapely
 from shapely.geometry import LineString, MultiLineString, Polygon, MultiPolygon
 
+from ._convex import CONCAVE_TOLERANCE, centroid_fan_fraction
+
 
 logger = logging.getLogger(__name__)
 
@@ -460,6 +462,15 @@ def calculate_mesh_quality(
     Returns:
         gpd.GeoDataFrame: The input GeoDataFrame with added columns for each
             quality metric (e.g., 'area', 'compactness', 'drift_ratio').
+            ``is_concave`` is True where ``convexity`` (cell area over
+            convex-hull area) is below ``1 - 1e-6``. ``star_from_centroid``
+            is True where every face of the cell is visible from its
+            centroid; MODFLOW 6 particle tracking (PRT) can loop forever in
+            a cell where it is False. A convex polygon has ``is_concave``
+            False and ``star_from_centroid`` True; cells that are not a
+            single polygon without holes get ``star_from_centroid`` False.
+            Clipping at reflex corners of the domain or a hole is what makes
+            cells concave; see ``VoronoiTessellator(split_concave=...)``.
     """
     df = gdf.copy()
     
@@ -474,7 +485,14 @@ def calculate_mesh_quality(
     # 3. Convexity (Solidity): The ratio of the cell's area to the area of its
     # convex hull. A perfectly convex polygon has a convexity of 1.0.
     df['convexity'] = df['area'] / df.geometry.convex_hull.area
-    
+    df['is_concave'] = df['convexity'] < 1.0 - CONCAVE_TOLERANCE
+
+    # 4. Star shape from the centroid: every face is visible from the cell
+    # centroid. MODFLOW 6 PRT tracks particles through a DISV cell on a fan
+    # of triangles that share the centroid, one per face; when a face is
+    # hidden one triangle has a negative area and PRT can loop forever.
+    df['star_from_centroid'] = centroid_fan_fraction(df.geometry.to_numpy()) > 0.0
+
     connectivity_report = None
     if connectivity is not None:
         connectivity_report = connectivity
@@ -487,7 +505,7 @@ def calculate_mesh_quality(
     elif calc_skewness and 'x' in df.columns and 'y' in df.columns:
         connectivity_report = build_connectivity(df, center="generator")
 
-    # 4. Generator-based drift metrics (require generator point coordinates).
+    # 5. Generator-based drift metrics (require generator point coordinates).
     if 'x' in df.columns and 'y' in df.columns:
         centroids = df.geometry.centroid
         dx = df['x'] - centroids.x
@@ -536,7 +554,14 @@ def summarize_quality(gdf: gpd.GeoDataFrame):
     # will lie on or very close to the cell's own geometric boundary.
     is_boundary = np.zeros(len(gdf), dtype=bool)
     if 'x' in gdf.columns and 'y' in gdf.columns:
-        gens = gpd.GeoSeries(gpd.points_from_xy(gdf.x, gdf.y), index=gdf.index,crs=gdf.crs)
+        gen_x, gen_y = gdf.x, gdf.y
+        if 'concave_split' in gdf.columns:
+            # Split concave pieces carry their centroid as x/y and their mesh
+            # node in source_x/source_y.
+            split = gdf['concave_split'].astype(bool)
+            gen_x = gen_x.where(~split, gdf['source_x'])
+            gen_y = gen_y.where(~split, gdf['source_y'])
+        gens = gpd.GeoSeries(gpd.points_from_xy(gen_x, gen_y), index=gdf.index,crs=gdf.crs)
         dists = gdf.geometry.boundary.distance(gens)
         
         # Use a small tolerance relative to the cell size.
@@ -586,6 +611,15 @@ def summarize_quality(gdf: gpd.GeoDataFrame):
                 logger.info(f"[WARNING] {high_drift} INTERNAL cells have high drift (> 0.25).")
             else:
                 logger.info("[OK] Internal drift is excellent.")
+
+    if 'is_concave' in gdf.columns and 'star_from_centroid' in gdf.columns:
+        n_concave = int(gdf['is_concave'].sum())
+        n_hidden = int((~gdf['star_from_centroid']).sum())
+        if n_hidden > 0:
+            logger.info(f"[WARNING] {n_hidden} cells have a face hidden from their centroid "
+                        f"(MODFLOW 6 PRT can stall in them); {n_concave} cells are concave.")
+        elif n_concave > 0:
+            logger.info(f"[OK] {n_concave} cells are concave, but every face is visible from its centroid.")
 
     # Boundary cells have different geometric norms.
     if not boundary_df.empty:

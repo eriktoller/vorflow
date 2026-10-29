@@ -1320,11 +1320,9 @@ class VoronoiTessellator:
 
         Every line marked `is_barrier=True` is checked, whatever its meshing
         method. Barrier mirror generators (_barrier_mirror_points) already
-        stop most cells at the line; what is left here is mainly nodes that
-        lie on the line itself (quad_buffer_thickness=2 puts a node row on
-        it), cells the mirror passes did not finish, and the bulges of a
-        curved barrier across its straddle pairs' faces (chords of the
-        curve). A cell is split only when the line leaves at least two
+        stop most cells at the line; what is left here is mainly cells the
+        mirror passes did not finish, such as those at a bend of a
+        quad-buffer barrier. A cell is split only when the line leaves at least two
         pieces larger than BARRIER_SLIVER_FRACTION of its area; cells the
         line merely runs along are left untouched. Cut points within
         roundoff of a cell vertex are merged into it, so the split adds no

@@ -289,6 +289,15 @@ and the project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   are now dropped and their nodes clipped (`boundary_centering` is `"clip"` in
   their row). Every vertex of a polygonised circular hole is reflex, so its
   nodes are all clipped.
+- Cells are no longer dropped from the grid, or split in two, where zone
+  polygons overhang the domain polygon. The union of the cookie-cut zones,
+  which cells are clipped to, kept roundoff slits along their shared edges.
+  GEOS could then intersect a cell the domain fully covered into a line,
+  leaving a gap of up to 0.2% of the domain area. The same slits made the
+  MODFLOW-USG export fail with "Centres must lie on opposite sides of the
+  shared face". The clip domain is now closed over gaps narrower than 1e-9
+  x its extent, a cell the domain covers is kept whole, and any other cell
+  lost with its generator inside the domain is named in a warning.
 
 ## [0.3.0] - 2026-10-15
 

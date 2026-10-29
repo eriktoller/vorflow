@@ -5,13 +5,14 @@ import numpy as np
 import pandas as pd
 import pytest
 import shapely
-from shapely.geometry import LineString, Point, Polygon
+from shapely.geometry import LineString, Point, Polygon, box
 from shapely.ops import unary_union
 
 from vorflow.blueprint import ConceptualMesh
+from vorflow.engine import MeshGenerator
 import vorflow.tessellator as tessellator_module
 from vorflow.tessellator import VoronoiTessellator
-from vorflow.utils import boundary_connectivity_report, build_connectivity
+from vorflow.utils import boundary_connectivity_report, build_connectivity, grid_to_mfusg_disu
 
 
 class DummyMeshGenerator:
@@ -39,6 +40,85 @@ def _plain_barrier_tessellator():
     cm.generate()
     mesh_gen = DummyMeshGenerator(nodes=np.empty((0, 2)), tags=[], zones_gdf=cm.clean_polygons)
     return VoronoiTessellator(mesh_gen, cm), cm.clean_lines.iloc[0].geometry
+
+
+def test_close_domain_slits_removes_seams_and_keeps_vertices():
+    # Cookie-cut zones leave the union with a zero-width hole and parts that meet only along a seam.
+    slit_hole = Polygon([(0, 0), (4, 0), (4, 2), (0, 2)], [[(1, 1), (3, 1 + 1e-13), (3, 1)]])
+    seam_part = Polygon([(4 + 1e-14, 0), (6, 0), (6, 2), (4 + 1e-14, 2)])
+    domain = shapely.MultiPolygon([slit_hole, seam_part])
+
+    closed = tessellator_module._close_domain_slits(domain)
+
+    assert closed.geom_type == "Polygon" and not closed.interiors
+    assert closed.area == pytest.approx(12.0)
+    assert closed.symmetric_difference(box(0, 0, 6, 2)).area < 1e-9
+    assert closed.hausdorff_distance(box(0, 0, 6, 2)) < 1e-9
+
+
+def _clip_frame(cells, generators):
+    return gpd.GeoDataFrame(
+        {"node_id": np.arange(len(cells)), "x": [g[0] for g in generators], "y": [g[1] for g in generators]},
+        geometry=cells,
+    )
+
+
+def test_clip_to_domain_keeps_a_covered_cell_that_intersection_loses(monkeypatch):
+    # GEOS 3.14 intersected a cell that a domain with a 4e-12 sliver hole fully covers into a LineString.
+    domain = box(0, 0, 4, 2)
+    cells = [box(0, 0, 1, 1), box(3, 1, 5, 3)]
+    intersection = shapely.intersection
+
+    def lossy_intersection(a, b, **kwargs):
+        pieces = np.array(intersection(a, b, **kwargs), dtype=object)
+        pieces[0] = LineString([(0, 0), (1, 1)])
+        return pieces
+
+    monkeypatch.setattr(tessellator_module.shapely, "intersection", lossy_intersection)
+    clipped = tessellator_module._clip_to_domain(_clip_frame(cells, [(0.5, 0.5), (3.5, 1.5)]), domain)
+
+    assert clipped.geometry.iloc[0].equals(cells[0])
+    assert clipped.geometry.iloc[1].area == pytest.approx(1.0)
+
+
+def test_clip_to_domain_warns_when_a_cell_with_its_generator_inside_is_lost(monkeypatch):
+    domain = box(0, 0, 4, 2)
+    cells = [box(3, 1, 5, 3)]
+    monkeypatch.setattr(tessellator_module.shapely, "intersection", lambda a, b, **kwargs: np.array([Point(4, 2)]))
+
+    with pytest.warns(UserWarning, match="lost 1 cell"):
+        tessellator_module._clip_to_domain(_clip_frame(cells, [(3.5, 1.5)]), domain)
+
+
+@pytest.mark.slow
+def test_zones_overhanging_the_domain_lose_no_cells():
+    # Fuzz case 66: the cookie-cut zones overhang the domain polygon, and their union carried roundoff
+    # slits that dropped a fully covered cell (0.04% of the area) and split others along a seam, which
+    # broke the MFUSG export ("Centres must lie on opposite sides of the shared face").
+    cm = ConceptualMesh()
+    cm.add_polygon(shapely.from_wkt(
+        "POLYGON ((707.8171713013712 1256.8154133818819, 509.38719578475093 2167.3960044846585, "
+        "361.30183440750034 3092.407445374673, 683.8132508300083 3624.485715630085, "
+        "2278.9538122697886 4501.929830679173, 3922.2791548812697 2624.123455160941, "
+        "707.8171713013712 1256.8154133818819))"), zone_id=1, resolution=310.04995695889556)
+    cm.add_polygon(shapely.from_wkt(
+        "POLYGON ((2445.454842801927 1855.7144392388266, 2146.5987642541936 2853.414296097322, "
+        "151.19905053720345 2255.7021390018554, 450.05512908493677 1258.0022821433597, "
+        "2445.454842801927 1855.7144392388266))"), zone_id=2, resolution=61.44363850514341, z_order=1)
+    cm.add_polygon(shapely.from_wkt(
+        "POLYGON ((451.42571161748265 3851.8313499106816, -145.43927314813618 2829.068561365194, "
+        "1900.0863039428386 1635.3385918339563, 2496.9512887084575 2658.101380379444, "
+        "451.42571161748265 3851.8313499106816))"), zone_id=3, resolution=131.5819756549956, z_order=2)
+    polys, lines, points = cm.generate()
+    mg = MeshGenerator(background_lc=310.04995695889556, verbosity=0)
+    mg.generate(polys, lines, points)
+
+    grid = VoronoiTessellator(mg, cm).generate()
+
+    domain = shapely.union_all(polys.geometry.to_numpy())
+    assert len(grid) == len(mg.nodes)
+    assert abs(grid.geometry.area.sum() - domain.area) < 1e-9 * domain.area
+    grid_to_mfusg_disu(grid, 10.0, 0.0)
 
 
 def test_enforce_barriers_preserves_uint64_ids_and_split_fragments():

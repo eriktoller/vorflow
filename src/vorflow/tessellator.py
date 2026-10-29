@@ -75,6 +75,14 @@ ZONE_SHARE_MARGIN = 0.1
 # no disconnected faces).
 GHOST_LEAK_FRACTION = 1e-6
 
+# Gaps in the clip domain narrower than this fraction of its extent are closed.
+# Zones that overhang the domain polygon are cookie-cut against each other, and
+# the union of the pieces keeps roundoff slits along their shared edges: holes
+# of ~1e-12 m2 and parts that touch only across a zero-width seam. GEOS can
+# intersect a cell the domain fully covers with such a domain into a
+# LineString, which drops the cell, and a seam through a cell splits it in two.
+DOMAIN_SLIT_FRACTION = 1e-9
+
 
 def _merged_vertex_index(vertices: np.ndarray, tolerance: float) -> np.ndarray:
     """Map each vertex index to the lowest index in its cluster of vertices chained within tolerance."""
@@ -370,16 +378,53 @@ def _fragment_merge(piece, geometries, tree, barriers):
     return best
 
 
+def _close_domain_slits(domain_geom, fraction: float = DOMAIN_SLIT_FRACTION):
+    """Return ``domain_geom`` with holes and seams narrower than ``fraction`` x its extent closed.
+
+    A mitred buffer out and back in by that width restores every other edge
+    and corner to roundoff (mitre_limit keeps corners down to ~0.1 degrees sharp).
+    """
+    minx, miny, maxx, maxy = domain_geom.bounds
+    width = fraction * max(maxx - minx, maxy - miny)
+    if width <= 0:
+        return domain_geom
+    closed = domain_geom.buffer(width, join_style='mitre', mitre_limit=1e3)
+    closed = closed.buffer(-width, join_style='mitre', mitre_limit=1e3)
+    if closed.is_empty or not closed.is_valid:
+        return domain_geom
+    return closed
+
+
 def _clip_to_domain(gdf, domain_geom):
     """Return the rows of ``gdf`` that intersect ``domain_geom``, clipped to it, in their original order.
 
     Replaces ``gpd.clip``, which with pandas 1.5 / GeoPandas 0.13 writes the
     clipped geometries back onto the wrong rows (its spatial-index query
     reorders them), so cells lose their generator's x/y and node_id.
+
+    A cell whose generator lies in the domain always keeps some area. If
+    the intersection loses it all (GEOS roundoff on a domain with slivers),
+    the cell is kept whole when the domain covers it, and a warning names
+    the cells otherwise, so no cell is dropped silently.
     """
     hits = np.sort(gdf.sindex.query(domain_geom, predicate='intersects'))
     clipped = gdf.iloc[hits].copy()
-    clipped[clipped.geometry.name] = clipped.geometry.intersection(domain_geom)
+    cells = clipped.geometry.to_numpy()
+    pieces = shapely.intersection(cells, domain_geom)
+    polygonal = np.isin(shapely.get_type_id(pieces), (3, 6, 7))
+    lost = ~polygonal | (shapely.area(pieces) <= 0.0)
+    if lost.any():
+        generators = shapely.points(clipped['x'].to_numpy(), clipped['y'].to_numpy())
+        lost &= shapely.intersects(domain_geom, generators)
+        covered = lost & shapely.covers(domain_geom, cells)
+        pieces[covered] = cells[covered]
+        dropped = lost & ~covered
+        if dropped.any():
+            warn_user(
+                f"Clipping to the domain lost {int(dropped.sum())} cell(s) whose generator lies in the domain "
+                f"(node_id {clipped['node_id'].to_numpy()[dropped][:10].tolist()}); the grid has gaps there."
+            )
+    clipped[clipped.geometry.name] = pieces
     return clipped
 
 
@@ -884,7 +929,7 @@ class VoronoiTessellator:
             domain_geom = unary_union(polygons.geometry)
             if not domain_geom.is_valid:
                 domain_geom = make_valid(domain_geom)
-            return domain_geom
+            return _close_domain_slits(domain_geom)
         if hasattr(self.cm, 'domain_boundary') and self.cm.domain_boundary:
             domain_geom = self.cm.domain_boundary
             if not domain_geom.is_valid:

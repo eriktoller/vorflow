@@ -59,7 +59,7 @@ def test_cells_on_line_returns_cell_areas_and_intersection_lengths(paired_polygo
 
     # length of line
     assert cells["cell_area"].tolist() == pytest.approx([1.0, 1.0])
-    assert cells["length"].tolist() == pytest.approx([1.0, 1.0])
+    assert cells["line_length"].tolist() == pytest.approx([1.0, 1.0])
 
 
 def test_cells_on_point_returns_containing_cell_and_zero_length(paired_polygons):
@@ -67,7 +67,7 @@ def test_cells_on_point_returns_containing_cell_and_zero_length(paired_polygons)
 
     assert len(cells) == 1
     assert cells["cell_area"].tolist() == pytest.approx([1.0])
-    assert cells["length"].tolist() == pytest.approx([0.0])
+    assert cells["line_length"].tolist() == pytest.approx([0.0])
 
 
 def test_cells_on_point_on_shared_edge_returns_single_cell(paired_polygons):
@@ -219,6 +219,46 @@ def test_cells_on_point_on_cell_boundary_returns_nearest_generator_cell(
 def test_cells_on_point_outside_grid_raises_value_error(grid_3x2):
     with pytest.raises(ValueError):
         cells_on(grid_3x2, Point(10.0, 10.0))
+
+
+def test_cells_on_line_leaves_out_cells_it_only_touches(grid_3x2):
+    # Runs through cells 0 and 1 and ends on the corner shared with 3, 4 and 5.
+    cells = cells_on(grid_3x2, LineString([(0.5, 0.5), (2.0, 1.0)]))
+
+    assert cells["cell_id"].tolist() == [0, 1]
+    assert (cells["line_length"] > 0).all()
+
+
+def test_cells_on_features_does_not_modify_the_input(grid_3x2):
+    features = gpd.GeoDataFrame(geometry=[LineString([(0.5, 0.5), (2.5, 0.5)])])
+
+    cells_on(grid_3x2, features)
+
+    assert list(features.columns) == ["geometry"]
+
+
+def test_cells_on_features_skips_polygons_and_features_outside_the_grid_with_a_warning(grid_3x2):
+    features = gpd.GeoDataFrame(
+        {"feature_id": ["well", "far", "zone"]},
+        geometry=[Point(0.5, 0.5), Point(10.0, 10.0), Polygon([(0, 0), (1, 0), (1, 1)])],
+    )
+
+    with pytest.warns(UserWarning) as record:
+        cells = cells_on(grid_3x2, features)
+
+    assert cells["feature_id"].tolist() == ["well"]
+    messages = " ".join(str(w.message) for w in record)
+    assert "'far' is outside the grid" in messages
+    assert "'zone' is not supported" in messages
+
+
+def test_cells_on_features_without_matches_returns_an_empty_frame_with_columns(grid_3x2):
+    features = gpd.GeoDataFrame({"feature_id": []}, geometry=[])
+
+    cells = cells_on(grid_3x2, features)
+
+    assert cells.empty
+    assert {"cell_id", "line_length", "cell_area", "feature_type", "feature_id"} <= set(cells.columns)
 
 
 def test_faces_on_default_excludes_faces_touching_line_at_an_endpoint(grid_3x2):

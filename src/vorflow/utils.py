@@ -9,6 +9,7 @@ import pandas as pd
 import shapely
 from shapely.geometry import LineString, MultiLineString, Polygon, MultiPolygon, Point
 from ._features import DEFAULT_CONNECTIVITY_TOLERANCE
+from ._log import warn_user
 
 from ._convex import CONCAVE_TOLERANCE, centroid_fan_fraction
 
@@ -872,49 +873,50 @@ def cells_on(
     gdf: gpd.GeoDataFrame,
     geometry: shapely.Point | shapely.LineString | shapely.MultiLineString | gpd.GeoDataFrame,
 ) -> gpd.GeoDataFrame:
-    """Returns a GeoPandas DataFrame for the cells that lies on the geometry object.
+    """Return the grid cells that a point or line lies on.
+
+    For a line that runs along cell faces, such as a barrier, which side's
+    cells are returned depends on roundoff; use :func:`faces_on` instead.
 
     Args:
         gdf (GeoDataFrame): Grid of single-part polygons without holes, with
             ``x`` and ``y`` columns (e.g. ``VoronoiTessellator.grid``).
-        geometry (Point | LineString | MultiLineString | GeoDataFrame): The geometrical object for which to find the intersecting cells or a GeoDataFrame which contains geometries.
+        geometry (Point | LineString | MultiLineString | GeoDataFrame): The
+            geometry to find the cells of, or a GeoDataFrame of such
+            geometries (e.g. ``ConceptualMesh.features()``). Optional
+            ``feature_type`` and ``feature_id`` columns default to the geometry
+            type and the index.
 
     Returns:
-        cells (GeoDataFrame): Returns a GeoDataFrame of all intersecting cells containing columns for ``cell_id``,
-            ``cell_area``, and the intersection ``length``. 
-            If ``geometry`` is a Point, returns a single row GeoDataFrame for the nearest cell.
-            if ``geometry`` is a GeoDataFrame, returns a concatinated GeoDataFrame with all provided geometries.
+        cells (GeoDataFrame): The cells with ``cell_id`` (the cell's row
+            position in ``gdf``, which is the DISV cell number, not its
+            ``node_id``), ``cell_area`` and ``line_length``, the length of the
+            line inside the cell. Cells the line only touches are left out.
+            For a Point, the single cell whose generator is nearest, with
+            ``line_length`` 0. For a GeoDataFrame, the cells of every feature,
+            with its ``feature_type`` and ``feature_id``; polygon rows and
+            features outside the grid are skipped with a warning.
 
     Raises:
-        ValueError: If ``geometry`` is not an instance of Point, LineString, or MultiLineString.
-        ValueError: If ``geometry`` is outside of the grid.
+        ValueError: If ``geometry`` is not a Point, LineString,
+            MultiLineString or GeoDataFrame.
+        ValueError: If ``geometry`` is outside the grid.
     """
     if isinstance(geometry, gpd.GeoDataFrame):
-        if not {'feature_type'}.issubset(geometry.columns):
-            geometry['feature_type'] = [g.geom_type for g in geometry.geometry]
-        if not {'feature_id'}.issubset(geometry.columns):
-            geometry['feature_id'] = [g for g in geometry.index]
-        res = []
-        for _, row in geometry.iterrows():
-            if not isinstance(row.geometry, (Point, LineString, MultiLineString)):
-                logger.info(f"[WARNING] {row.geometry.geom_type} is not suported and is skipped.")
-                continue
-            cells_gdf = cells_on(gdf, row.geometry)
-            cells_gdf["feature_type"] = row["feature_type"]
-            cells_gdf["feature_id"] = row["feature_id"]
-            res.append(cells_gdf)
-        if len(res) == 0:
-            return gpd.GeoDataFrame()
-        cells = gpd.GeoDataFrame(pd.concat(res, ignore_index=True))
-        return cells
-    
+        return _cells_on_features(gdf, geometry)
+
     if not isinstance(geometry, (Point, LineString, MultiLineString)):
         raise ValueError("geometry must be a Point, LineString, or MultiLineString.")
 
-    mask = gdf.geometry.intersects(geometry).to_numpy()
+    mask = gdf.geometry.intersects(geometry).to_numpy().copy()
+    if not isinstance(geometry, Point):
+        # Drop cells the line only touches at a vertex or along part of their boundary.
+        inside = shapely.intersection(gdf.geometry.to_numpy()[mask], geometry)
+        rows = np.flatnonzero(mask)
+        mask[rows[shapely.length(inside) <= 1e-9 * geometry.length]] = False
     cells = gdf.loc[mask].copy()
     if cells.empty:
-            raise ValueError("the geometry is outside the grid")
+        raise ValueError("the geometry is outside the grid")
     if isinstance(geometry, Point):
         # if more than one point find the nearest cell generator to point
         if len(cells) > 1:
@@ -926,17 +928,43 @@ def cells_on(
         else:
             cells = cells.iloc[[0]].copy()
             cells["cell_id"] = np.flatnonzero(mask)[0]
-        cells["length"] = 0.0
+        cells["line_length"] = 0.0
         cells["cell_area"] = cells.geometry.area
     else:
         cells["cell_id"] = np.flatnonzero(mask)
         cells["cell_area"] = cells.geometry.area
-        cells["length"] = cells.geometry.intersection(geometry).length
+        cells["line_length"] = cells.geometry.intersection(geometry).length
 
     # Reset the index
     cells.reset_index(drop=True, inplace=True)
 
     return cells
+
+
+def _cells_on_features(gdf, features):
+    """``cells_on`` for every row of ``features``, skipping polygons and features outside the grid."""
+    features = features.copy()
+    if "feature_type" not in features.columns:
+        features["feature_type"] = features.geometry.geom_type
+    if "feature_id" not in features.columns:
+        features["feature_id"] = features.index
+    res = []
+    for _, row in features.iterrows():
+        if not isinstance(row.geometry, (Point, LineString, MultiLineString)):
+            warn_user(f"cells_on: {row.geometry.geom_type} feature {row['feature_id']!r} is not supported and is skipped.")
+            continue
+        try:
+            cells = cells_on(gdf, row.geometry)
+        except ValueError:
+            warn_user(f"cells_on: feature {row['feature_id']!r} is outside the grid and is skipped.")
+            continue
+        cells["feature_type"] = row["feature_type"]
+        cells["feature_id"] = row["feature_id"]
+        res.append(cells)
+    if not res:
+        columns = [*gdf.columns, "cell_id", "line_length", "cell_area", "feature_type", "feature_id"]
+        return gpd.GeoDataFrame(columns=columns, geometry=gdf.geometry.name, crs=gdf.crs)
+    return gpd.GeoDataFrame(pd.concat(res, ignore_index=True), crs=gdf.crs)
 
 
 def faces_on(gdf, geometry, tolerance=None, predicate="within"):

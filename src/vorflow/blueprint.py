@@ -1813,7 +1813,7 @@ class ConceptualMesh:
 
     def features(self):
         """
-        Returns a concatinated GeoDataFrame of all cleaned lines, points and polygons from the ConceptualModel.
+        Return all cleaned lines, points and polygons as one GeoDataFrame.
 
         Returns:
             features (GeoDataFrame): Returns a GeoDataFrame of all cleaned features of the ConceptualModel with 

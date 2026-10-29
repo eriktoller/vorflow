@@ -48,7 +48,8 @@ from dataclasses import dataclass, field
 
 import numpy as np
 import pandas as pd
-from shapely.geometry import LineString, MultiLineString, MultiPolygon, Polygon
+import shapely
+from shapely.geometry import LineString, MultiLineString, MultiPolygon, Point, Polygon
 from shapely.ops import linemerge, unary_union
 from shapely.validation import make_valid
 
@@ -71,6 +72,12 @@ QUAD_BUFFER_CROSSING_GAP = 0.5
 
 # Mitre limit of the strip's offset lines, in multiples of the offset.
 MITRE_LIMIT = 5.0
+
+# A strip end on the domain boundary is extended past it by this many strip
+# half-widths before offsetting, so both side lines reach the boundary and the
+# end cap lies on it. 5 (the offset mitre limit) covers boundaries crossed at
+# more than ~11 degrees to the line.
+STRIP_END_EXTENSION = 5.0
 
 # Rank used as the fourth priority-key element: lines win ties over polygons.
 _KIND_RANK = {'line': 0, 'poly': 1}
@@ -185,6 +192,8 @@ def plan_line_strip(line, lc, thickness, domain, feature_name) -> list[StripPart
             continue
         work = part.simplify(lc * 1.5)
         work = work.segmentize(lc)
+        if domain is not None and not domain.is_empty:
+            work = extend_boundary_ends(work, domain.boundary, STRIP_END_EXTENSION * offset, 1e-6 * lc)
         pos, neg = paired_offsets(work, offset)
         if pos is None or neg is None:
             warnings.warn(
@@ -192,8 +201,7 @@ def plan_line_strip(line, lc, thickness, domain, feature_name) -> list[StripPart
             )
             continue
         if domain is not None and not domain.is_empty:
-            pos = coerce_offset_line(pos.intersection(domain))
-            neg = coerce_offset_line(neg.intersection(domain))
+            pos, neg = clip_paired_sides(pos, neg, domain)
             if pos is None or neg is None:
                 warnings.warn(
                     f"Skipping structured buffer for line feature {feature_name} after domain clipping."
@@ -247,6 +255,58 @@ def paired_offsets(line: LineString, offset: float) -> tuple:
         coerce_offset_line(line.offset_curve(offset, quad_segs=1, join_style=2, mitre_limit=MITRE_LIMIT)),
         coerce_offset_line(line.offset_curve(-offset, quad_segs=1, join_style=2, mitre_limit=MITRE_LIMIT)),
     )
+
+
+def clip_paired_sides(left: LineString, right: LineString, domain) -> tuple:
+    """Both side lines clipped to ``domain``, keeping only the vertex stations both still have.
+
+    An oblique boundary cuts the two sides at different stations. A vertex
+    left on one side only would break the pairing of ``paired_offsets``, so
+    it is dropped and that side runs straight from the last shared station
+    to the boundary. Sides that do not pair up are just clipped.
+    """
+    clipped = [coerce_offset_line(side.intersection(domain)) for side in (left, right)]
+    if any(clip is None for clip in clipped) or len(left.coords) != len(right.coords):
+        return tuple(clipped)
+    sides_xy = [np.asarray(side.coords) for side in (left, right)]
+    inside = shapely.covers(domain, shapely.points(sides_xy[0])) & shapely.covers(domain, shapely.points(sides_xy[1]))
+    keep = np.flatnonzero(inside)
+    if len(keep) == 0 or np.any(np.diff(keep) != 1):
+        return tuple(clipped)
+    paired = []
+    for xy, clip in zip(sides_xy, clipped):
+        ends = np.asarray(clip.coords)[[0, -1]]
+        if np.hypot(*(ends[0] - xy[keep[0]])) > np.hypot(*(ends[1] - xy[keep[0]])):
+            ends = ends[::-1]
+        coords = sanitize_coords(np.vstack([ends[:1], xy[keep], ends[1:]]).tolist(), min_points=2)
+        paired.append(LineString(coords) if len(coords) >= 2 else None)
+    return tuple(paired)
+
+
+def extend_boundary_ends(line: LineString, boundary, length: float, tol: float) -> LineString:
+    """``line`` with each end within ``tol`` of ``boundary`` extended straight on by ``length``.
+
+    Without it, the side line on the obtuse side of an oblique boundary stops
+    short of it, and the strip leaves an unstructured wedge whose nodes can
+    fall on the line itself.
+    """
+    coords = [tuple(c) for c in line.coords]
+    if len(coords) < 2:
+        return line
+    for end, prev in ((0, 1), (-1, -2)):
+        if Point(coords[end]).distance(boundary) > tol:
+            continue
+        dx = coords[end][0] - coords[prev][0]
+        dy = coords[end][1] - coords[prev][1]
+        norm = math.hypot(dx, dy)
+        if norm <= 0:
+            continue
+        tip = (coords[end][0] + dx / norm * length, coords[end][1] + dy / norm * length)
+        if end == 0:
+            coords.insert(0, tip)
+        else:
+            coords.append(tip)
+    return LineString(coords)
 
 
 def plan_polygon_band(geom, lc, thickness, feature_name):

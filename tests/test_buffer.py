@@ -254,14 +254,12 @@ def test_structured_quad_buffer_barrier_is_only_cut_where_cells_straddle_it():
     tessellator = VoronoiTessellator(mesher, cm, clip_to_boundary=True)
     grid = tessellator.generate()
 
-    # Buffer cells already have faces on the line and are not re-cut. Only
-    # the end caps, where the strip meets the domain boundary and nodes land
-    # on the line, straddle it and are split.
-    fragments = grid[~grid["node_id"].isin(mesher.node_tags)]
-    assert set(mesher.node_tags).issubset(set(grid["node_id"]))
+    # Buffer cells already have faces on the line and are not re-cut. The
+    # end caps on the domain boundary keep their structure too (the overlay
+    # with the domain used to split them, and the unstructured caps put
+    # nodes on the line), so no cell is cut.
+    assert set(grid["node_id"]) == set(mesher.node_tags)
     assert grid["node_id"].is_unique
-    assert len(fragments) <= 4
-    assert (fragments.geometry.distance(line.boundary) < 1.0).all()
     assert _straddling_cell_count(grid, line) == 0
 
 
@@ -273,11 +271,9 @@ def test_structured_quad_buffer_thickness2_barrier_keeps_nodes_off_the_line():
     grid = VoronoiTessellator(mesher, cm, clip_to_boundary=True).generate()
 
     # Two cell rows on each side: the node rows sit at +/- 0.5 and 1.5 lc,
-    # so the cells meet on the line. (The end caps on the domain boundary
-    # are subdivided by its densified vertices and meshed unstructured.)
-    nodes = shapely.points(mesher.nodes)
-    inner = shapely.distance(nodes, line.boundary) > 1.5
-    assert shapely.distance(nodes[inner], line).min() == pytest.approx(0.5)
+    # so the cells meet on the line and none is cut.
+    assert shapely.distance(shapely.points(mesher.nodes), line).min() == pytest.approx(0.5)
+    assert set(grid["node_id"]) == set(mesher.node_tags)
     assert _straddling_cell_count(grid, line) == 0
     assert grid.geometry.area.sum() == pytest.approx(40.0)
 

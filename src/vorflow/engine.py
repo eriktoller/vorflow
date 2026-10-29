@@ -102,6 +102,8 @@ _HEAL_MATCH_TOL = 1e-4
 _HEAL_MATCH_REL_TOL = 0.5
 # Vertices closer than this are one point when building OCC curve loops.
 _VERTEX_MERGE_TOL = 1e-5
+# Area fraction of a buffer footprint outside the domain that is roundoff.
+_COVERED_AREA_TOL = 1e-9
 
 
 def _entity_signature(dim, tag):
@@ -1944,8 +1946,14 @@ class MeshGenerator:
 
     def _add_buffer_surfaces(self, buffer_geom, feature_key, domain, inventory,
                              corners=None, side_lines=None):
-        """Create OCC surfaces for a buffer footprint clipped to the domain; returns [(key, strip_info)]."""
-        if domain is not None and not domain.is_empty:
+        """Create OCC surfaces for a buffer footprint clipped to the domain; returns [(key, strip_info)].
+
+        A footprint already inside the domain is not intersected: where its
+        end cap lies on the domain boundary, the overlay adds a spurious
+        vertex to the cap, and a split cap cannot carry the transfinite rows.
+        """
+        if domain is not None and not domain.is_empty and \
+                buffer_geom.difference(domain).area > _COVERED_AREA_TOL * buffer_geom.area:
             buffer_geom = buffer_geom.intersection(domain)
         buffer_geom = unpinch_polygons(make_valid(buffer_geom), _VERTEX_MERGE_TOL)
         parts = [

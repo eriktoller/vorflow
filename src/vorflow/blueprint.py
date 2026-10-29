@@ -688,7 +688,8 @@ class ConceptualMesh:
                 (``is_barrier=True``) no node row ever lands on the line:
                 ``quad_buffer_thickness`` is the number of cell rows on each
                 side of it, so ``2`` gives a strip three cells wide whose
-                middle faces follow the line. When two quad buffers cross,
+                middle faces follow the line. Where the line leaves the
+                domain, the strip runs to the boundary on both sides. When two quad buffers cross,
                 the higher-priority one stays continuous and only the other is
                 trimmed at the crossing with a warning (priority: ``z_order``,
                 then finer resolution, wider strip, lines over polygons,

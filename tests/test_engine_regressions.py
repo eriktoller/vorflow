@@ -683,3 +683,19 @@ def test_quad_buffer_thickness_2_barrier_keeps_generators_off_the_line(coords):
     assert _multi_edge_pairs(grid, build_connectivity(grid, center="generator")) == []
     grid_to_mfusg_disu(grid, top=10.0, botm=0.0)
 
+
+@pytest.mark.slow
+@pytest.mark.parametrize("thickness", [1, 2])
+@pytest.mark.parametrize("end", [(-20, 80), (-30, 200)], ids=["exit-left", "exit-up-left"])
+def test_quad_buffer_barrier_leaving_the_domain_obliquely_crosses_no_cell(end, thickness):
+    # The strip used to stop short of a slanted boundary on one side, and the
+    # unstructured wedge left there put nodes next to the barrier, whose cells
+    # it crossed. Both side lines now run to the boundary.
+    line = LineString([(150, 150), end])
+    with warnings.catch_warnings():
+        warnings.simplefilter("error", UserWarning)
+        grid, mg, vt = _residual_grid([dict(coords=list(line.coords), is_barrier=True, quad_buffer=True,
+                                            quad_buffer_thickness=thickness)])
+    inside = [cell.buffer(-1e-6).intersection(line).length for cell in grid.geometry]
+    assert max(inside) < 1e-6
+    assert vt.n_exact_barrier_cuts == 0

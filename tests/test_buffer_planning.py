@@ -163,6 +163,30 @@ def test_plan_line_strip_clips_offsets_to_the_domain():
     assert minx == pytest.approx(0.0) and maxx == pytest.approx(10.0)
 
 
+def test_paired_offsets_put_each_rung_through_a_line_vertex():
+    line = LineString([(0, 0), (4, 0), (8, 3)])
+    left, right = buffer.paired_offsets(line, 1.0)
+    assert len(left.coords) == len(right.coords) == 3
+    np.testing.assert_allclose((np.asarray(left.coords) + np.asarray(right.coords)) / 2,
+                               np.asarray(line.coords), atol=1e-12)
+    assert left.distance(line) == pytest.approx(1.0) and right.distance(line) == pytest.approx(1.0)
+
+
+def test_plan_line_strip_reaches_an_oblique_boundary_with_paired_sides():
+    # The line ends where it meets the domain's slanted top edge.
+    domain = Polygon([(0, 0), (20, 0), (20, 20), (0, 10)])
+    parts = buffer.plan_line_strip(LineString([(10, 2), (10, 15)]), lc=1.0, thickness=3,
+                                   domain=domain, feature_name=0)
+    pos, neg = [np.asarray(side.coords) for side in parts[0].side_lines]
+    # Both sides run to the boundary, so no unstructured wedge is left at the end.
+    assert domain.boundary.distance(Point(pos[-1])) < 1e-9
+    assert domain.boundary.distance(Point(neg[-1])) < 1e-9
+    # Vertex i of one side faces vertex i of the other, up to the last one.
+    assert len(pos) == len(neg)
+    np.testing.assert_allclose(pos[:-1, 0] + neg[:-1, 0], 20.0)
+    np.testing.assert_allclose(pos[:-1, 1], neg[:-1, 1])
+
+
 def test_plan_polygon_band_is_an_annulus_around_the_outline():
     band = buffer.plan_polygon_band(box(0, 0, 10, 10), lc=1.0, thickness=2, feature_name=0)
     assert band.area == pytest.approx(12.0 ** 2 - 8.0 ** 2)

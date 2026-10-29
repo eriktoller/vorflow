@@ -325,6 +325,12 @@ and the project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   sheared the rows wherever the sides' lengths differed), and Gmsh's
   smoothing and optimization passes no longer move the node rows inside a
   quad buffer off their transfinite positions.
+- A quad buffer whose line leaves the domain at a slant now runs to the
+  boundary on both sides. One side used to stop short, and on a barrier the
+  unstructured wedge left there could put nodes beside the line and leave
+  cells it crossed. The overlay with the domain also no longer adds a
+  vertex to the strip's end cap on the boundary, which made Gmsh give up
+  the structured strip and mesh it unstructured.
 
 ## [0.3.0] - 2026-10-15
 

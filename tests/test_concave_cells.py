@@ -467,3 +467,50 @@ def test_split_concave_on_gmsh_mesh_around_l_shaped_hole():
     assert grid["node_id"].is_unique
     assert grid.geometry.area.sum() == pytest.approx(domain.area, rel=1e-12)
     assert grid_to_disv(grid)["ncpl"] == len(grid)
+
+
+# A square and a triangle joined at (1, 1); the second copy of that vertex lies
+# 4e-14 away, as clipping a cell around a notch tip computes it.
+PINCHED = Polygon([(0, 0), (1, 0), (1, 1), (2, 1.5), (1.5, 2), (1 + 4e-14, 1 + 4e-14), (0, 1)])
+
+
+def test_split_pinches_separates_lobes_joined_through_a_roundoff_neck():
+    """Catches a pinched cell surviving as one ring that passes twice through one point."""
+    assert PINCHED.is_valid
+    out = convex.split_pinches(np.array([PINCHED, L_SHAPE, None], dtype=object), 1e-12)
+
+    assert out[0].geom_type == "MultiPolygon"
+    assert sorted(p.area for p in out[0].geoms) == pytest.approx([0.375, 1.0])
+    assert out[1] is L_SHAPE
+    assert out[2] is None
+
+
+def test_explode_gives_a_pinched_lobe_its_own_cell():
+    """Catches a pinched cell reaching DISV with a vertex listed twice."""
+    grid = gpd.GeoDataFrame({"node_id": [5], "x": [0.5], "y": [0.5]}, geometry=[PINCHED])
+
+    exploded = vorflow.tessellator._explode_with_unique_ids(grid)
+
+    assert list(exploded["node_id"]) == [5, 6]
+    assert exploded.geometry.iloc[0].covers(shapely.Point(0.5, 0.5))
+    assert exploded[["x", "y"]].iloc[1].tolist() == pytest.approx([1.5, 1.5])
+
+
+@pytest.mark.slow
+def test_barrier_from_a_notch_tip_leaves_no_pinched_cell():
+    """Catches the cell clipped around a notch tip pinching and the barrier safety net cutting it."""
+    domain = Polygon([(0, 0), (0, 300), (228.26, 300), (241.46, 189.16), (240.15, 300), (300, 300), (300, 0)])
+    cm = ConceptualMesh()
+    cm.add_polygon(domain, zone_id=1, resolution=20.0)
+    cm.add_line(LineString([(241.46, 189.16), (109.94977304865061, 152.87715312809004)]), line_id="b", resolution=8.0, is_barrier=True)
+    mg = MeshGenerator(background_lc=20.0, verbosity=0)
+    mg.generate(*cm.generate())
+
+    tessellator = VoronoiTessellator(mg, cm, split_concave="hidden_face")
+    grid = tessellator.generate()
+
+    assert (centroid_fan_fraction(grid.geometry.to_numpy()) > 0).all()
+    cell2d = grid_to_disv(grid)["cell2d"]
+    assert all(len(set(row[4:])) == row[3] for row in cell2d)
+    assert grid["node_id"].is_unique
+    assert grid.geometry.area.sum() == pytest.approx(domain.area, rel=1e-12)

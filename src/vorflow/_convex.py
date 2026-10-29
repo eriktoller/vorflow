@@ -34,9 +34,11 @@ import logging
 import numpy as np
 import pandas as pd
 import shapely
-from shapely.geometry import LineString, Point, Polygon
+from scipy.spatial import cKDTree
+from shapely.geometry import LineString, MultiPolygon, Point, Polygon
 from shapely.geometry.polygon import orient
 from shapely.ops import split
+from shapely.validation import make_valid
 
 logger = logging.getLogger(__name__)
 
@@ -148,6 +150,50 @@ def _drop_spikes(poly: Polygon) -> tuple[Polygon, list[np.ndarray]]:
     if len(xy) < 3:
         raise SplitError("the cell collapses once its zero-width spikes are removed")
     return Polygon(xy), bases
+
+
+def split_pinches(geoms: np.ndarray, tolerance: float) -> np.ndarray:
+    """``geoms`` with each polygon whose exterior passes twice through one point split there into its lobes.
+
+    Clipping a cell around a sharp notch tip can compute the tip twice, a
+    roundoff apart, so the ring touches itself through a neck of near-zero
+    width that GEOS still counts as valid. Two exterior vertices of one
+    polygon closer than ``tolerance`` that are not neighbours on the ring
+    are such a pinch. The pinched polygon becomes a MultiPolygon of its
+    lobes, which the caller explodes into cells; a polygon whose fix would
+    change its area or leave a lobe with a hole is kept as it is.
+    """
+    geoms = np.asarray(geoms, dtype=object).copy()
+    polygons = np.flatnonzero(shapely.get_type_id(geoms) == shapely.GeometryType.POLYGON)
+    coords, owner = shapely.get_coordinates(shapely.get_exterior_ring(geoms[polygons]), return_index=True)
+    # Without the closing repeat, a ring's first and last vertices are neighbours too.
+    closing = np.r_[owner[1:] != owner[:-1], True]
+    coords, owner = coords[~closing], owner[~closing]
+    pairs = cKDTree(coords).query_pairs(tolerance, output_type="ndarray")
+    if len(pairs) == 0:
+        return geoms
+    ring_size = np.bincount(owner)[owner[pairs[:, 0]]]
+    apart = np.ptp(pairs, axis=1)
+    pinch = (owner[pairs[:, 0]] == owner[pairs[:, 1]]) & (apart > 1) & (apart < ring_size - 1)
+    for k in polygons[np.unique(owner[pairs[pinch, 0]])]:
+        geoms[k] = _split_pinch(geoms[k], tolerance)
+    return geoms
+
+
+def _split_pinch(poly: Polygon, tolerance: float):
+    """``poly`` split into its lobes where non-neighbouring exterior vertices lie within ``tolerance``."""
+    xy = np.asarray(poly.exterior.coords)[:-1]
+    n = len(xy)
+    for i, j in cKDTree(xy).query_pairs(tolerance, output_type="ndarray"):
+        if 1 < abs(int(j) - int(i)) < n - 1:
+            xy[max(i, j)] = xy[min(i, j)]
+    parts = [part for part in shapely.get_parts(make_valid(Polygon(xy, poly.interiors)))
+             if part.geom_type == "Polygon" and part.area > 0.0]
+    if len(parts) < 2 or any(part.interiors for part in parts):
+        return poly
+    if abs(sum(part.area for part in parts) - poly.area) > SPLIT_TOLERANCE * poly.area:
+        return poly
+    return MultiPolygon(parts)
 
 
 def _compactness(poly: Polygon) -> float:

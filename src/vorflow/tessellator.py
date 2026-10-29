@@ -15,7 +15,7 @@ from shapely.validation import make_valid
 
 from . import _lloyd
 from ._log import warn_user
-from ._convex import CONCAVE_TOLERANCE, centroid_fan_fraction, split_concave_cells
+from ._convex import CONCAVE_TOLERANCE, centroid_fan_fraction, split_concave_cells, split_pinches
 from ._plot import get_ax
 from ._barrier import BarrierMeshError
 from .utils import grid_to_disv, grid_to_gsf, grid_to_mfusg_disu
@@ -562,7 +562,15 @@ def _mirror_metadata(tags, mirrors):
 
 
 def _explode_with_unique_ids(grid_gdf):
-    """Explode multipart cells into polygons, giving every non-primary part a fresh node_id."""
+    """Explode multipart and pinched cells into polygons, giving every non-primary part a fresh node_id."""
+    if not grid_gdf.empty:
+        geoms = grid_gdf.geometry.to_numpy()
+        coords = shapely.get_coordinates(geoms)
+        scale = max(float(np.ptp(coords, axis=0).max()), float(np.abs(coords).max()), 1.0)
+        grid_gdf = grid_gdf.copy()
+        grid_gdf[grid_gdf.geometry.name] = gpd.GeoSeries(
+            split_pinches(geoms, VERTEX_MERGE_FRACTION * scale), index=grid_gdf.index, crs=grid_gdf.crs
+        )
     exploded = grid_gdf.explode(index_parts=False)
     # GeometryCollections from clipping can carry line/point slivers; drop them.
     exploded = exploded[exploded.geom_type == 'Polygon'].reset_index(drop=True)

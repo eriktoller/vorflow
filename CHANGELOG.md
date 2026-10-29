@@ -298,6 +298,12 @@ and the project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   shared face". The clip domain is now closed over gaps narrower than 1e-9
   x its extent, a cell the domain covers is kept whole, and any other cell
   lost with its generator inside the domain is named in a warning.
+- A cell clipped around a sharp notch tip no longer passes twice through the
+  tip. Clipping computed the tip twice, a roundoff apart, so the cell was two
+  lobes joined by a neck of near-zero width: DISV listed one vertex twice,
+  `grid_to_mfusg_disu` rejected the grid, and a barrier from the tip made the
+  barrier safety net cut the cell. The lobe away from the generator now
+  becomes a cell of its own, as other detached parts of clipped cells do.
 
 ## [0.3.0] - 2026-10-15
 

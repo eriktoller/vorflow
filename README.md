@@ -574,8 +574,8 @@ Otherwise the cut follows the corner's angle bisector, and the neighbouring
 cell gains a vertex where the cut ends (its shape does not change). Where the
 bisector would end on a barrier face, two diagonals to the ends of that face
 cut it off instead, so every barrier segment stays one face. The
-largest piece holding the generator keeps the cell's `node_id`; the others
-get new IDs. Pieces usually carry their centroid as `x`/`y`, unlike every
+largest piece holding the generator keeps the cell's `node_id` and zone; the
+others get new IDs and the zone that holds most of their area. Pieces usually carry their centroid as `x`/`y`, unlike every
 other cell: the generator sits on the corner, at the end of the cut, and a
 cell centre there makes XT3D crash. A piece that holds the generator clear of
 its boundary keeps it, and a piece with one barrier face takes a point on the

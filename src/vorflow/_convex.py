@@ -504,6 +504,31 @@ def _piece_centre(piece: Polygon, generator: Point, barriers) -> tuple[float, fl
     return piece.centroid.x, piece.centroid.y
 
 
+def zone_by_area(grid, node_ids: list[int], zones):
+    """``grid`` with the cells ``node_ids`` given the zone that holds most of their area.
+
+    For split pieces without the generator, whose zone the generator join
+    does not decide. ``zones`` has ``geometry``, ``zone_id`` and
+    ``z_order``; a zone's share sums all its polygon rows, and a tie goes to
+    the higher ``z_order``.
+    """
+    rows = np.flatnonzero(grid["node_id"].isin(node_ids).to_numpy())
+    if len(rows) == 0 or zones.empty or "zone_id" not in grid.columns:
+        return grid
+    zones = zones.sort_values("z_order", ascending=False, kind="mergesort")
+    codes, zone_ids = pd.factorize(zones["zone_id"])
+    cells = grid.geometry.to_numpy()[rows]
+    shares = np.zeros((len(rows), len(zone_ids)))
+    for code, zone in zip(codes, zones.geometry.to_numpy()):
+        shares[:, code] += shapely.area(shapely.intersection(cells, zone))
+    best = shares.argmax(axis=1)
+    grid = grid.copy()
+    grid.loc[grid.index[rows], "zone_id"] = zone_ids.to_numpy()[best]
+    if "z_order" in grid.columns:
+        grid.loc[grid.index[rows], "z_order"] = zones["z_order"].groupby(codes).max().to_numpy()[best]
+    return grid
+
+
 def _report_frame(rows: list[dict]) -> pd.DataFrame:
     """The split report, with the same column types whether or not it has rows."""
     dtypes = {"node_id": "int64", "convexity": "float64", "n_pieces": "int64",

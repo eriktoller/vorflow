@@ -630,3 +630,36 @@ def test_split_keeps_barrier_faces_orthogonal_at_a_notch_tip():
 
     assert len(tessellator.concave_split_report) == 1
     assert faces["ortho_error"].max() < 1e-6
+
+
+def test_zone_by_area_gives_pieces_the_zone_holding_most_of_them():
+    """Catches a split piece keeping its parent's zone when it lies mostly in another."""
+    zones = gpd.GeoDataFrame({"zone_id": [1, 2], "z_order": [0, 1]}, geometry=[box(0, 0, 2, 1), box(0, 1, 2, 2)])
+    grid = _grid([box(0, 0.2, 1, 1.2), box(1, 0.5, 2, 1.5), box(0, 0, 1, 0.2)])
+    grid["z_order"] = 0
+
+    out = convex.zone_by_area(grid, [10, 11], zones)
+
+    assert out["zone_id"].tolist() == [1, 2, 7]
+    assert out["z_order"].tolist() == [0, 1, 0]
+
+
+@pytest.mark.slow
+def test_split_pieces_take_the_zone_holding_most_of_their_area():
+    """Catches a piece cut from the cell at a zone corner keeping a zone it barely overlaps."""
+    lower, upper = box(0, 0, 300, 150), box(0, 150, 150, 300)
+    cm = ConceptualMesh()
+    cm.add_polygon(lower, zone_id=1, resolution=20.0)
+    cm.add_polygon(upper, zone_id=2, resolution=20.0)
+    mg = MeshGenerator(background_lc=20.0, verbosity=0)
+    mg.generate(*cm.generate())
+
+    tessellator = VoronoiTessellator(mg, cm, split_concave="all")
+    grid = tessellator.generate()
+
+    new_pieces = [i for ids in tessellator.concave_split_report["piece_ids"] for i in ids[1:]]
+    assert new_pieces
+    pieces = grid[grid["node_id"].isin(new_pieces)]
+    zones = {1: lower, 2: upper}
+    shares = [zones[z].intersection(p).area / p.area for z, p in zip(pieces["zone_id"], pieces.geometry)]
+    assert min(shares) > 0.5

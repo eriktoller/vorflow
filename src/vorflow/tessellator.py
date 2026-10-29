@@ -15,7 +15,7 @@ from shapely.validation import make_valid
 
 from . import _lloyd
 from ._log import warn_user
-from ._convex import CONCAVE_TOLERANCE, centroid_fan_fraction, split_concave_cells, split_pinches
+from ._convex import CONCAVE_TOLERANCE, centroid_fan_fraction, split_concave_cells, split_pinches, zone_by_area
 from ._plot import get_ax
 from ._barrier import BarrierMeshError
 from .utils import grid_to_disv, grid_to_gsf, grid_to_mfusg_disu
@@ -729,8 +729,9 @@ class VoronoiTessellator:
             two diagonals to its ends cut it off instead, so every barrier
             segment stays one face. A zero-width spike (as a barrier end
             can leave) is removed first. The largest piece holding the
-            generator keeps the cell's ``node_id``; the others get new IDs
-            above the maximum. A cell that cannot be split (e.g. one with a
+            generator keeps the cell's ``node_id`` and zone; the others get
+            new IDs above the maximum and the zone that holds most of their
+            area. A cell that cannot be split (e.g. one with a
             hole, which no DISV cell can represent) is left as it is with a
             warning, in either mode. Unlike every other cell, a piece of a
             split cell usually carries its centroid as ``x``/``y``: the
@@ -1636,6 +1637,8 @@ class VoronoiTessellator:
         barriers = shapely.union_all(lines) if lines else None
         grid, self.concave_split_report = split_concave_cells(grid, targets, barriers)
         report = self.concave_split_report
+        new_pieces = [i for ids in report['piece_ids'] for i in ids[1:]]
+        grid = zone_by_area(grid, new_pieces, self._embedded_polygons()[['geometry', 'zone_id', 'z_order']])
         added = int(report['n_pieces'].sum()) - len(report)
         logger.info(f"  -> Split {len(report)} concave cells into convex pieces (+{added} cells)")
         return grid

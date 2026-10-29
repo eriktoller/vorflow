@@ -130,7 +130,8 @@ and the project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   corner (a bisector cut, with the new vertex added to the neighbour, where no
   diagonal works; where the bisector ends on a barrier face, diagonals to the
   ends of that face instead, so each barrier segment stays one face). The largest piece holding the generator keeps `node_id`
-  and the others get new IDs; a cell that cannot be split is left as it is,
+  and zone, and the others get new IDs and the zone holding most of their
+  area; a cell that cannot be split is left as it is,
   with a warning. Pieces carry their centroid as `x`/`y`, because the
   generator sits at the end of the cut and XT3D crashes on a cell centre
   there, except that a piece holding the generator clear of its boundary

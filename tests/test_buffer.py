@@ -3,6 +3,7 @@ import warnings
 import gmsh
 import numpy as np
 import pytest
+import shapely
 from shapely.geometry import LineString, Polygon, box
 from shapely.ops import split
 
@@ -264,20 +265,20 @@ def test_structured_quad_buffer_barrier_is_only_cut_where_cells_straddle_it():
     assert _straddling_cell_count(grid, line) == 0
 
 
-def test_structured_quad_buffer_thickness2_barrier_is_enforced():
-    """Catches quad-buffered barriers being skipped when a node row sits on the line."""
+def test_structured_quad_buffer_thickness2_barrier_keeps_nodes_off_the_line():
+    """Catches a node row on a thickness-2 barrier strip, which cut its cells through their generators."""
     mesher, cm = _generate_line_buffer_mesh(thickness=2, return_context=True)
     line = cm.clean_lines.iloc[0].geometry
 
     grid = VoronoiTessellator(mesher, cm, clip_to_boundary=True).generate()
 
-    # The node row on the line gives ~one straddling cell per lc of line;
-    # each is split in two along the barrier.
-    fragments = grid[~grid["node_id"].isin(mesher.node_tags)]
-    assert len(fragments) >= 0.5 * line.length
-    assert (fragments.geometry.distance(line) < 1e-9).all()
+    # Two cell rows on each side: the node rows sit at +/- 0.5 and 1.5 lc,
+    # so the cells meet on the line. (The end caps on the domain boundary
+    # are subdivided by its densified vertices and meshed unstructured.)
+    nodes = shapely.points(mesher.nodes)
+    inner = shapely.distance(nodes, line.boundary) > 1.5
+    assert shapely.distance(nodes[inner], line).min() == pytest.approx(0.5)
     assert _straddling_cell_count(grid, line) == 0
-    assert grid["node_id"].is_unique
     assert grid.geometry.area.sum() == pytest.approx(40.0)
 
 

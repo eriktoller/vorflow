@@ -313,6 +313,18 @@ and the project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   `grid_to_mfusg_disu` rejected the grid, and a barrier from the tip made the
   barrier safety net cut the cell. The lobe away from the generator now
   becomes a cell of its own, as other detached parts of clipped cells do.
+- A barrier with `quad_buffer=True, quad_buffer_thickness=2` no longer puts
+  a row of mesh nodes on the barrier. The cells of that row were cut through
+  their generators, with no warning; `to_mfusg_disu()` then failed with an
+  error that did not name the barrier, and `to_disv()` wrote faces split
+  into two edges. On a barrier `quad_buffer_thickness` is now the number of
+  cell rows on each side of the line, so `2` gives a strip three cells wide
+  whose middle faces follow the line. Two changes keep those faces on the
+  line: the two sides of a strip carry their nodes at matching stations,
+  also around corners (each side used to spread its own count, which
+  sheared the rows wherever the sides' lengths differed), and Gmsh's
+  smoothing and optimization passes no longer move the node rows inside a
+  quad buffer off their transfinite positions.
 
 ## [0.3.0] - 2026-10-15
 

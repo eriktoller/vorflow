@@ -131,6 +131,15 @@ def test_domain_union_ignores_field_only_polygons():
     assert buffer.domain_union_geometry(None) is None
 
 
+def test_strip_cells_across_keeps_barrier_node_rows_off_the_line():
+    assert buffer.strip_cells_across(_row(quad_buffer_thickness=2)) == 2
+    assert buffer.strip_cells_across(_row(is_barrier=True)) == 1
+    # An odd quad count: thickness cell rows on each side of the barrier.
+    assert buffer.strip_cells_across(_row(is_barrier=True, quad_buffer_thickness=2)) == 3
+    row = _row(lc=2.0, is_barrier=True, quad_buffer=True, quad_buffer_thickness=2)
+    assert buffer.protection_epsilon(row, 5) == 3.0
+
+
 # --- footprint planning ------------------------------------------------------
 
 def test_plan_line_strip_builds_strip_with_ordered_corners():

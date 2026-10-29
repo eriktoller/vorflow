@@ -287,8 +287,11 @@ barrier face, so move the point off the line, or, where it marks the
 barrier's end, end the barrier that far short of it.
 
 Quad buffers on barriers (`quad_buffer=True`) do not use the exact faces
-yet. They still rely on mirrored generators and on cutting cells, so they
-can leave cut cells and bent faces. `straddle_width` is deprecated, with a
+yet. On a straight stretch their cells meet on the barrier, with no node
+row on it (`quad_buffer_thickness` counts the cell rows on each side). At
+corners, and where the barrier leaves the domain at a slant, they still
+rely on mirrored generators and on cutting cells, so they can leave cut
+cells and bent faces there. `straddle_width` is deprecated, with a
 `FutureWarning`, and its value is ignored, so remove it from barriers. A
 non-barrier line that sets it still gets exact faces along it.
 

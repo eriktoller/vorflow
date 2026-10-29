@@ -3,13 +3,11 @@
 Geometry transfer (``MeshGenerator._build_occ_model``) runs in a fixed order,
 because the order in which OCC entities are created determines their tags:
 
-1. point features;
-2. protection corridors, the barrier zone, quad-buffer plans and the
-   straddle pairs fixed where standard lines cross barriers (pure geometry,
-   see ``vorflow.buffer`` and ``vorflow._straddle``);
-3. lines: quad-buffer strip surfaces, straddle point pairs for barrier and
-   straddle lines, plain curves trimmed off the barrier zone, or, for a line
-   crossing a barrier, curves that end on the barrier's straddle pairs;
+1. point features (the barrier sites are point rows too, see below);
+2. protection corridors, the barrier zone and quad-buffer plans (pure
+   geometry, see ``vorflow.buffer``);
+3. lines: quad-buffer strip surfaces, barrier lines as field-only curves,
+   or plain curves trimmed off the quad-buffer corridors;
 4. polygons: quad-buffer bands first, then every embedded polygon minus the
    buffer footprints; field-only (embed=False) polygons are deferred;
 5. ``fragment`` + ``removeAllDuplicates`` (+ optional ``healShapes``), with
@@ -20,6 +18,15 @@ because the order in which OCC entities are created determines their tags:
 The resulting ``gmsh_map`` (feature id -> dimtags, per kind) drives
 ``_embed_features`` and ``_setup_fields``; the quad-buffer crossings are
 passed on to ``_setup_fields`` as Ball refinement fields.
+
+Barriers (``vorflow._barrier``). Before any Gmsh call, ``generate()`` plans
+the barrier sites in closed form and checks the empty-circle condition, or
+raises ``BarrierMeshError``. Gmsh then meshes a copy of the clean frames in
+which every barrier is a size field only, the barrier faces finer than the
+size field get extra field-only lines, and the sites are embedded points.
+Afterwards the mesh nodes inside the sites' circles are removed (feature
+nodes never are), the free nodes are polished by Lloyd around the fixed
+sites, and the sites join ``nodes``.
 """
 from __future__ import annotations
 
@@ -34,7 +41,7 @@ import pandas as pd
 import geopandas as gpd
 import shapely
 from shapely.geometry import Point, Polygon
-from shapely.ops import nearest_points, unary_union
+from shapely.ops import unary_union
 from shapely.validation import make_valid
 from scipy.spatial import cKDTree
 from .fields import (
@@ -46,22 +53,21 @@ from .fields import (
     ThresholdField,
     _BorderGradingField,
 )
-from ._log import current_verbosity, verbosity_scope
+from ._log import current_verbosity, verbosity_scope, warn_user
 from ._plot import get_ax
 from . import buffer
+from . import _lloyd
+from ._barrier import frames as _barrier_frames
+from ._barrier import network as _barrier_network
+from ._barrier import polish as _barrier_polish
+from ._barrier import sizing as _barrier_sizing
 from ._gap import GapWalls, SizeSource
-from ._straddle import (
-    _straddle_distances,
-    _straddle_pair,
-    plan_barrier_crossings,
-    straddle_epsilon,
-    straddle_probe,
-)
 from ._features import (
     feature_lc,
     is_embedded,
+    is_face_line,
+    line_parts,
     polygon_parts,
-    positive_number,
     ring_seed_coords,
     row_bool,
     sanitize_coords,
@@ -71,6 +77,15 @@ from ._features import (
 
 logger = logging.getLogger(__name__)
 
+
+
+def _positive_option(value, name):
+    """``value`` as a positive finite float, or ValueError naming ``name``."""
+    if isinstance(value, bool) or not isinstance(value, (int, float, np.integer, np.floating)):
+        raise ValueError(f"{name} must be a positive number. Got {value!r}.")
+    if not math.isfinite(value) or value <= 0:
+        raise ValueError(f"{name} must be a positive finite number. Got {value!r}.")
+    return float(value)
 
 
 def _to_key(dim, tag):
@@ -248,7 +263,7 @@ def _accumulate_nodes(dim, ent_tag, tag_to_xy):
 
 
 def _embedded_constraint_entities(gmsh_map, clean_points, clean_lines):
-    """Yield (dim, tag) of embedded point features, line curves and straddle points."""
+    """Yield (dim, tag) of embedded point features (barrier sites included) and line curves."""
     if clean_points is not None and not clean_points.empty and 'embed' in clean_points.columns:
         for fid, row in clean_points.iterrows():
             if not is_embedded(row):
@@ -259,17 +274,13 @@ def _embedded_constraint_entities(gmsh_map, clean_points, clean_lines):
 
     if clean_lines is not None and not clean_lines.empty and 'embed' in clean_lines.columns:
         for fid, row in clean_lines.iterrows():
-            if not is_embedded(row):
+            # Barrier curves only size the mesh; their nodes come from the sites.
+            if not is_embedded(row) or is_face_line(row):
                 continue
             if int(fid) in gmsh_map.get('lines', {}):
                 for dimtag in gmsh_map['lines'][int(fid)]:
                     if isinstance(dimtag, (tuple, list)) and len(dimtag) >= 2 and int(dimtag[0]) == 1:
                         yield 1, int(dimtag[1])
-            # Straddle/barrier lines are represented by point pairs.
-            elif int(fid) in gmsh_map.get('straddle_points', {}):
-                for dimtag in gmsh_map['straddle_points'][int(fid)]:
-                    if isinstance(dimtag, (tuple, list)) and len(dimtag) >= 2 and int(dimtag[0]) == 0:
-                        yield 0, int(dimtag[1])
 
 
 def _free_node_tags(gmsh_map, polygons_gdf):
@@ -278,7 +289,7 @@ def _free_node_tags(gmsh_map, polygons_gdf):
     gmsh classifies a node on the lowest-dimension entity it lies on, so
     getNodes(2, s, includeBoundary=False) leaves out the nodes of the
     surface's boundary and of the points and curves embedded in it (hex-ring
-    seeds, line nodes, straddle pairs). Quad-buffer surfaces (strips and
+    seeds, line nodes, barrier sites). Quad-buffer surfaces (strips and
     bands) are left out entirely.
     """
     if polygons_gdf is None or polygons_gdf.empty:
@@ -363,7 +374,6 @@ def _node_sizes_from_elements(element_data, node_tags, fallback):
 # gmsh_map key for each fragment-input kind recorded in _GeometryInventory.
 _MAP_KEY_BY_KIND = {
     'point': 'points',
-    'straddle_point': 'straddle_points',
     'line': 'lines',
     'surface': 'surfaces',
     'structured_buffer_surf': 'structured_buffer_surfs',
@@ -382,11 +392,9 @@ class _GeometryInventory:
     embedded_line_tags: list = dataclasses.field(default_factory=list)
     embedded_surface_tags: list = dataclasses.field(default_factory=list)
     # Non-embedded (field-only) entities per feature id; they do not fragment
-    # but still receive size fields. Straddle pairs are keyed by their *line*
-    # id, apart from point features (whose ids share the same 0..n range).
-    # Field-only polygons also keep their boundary curves (poly_curves).
+    # but still receive size fields. Field-only polygons also keep their
+    # boundary curves (poly_curves).
     nonembedded_point_tags: dict = dataclasses.field(default_factory=dict)
-    nonembedded_straddle_tags: dict = dataclasses.field(default_factory=dict)
     nonembedded_line_tags: dict = dataclasses.field(default_factory=dict)
     nonembedded_surface_tags: dict = dataclasses.field(default_factory=dict)
     nonembedded_poly_curve_tags: dict = dataclasses.field(default_factory=dict)
@@ -409,7 +417,6 @@ class _GeometryInventory:
         """A gmsh_map seeded with the non-embedded tags (shallow copies)."""
         return {
             'points': dict(self.nonembedded_point_tags),
-            'straddle_points': dict(self.nonembedded_straddle_tags),
             'lines': dict(self.nonembedded_line_tags),
             'surfaces': dict(self.nonembedded_surface_tags),
             'structured_buffer_surfs': {},
@@ -570,9 +577,6 @@ def _field_target_tags(gmsh_map, feature_ids, field_only_polygons):
     for fid in feature_ids['lines']:
         if fid in gmsh_map.get('lines', {}):
             tags['lines'].extend(_dimtag_tags(gmsh_map['lines'][fid]))
-        elif fid in gmsh_map.get('straddle_points', {}):
-            # Straddle/barrier lines are represented by point pairs.
-            tags['points'].extend(_dimtag_tags(gmsh_map['straddle_points'][fid]))
         elif ('line', fid) in buffer_surfs:
             # Buffer strips are embedded surfaces; list them as such so
             # distance-growth fields target their boundary curves (an empty
@@ -860,7 +864,7 @@ def _hex_ring_intact(dimtags, centre, element_nodes):
 
 
 def _entities_to_embed(gmsh_map, points_gdf, lines_gdf):
-    """(dim, tag) of every embedded point, line and barrier straddle point, in embedding order."""
+    """(dim, tag) of every embedded point (barrier sites included) and line, in embedding order."""
     entities = []
     if points_gdf is not None:
         for idx, row in points_gdf.iterrows():
@@ -869,11 +873,9 @@ def _entities_to_embed(gmsh_map, points_gdf, lines_gdf):
                                 if dt[0] == 0)
     if lines_gdf is not None:
         for idx, row in lines_gdf.iterrows():
-            if is_embedded(row):
+            if is_embedded(row) and not is_face_line(row):
                 entities.extend((1, dt[1]) for dt in gmsh_map.get('lines', {}).get(idx, [])
                                 if dt[0] == 1)
-                entities.extend((0, dt[1]) for dt in gmsh_map.get('straddle_points', {}).get(idx, [])
-                                if dt[0] == 0)
     return entities
 
 
@@ -928,6 +930,78 @@ class MeshGenerator:
             gaps between embedded features to ``cells_across`` cells. It
             adds no Gmsh field where no gap needs refining. The estimate is
             summarised in ``diagnostics['gap_field']``.
+        barrier_gradation (float): Largest change of the barrier face length
+            per unit length along the barrier network (0.3: a face is at most
+            30% of the distance longer than one a unit away). The faces are
+            graded over the whole network at once, across junctions, so this
+            is a mesh-wide option rather than an ``add_line`` one.
+        sharp_angle (float): Spikes (a barrier folding back on itself)
+            sharper than this angle, in degrees, leave the last 0.45 x
+            resolution of each leg without cell faces: the tip lies inside
+            cells, so the cells there stay regular instead of becoming
+            slivers. The uncovered length and place are in
+            ``barrier_report``. Default 18 (an 18 degree apex cell has a
+            compactness of 0.36). Where two barrier legs of a junction (or a
+            barrier and the domain boundary) meet at less than this angle,
+            they share a short stem instead, moving them at most 0.1 x
+            resolution (``barrier_report['collapsed']``). It acts wherever
+            two barrier legs meet, also between different lines, so it is a
+            mesh-wide option.
+        barrier_polish_iterations (int): Lloyd steps that move the free mesh
+            nodes within 3 x their local size of a barrier circle towards
+            their cell centroids around the fixed barrier sites, kept out of
+            the circles (0 turns it off). Nodes further away keep their Gmsh
+            positions exactly. Default 20. Independent of
+            ``VoronoiTessellator(lloyd_iterations=...)``, which also respects
+            the circles.
+
+    Barrier results:
+        barrier_report (dict): Set by ``generate()``, like the three
+            attributes below. What the barrier construction did and gave
+            up, each entry with its ``location`` (global x, y): ``tips``
+            (sharp spike tips left without faces, with ``length``),
+            ``stubs`` (dangling pieces shorter than 0.1 x resolution past a
+            junction, and branches that snapping collapsed, dropped),
+            ``snaps`` (barrier ends moved or trimmed onto another barrier or
+            the boundary, and simplifications), ``noise`` (digitising-noise
+            vertices dropped, with the largest move), ``on_boundary``
+            (barrier parts dropped because they lie on the domain boundary,
+            ``distance`` the length dropped), ``rings`` (hex rings dropped
+            because a barrier is too close), ``fixed_nodes`` (per standard
+            line, zone edge or quad-buffer strip, the ``nodes`` that had to
+            be removed inside the circles), ``corridors`` (narrow gaps given
+            one shared row of cells, at most 3 x the gap long, so flow
+            along the gap is kept: ``kind`` "barriers" between two close,
+            nearly parallel barriers (separate lines, or the legs of one
+            line: a U-turn, a thin loop) or "boundary" along a boundary
+            edge, ``line_ids``, ``length``, ``gap`` (the narrowest; for
+            "boundary" the distance to the edge),
+            ``ends`` (how each end closes: "tip", "stagger", "mouth",
+            "boundary", "bend" or "fork"), ``cells`` in its row,
+            ``resolution``; rows of cells shorter than 0.5 x resolution
+            raise one UserWarning with their cell count), ``collapsed``
+            (barrier legs meeting at less than ``sharp_angle``, or fans of
+            legs closer than 29 degrees, merged over a short reach: ``kind``
+            "junction" or "boundary", ``line_ids``, ``angle``, ``reach``,
+            ``deviation``, the largest move of a line, at most 0.1 x its
+            resolution), plus
+            ``repair_rounds``, ``sites``, ``removed_nodes`` (Gmsh nodes
+            removed for the sites, not counting Gmsh's copies of the sites)
+            and ``polish`` (``iterations``, ``residual``, ``rejected``,
+            short faces before and after, and ``moved``, the nodes it
+            moved). Merged wedges, tips, stubs, snapped ends and fixed-line
+            nodes each raise one UserWarning with their count. When the
+            cleaning dropped every barrier, the report holds only what it
+            dropped.
+        barrier_lines (GeoDataFrame): The lines the barrier faces follow
+            (after stubs and sharp tips are removed and narrow junctions
+            merged; a stretch the faces of several lines share is part of
+            each of their rows), with ``feature_id``
+            (the clean-line index), ``line_id`` and ``is_barrier``.
+        barrier_circles (tuple): ``(centres (k, 2), radii (k,))`` of the
+            empty circles; no generator other than the barrier sites may
+            lie inside one.
+        node_is_site (ndarray): True for the nodes that are barrier sites.
     """
 
     def __init__(self, background_lc=None, verbosity=None, mesh_algorithm=6,
@@ -936,10 +1010,13 @@ class MeshGenerator:
                  heal_shapes=False, heal_tolerance=1e-8,
                  heal_fix_degenerated=True, heal_fix_small_edges=True,
                  heal_fix_small_faces=True, diagnose=False,
-                 conceptual_mesh=None, gap_field=None):
+                 conceptual_mesh=None, gap_field=None, barrier_gradation=_barrier_sizing.GRADATION,
+                 sharp_angle=math.degrees(_barrier_network.SHARP_ANGLE),
+                 barrier_polish_iterations=_barrier_polish.ITERATIONS):
         if gap_field is not None and not isinstance(gap_field, GapField):
             raise ValueError(f"gap_field must be a GapField or None. Got {gap_field!r}.")
         self.gap_field = gap_field
+        self._gap_estimate = None
         self.conceptual_mesh = conceptual_mesh
         self.background_lc = background_lc
         self.verbosity = verbosity
@@ -955,6 +1032,12 @@ class MeshGenerator:
         self.heal_fix_small_edges = heal_fix_small_edges
         self.heal_fix_small_faces = heal_fix_small_faces
         self.diagnose = bool(diagnose)
+        self.barrier_gradation = _positive_option(barrier_gradation, "barrier_gradation")
+        self.sharp_angle = _positive_option(sharp_angle, "sharp_angle")
+        if not self.sharp_angle < 60.0:
+            raise ValueError(f"sharp_angle must be below 60 degrees (a ladder takes over there). Got {sharp_angle!r}.")
+        _lloyd.validate_settings(barrier_polish_iterations, 1.0, 0.0, prefix="barrier_polish_")
+        self.barrier_polish_iterations = int(barrier_polish_iterations)
 
         self.initialized = False
         self.nodes = None
@@ -975,6 +1058,10 @@ class MeshGenerator:
         self.node_edges = None
         self.buffer_footprints = None
         self.diagnostics = {}
+        self.barrier_report = None
+        self.barrier_lines = None
+        self.barrier_circles = None
+        self.node_is_site = None
 
     def _validate_background_lc(self):
         """Fail before any Gmsh work if background_lc is missing or not positive."""
@@ -1159,6 +1246,10 @@ class MeshGenerator:
         so this method can be called after the normal mesh-generation lifecycle.
         The report includes all 2D element types and marks triangle elements in
         ``is_triangle`` so mixed tri/quad meshes are explicit.
+
+        With barriers these are Gmsh's elements before the barrier sites are
+        fitted, as in ``get_element_grid``: they describe the mesh away from
+        the barriers, not the cells next to them.
         """
         if self.triangular_quality is None:
             raise RuntimeError(
@@ -1295,6 +1386,13 @@ class MeshGenerator:
         centroid; field-only (``embed=False``) polygons never assign zones. Ties (overlapping zones or centroids on shared borders) are
         broken deterministically: highest ``z_order`` wins, then the zone that
         appears earliest in the conceptual-mesh polygon table.
+
+        With barriers this is Gmsh's mesh before the barrier sites are fitted:
+        the sites are not element vertices, and the nodes later removed from
+        the barrier circles or moved by the polish (within 3 x their local
+        size of a circle) are still at their Gmsh positions. Every other
+        element vertex is a node of ``nodes`` at the same position. A
+        triangulation of the fitted nodes would need another Gmsh run.
         """
         if self.element_grid is None and self._element_data is None:
             raise RuntimeError(
@@ -1555,18 +1653,17 @@ class MeshGenerator:
         self._add_point_features(points_gdf, inventory)
 
         corridors = buffer.protected_corridors(polygons_gdf, lines_gdf, self.background_lc)
-        barrier_zone = self._build_barrier_zone(corridors)
+        # Barrier faces are placed exactly (vorflow._barrier); only quad-buffer
+        # corridors still trim the standard lines.
+        barrier_zone = self._build_barrier_zone({
+            key: value for key, value in corridors.items()
+            if not (key[0] == 'line' and is_face_line(lines_gdf.loc[key[1]]))
+        })
         plans = buffer.plan_quad_buffers(polygons_gdf, lines_gdf, self.background_lc, domain)
         crossings = buffer.find_all_crossings(plans)
-        straddle_plan = plan_barrier_crossings(
-            lines_gdf, self.background_lc, domain, barrier_zone,
-            lambda b_idx: buffer.barrier_zone(
-                {k: v for k, v in corridors.items() if k != ('line', b_idx)}
-            ),
-        )
 
         line_strips = self._add_line_features(
-            lines_gdf, inventory, plans, corridors, barrier_zone, domain, straddle_plan
+            lines_gdf, inventory, plans, corridors, barrier_zone, domain
         )
         footprints = self._add_polygon_features(
             polygons_gdf, inventory, plans, corridors, domain, line_strips
@@ -1625,42 +1722,25 @@ class MeshGenerator:
             logger.info(f"Constructed Barrier Zone from {len(corridors)} protected features.")
         return zone
 
-    def _add_line_features(self, lines_gdf, inventory, plans, corridors, barrier_zone, domain,
-                           straddle_plan=None):
-        """Add each line as a quad buffer, straddle point pairs or plain curves; returns the strip footprints.
+    def _add_line_features(self, lines_gdf, inventory, plans, corridors, barrier_zone, domain):
+        """Add each line as a quad buffer, a field-only barrier curve or plain curves; returns the strip footprints.
 
-        ``straddle_plan`` (see _straddle.plan_barrier_crossings) fixes the
-        straddle pairs at crossings of standard lines and gives those lines
-        the geometry that ends on them.
+        A barrier (``is_face_line``) only sizes the mesh here: its faces come
+        from the barrier sites, which ``generate()`` adds as point rows.
         """
-        fixed = straddle_plan.fixed if straddle_plan is not None else {}
-        line_parts = straddle_plan.line_parts if straddle_plan is not None else {}
         line_strips = []
         for idx, row in lines_gdf.iterrows():
-            is_barrier = row_bool(row, 'is_barrier', False)
             quad_buffer = row_bool(row, 'quad_buffer', False)
-            straddle = positive_number(row.get('straddle_width'))
             lc = feature_lc(row, self.background_lc)
-            embedded = is_embedded(row)
             if quad_buffer:
                 line_strips.extend(self._add_line_quad_buffer(
                     idx, row, lc, inventory, plans, corridors, domain
                 ))
-            elif is_barrier or straddle is not None:
-                self._add_straddle_points(
-                    idx, row.geometry, lc, straddle, embedded, inventory, domain,
-                    fixed=fixed.get(int(idx)),
-                )
-            elif int(idx) in line_parts:
-                if self._verbosity > 1:
-                    new_len = sum(part.length for part in line_parts[int(idx)])
-                    logger.info(f"  Line {idx} ends on barrier straddle pairs "
-                                f"(Len: {row.geometry.length:.2f} -> {new_len:.2f})")
-                for part in line_parts[int(idx)]:
-                    if part.length >= 1e-6:
-                        self._add_polyline(idx, part, embedded, inventory)
+            elif is_face_line(row):
+                for part in line_parts(row.geometry):
+                    self._add_polyline(idx, part, False, inventory)
             else:
-                self._add_standard_line(idx, row.geometry, embedded, barrier_zone, inventory)
+                self._add_standard_line(idx, row.geometry, is_embedded(row), barrier_zone, inventory)
         return line_strips
 
     def _add_line_quad_buffer(self, idx, row, lc, inventory, plans, corridors, domain):
@@ -1694,59 +1774,6 @@ class MeshGenerator:
         elif self._verbosity > 0:
             logger.warning(f"Warning: Structured buffer requested for line {idx}, but no buffer surface was created.")
         return strips
-
-    def _add_straddle_points(self, idx, line, lc, straddle, embedded, inventory, domain=None,
-                             fixed=None):
-        """Place point pairs at +/-eps along a barrier/straddle line so Voronoi edges follow it.
-
-        The line itself is not added; the pairs become mesh nodes whose
-        Voronoi edges trace the original line. For an embedded line, every
-        point is kept inside ``domain``: end pairs on an oblique boundary
-        slide inward (see _straddle_distances) and any other point outside
-        the domain is dropped, since no surface could embed it. ``fixed``
-        maps distances along the line to pairs placed exactly there (at
-        crossings of standard lines, whose nodes they share; OCC dedup
-        merges the coincident points).
-        """
-        fixed = fixed or {}
-        epsilon = straddle_epsilon(lc, straddle)
-        # Tangent probe proportional to line length so the offsets work for
-        # any CRS units and for lines shorter than a fixed step.
-        probe = straddle_probe(line)
-        clip = domain if embedded else None
-        tol = epsilon * 1e-6
-        distances = _straddle_distances(line, lc, epsilon, probe, clip, tol, anchors=list(fixed))
-        coords = [xy for d in distances
-                  for xy in (fixed[d] if d in fixed else _straddle_pair(line, d, epsilon, probe))]
-        if clip is not None and coords:
-            coords = self._clip_straddle_points(idx, coords, clip, tol)
-        for x, y in coords:
-            key = _to_key(0, gmsh.model.occ.addPoint(x, y, 0))
-            if embedded:
-                inventory.record_embedded(key, 'straddle_point', idx)
-            else:
-                inventory.nonembedded_straddle_tags.setdefault(int(idx), []).append(key)
-
-    def _clip_straddle_points(self, idx, coords, domain, tol):
-        """Drop straddle points outside ``domain``; snap those within ``tol`` of it onto its boundary.
-
-        A slid end pair lands one point on the boundary only up to round-off;
-        snapping puts it exactly there, as for a pair on a perpendicular end.
-        """
-        points = shapely.points(coords)
-        near = shapely.dwithin(domain, points, tol)
-        if self._verbosity > 1 and not near.all():
-            logger.debug(f"[DIAG] Line {idx}: dropped {int((~near).sum())} straddle "
-                         f"point(s) outside the domain")
-        kept = []
-        for xy, point, keep in zip(coords, points, near):
-            if not keep:
-                continue
-            if not domain.covers(point):
-                snapped = nearest_points(domain.boundary, point)[0]
-                xy = (snapped.x, snapped.y)
-            kept.append(xy)
-        return kept
 
     def _add_standard_line(self, idx, geom, embedded, barrier_zone, inventory):
         """Add a plain constraint line, trimmed off the barrier zone, as OCC segments."""
@@ -2651,6 +2678,15 @@ class MeshGenerator:
                          f"first map key {first_key!r} ({type(first_key).__name__}), "
                          f"match={first_idx in surfaces}")
 
+    def _estimate_gaps(self, polygons_gdf, lines_gdf, points_gdf):
+        """The GapField's estimate (``_gap.GapEstimate``) on the clean frames, or None without a gap_field."""
+        if self.gap_field is None:
+            return None
+        self._validate_background_lc()
+        background_lc = float(self.background_lc)
+        return self.gap_field.estimate(_gap_walls(polygons_gdf, lines_gdf, points_gdf), background_lc,
+                                       _gap_size_sources(polygons_gdf, lines_gdf, points_gdf, background_lc))
+
     def _add_gap_field(self, polygons_gdf, lines_gdf, points_gdf, background_lc):
         """The GapField's Gmsh field id as a list (empty without a field); records diagnostics['gap_field']."""
         if self.gap_field is None:
@@ -2659,6 +2695,8 @@ class MeshGenerator:
             'gap_walls': _gap_walls(polygons_gdf, lines_gdf, points_gdf),
             'size_sources': _gap_size_sources(polygons_gdf, lines_gdf, points_gdf, background_lc),
         }
+        if getattr(self, '_gap_estimate', None) is not None:
+            tags_dict['gap_estimate'] = self._gap_estimate
         f_id = self.gap_field.create(gmsh, tags_dict, background_lc)
         est = tags_dict['gap_estimate']
         active = est.active
@@ -2701,7 +2739,7 @@ class MeshGenerator:
         return field_ids
 
     def _embed_features(self, gmsh_map, polygons_gdf, lines_gdf, points_gdf):
-        """Embed points, lines and straddle points into the domain surfaces that contain them.
+        """Embed points (barrier sites included) and lines into the domain surfaces that contain them.
 
         Fragmentation splits surfaces, so each entity's owner is found
         geometrically. Candidates are pre-filtered by bounding box, then
@@ -3001,19 +3039,32 @@ class MeshGenerator:
         self.node_sizes = None
         self.node_edges = None
         self.buffer_footprints = None
+        self.barrier_report = None
+        self.barrier_lines = None
+        self.barrier_circles = None
+        self.node_is_site = None
+        # The GapField estimate comes first: the barrier faces follow its sizes, and Gmsh gets the same one.
+        self._gap_estimate = self._estimate_gaps(clean_polys, clean_lines, clean_points)
+        # Before any Gmsh call: an invalid barrier construction raises here.
+        barrier_plan, barrier_context = self._plan_barriers(clean_polys, clean_lines, clean_points)
+        gmsh_lines, gmsh_points = clean_lines, clean_points
+        if barrier_plan is not None:
+            gmsh_lines, gmsh_points = _barrier_frames.gmsh_frames(
+                barrier_plan, barrier_context, clean_lines, clean_points
+            )
         self._initialize_gmsh()
         try:
             logger.info("Transferring Geometry to Gmsh...")
             gmsh_map, crossings, self.buffer_footprints = self._build_occ_model(
-                clean_polys, clean_lines, clean_points, launch_gmsh_gui=launch_gmsh_gui
+                clean_polys, gmsh_lines, gmsh_points, launch_gmsh_gui=launch_gmsh_gui
             )
 
             # Ensure features are correctly embedded in surfaces before meshing
-            self._embed_features(gmsh_map, clean_polys, clean_lines, clean_points)
+            self._embed_features(gmsh_map, clean_polys, gmsh_lines, gmsh_points)
             self._log_post_embed_diagnostics(gmsh_map)
 
             logger.info("Setting up Resolution Fields...")
-            self._setup_fields(gmsh_map, clean_polys, clean_lines, clean_points, crossings=crossings)
+            self._setup_fields(gmsh_map, clean_polys, gmsh_lines, gmsh_points, crossings=crossings)
 
             self._mesh_2d()
             self._check_hex_rings(gmsh_map, clean_points)
@@ -3026,7 +3077,7 @@ class MeshGenerator:
                 gmsh.write(output_file)
 
             self.nodes, self.node_tags = self._collect_domain_nodes(
-                gmsh_map, meshed_surface_tags, clean_points, clean_lines
+                gmsh_map, meshed_surface_tags, gmsh_points, gmsh_lines
             )
             free_tags = _free_node_tags(gmsh_map, clean_polys)
             self.node_is_free = np.isin(np.asarray(self.node_tags, dtype=np.int64),
@@ -3039,6 +3090,11 @@ class MeshGenerator:
             if launch_gmsh_gui:
                 gmsh.fltk.run()
             self._finalize_gmsh()
+            self.node_is_site = np.zeros(len(self.nodes), dtype=bool)
+            if barrier_plan is not None:
+                self._fit_barrier_sites(barrier_plan, barrier_context, clean_lines.crs)
+            else:
+                self._set_barrier_report(_barrier_frames.dropped_report(clean_lines))
             return self
 
         except Exception as e:
@@ -3047,6 +3103,49 @@ class MeshGenerator:
             logger.error(f"Mesh Generation Failed: {e}")
             self._finalize_gmsh()
             raise
+
+    def _plan_barriers(self, clean_polys, clean_lines, clean_points):
+        """(plan, context) of the barrier sites, or (None, None) without barriers; see ``vorflow._barrier``."""
+        plan, context = _barrier_frames.prepare(
+            clean_polys, clean_lines, clean_points, float(self.background_lc), _feature_fields,
+            self.barrier_gradation, self.sharp_angle, gap_estimate=getattr(self, '_gap_estimate', None),
+        )
+        if plan is not None:
+            logger.info(f"Barrier construction: {len(plan.layout.sites)} sites on {len(plan.layout.segments)} "
+                        f"faces, {plan.rounds} repair round(s).")
+        return plan, context
+
+    def _fit_barrier_sites(self, plan, context, crs):
+        """Remove the mesh nodes in the barrier circles, polish the free nodes, add the sites; fill the barrier results."""
+        fitted = _barrier_frames.fit_sites(
+            plan, context, self.nodes, self.node_tags, self.node_is_free, self.node_sizes, self.node_edges,
+            self.buffer_footprints, self.barrier_polish_iterations,
+        )
+        self.nodes, self.node_tags = fitted["nodes"], fitted["tags"]
+        self.node_is_free, self.node_sizes = fitted["is_free"], fitted["sizes"]
+        self.node_edges, self.node_is_site = fitted["edges"], fitted["is_site"]
+        self.barrier_circles = (plan.layout.xy + context.origin, plan.layout.radius.copy())
+        self.barrier_lines = _barrier_frames.barrier_lines_frame(plan, context, crs)
+        self._set_barrier_report(_barrier_frames.report(plan, context, fitted))
+
+    def _set_barrier_report(self, report):
+        """Store ``barrier_report``, log its tips and stubs, and warn once per kind of thing given up."""
+        self.barrier_report = report
+        if report is None:
+            return
+        for tip in report['tips']:
+            logger.info(
+                f"Barrier {tip['line_id']!r}: the spike tip at ({tip['location'][0]:.2f}, "
+                f"{tip['location'][1]:.2f}) is sharper than sharp_angle={self.sharp_angle:g} degrees; "
+                f"its last {tip['length']:.3g} (both legs) has no cell faces."
+            )
+        for stub in report['stubs']:
+            logger.info(
+                f"Barrier {stub['line_id']!r}: dropped a {stub['length']:.3g} dangling stub "
+                f"at ({stub['location'][0]:.2f}, {stub['location'][1]:.2f})."
+            )
+        for message in _barrier_frames.report_warnings(report, self.sharp_angle):
+            warn_user(message)
 
     def _check_hex_rings(self, gmsh_map, points_gdf):
         """Warn for each hex_ring point whose ring the mesher split; record the outcome in diagnostics.

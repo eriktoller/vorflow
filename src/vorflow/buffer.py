@@ -23,10 +23,12 @@ against the winner's structured row. Priority key (lower wins): user
 ``z_order`` (higher first), then finer ``lc``, then wider strip, then line
 over polygon, then insertion order.
 
-*Protection corridors.* Barrier, straddle and quad-buffer features each get a
-corridor (the feature buffered by ``1.2 * eps``). Their union, the barrier
-zone, trims standard lines away from these sensitive regions; corridors of
-non-quad features also act as obstacles for quad buffers.
+*Protection corridors.* Barrier lines (also non-barrier lines with the
+deprecated ``straddle_width``, whose faces follow them exactly) and
+quad-buffer features each get a corridor (the feature buffered by
+``1.2 * eps``). Their union, the barrier zone, trims standard lines away
+from these sensitive regions; corridors of non-quad features also act as
+obstacles for quad buffers.
 
 *Slivers.* One-sided trimming can leave thin wedges at shallow-angle overlaps.
 Pieces are morphologically opened and dropped when thinner than ~0.8 cells;
@@ -278,13 +280,14 @@ def plan_quad_buffers(polygons_gdf, lines_gdf, background_lc, domain) -> dict:
 
 
 def protection_epsilon(row, background_lc) -> float:
-    """Half-width protected around a feature: buffer half-width, straddle/2, or 0.2*lc."""
+    """Half-width protected around a feature: the quad buffer's half-width, else 0.2*lc.
+
+    The deprecated ``straddle_width`` is ignored: barrier sites stay within
+    half a face length of the line, whatever it was set to.
+    """
     lc = feature_lc(row, background_lc)
     if row_bool(row, 'quad_buffer', False):
         return quad_buffer_thickness(row) * lc / 2.0
-    straddle = positive_number(row.get('straddle_width'))
-    if straddle:
-        return straddle / 2.0
     return lc * 0.20
 
 

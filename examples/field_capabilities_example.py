@@ -10,7 +10,6 @@ field types:
 - Explicit `ThresholdField`
 - `GeometricGrowthField` with edge-ratio and continuous-metric conventions
 - Field-only polygon via `embed=False`
-- Barrier/straddle line to validate point-pair representation
 - `hex_ring=True` point, whose cell is a regular hexagon centred on it
 - Lloyd relaxation (`lloyd_iterations`) compared with the default grid
 """

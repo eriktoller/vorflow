@@ -22,10 +22,10 @@ to the background size, so the cell size and quality stay smooth across the
 crossing. Here the inner zone (z_order=1) wins over the fault, which is trimmed.
 
 Two more features round out the comparison: a ``tee`` line that ends ON the
-fault (a T-junction, trimmed because the fault was added first) and a classic
-straddle ``barrier`` line (no quad buffer), which aligns Voronoi faces via
-mirrored point pairs rather than a structured strip -- the lightweight treatment
-to compare against the quad buffers.
+fault (a T-junction, trimmed because the fault was added first) and a plain
+``barrier`` line (no quad buffer), whose Voronoi faces are placed exactly on
+the line by generator pairs rather than by a structured strip -- the default
+treatment to compare against the quad buffers.
 """
 
 import matplotlib.pyplot as plt
@@ -42,7 +42,7 @@ domain = box(0, 0, 12, 22)
 fault = LineString([(0, 5), (12, 5)])    # crosses inner_zone's band
 drain = LineString([(0, 10), (12, 10)])  # passes between the two zones
 tee = LineString([(10, 5), (10, 9)])     # T-junction: ends on the fault
-barrier = LineString([(0, 20), (12, 20)])  # classic straddle, clear of all bands
+barrier = LineString([(0, 20), (12, 20)])  # exact barrier faces, clear of all bands
 inner_zone = Polygon([(4, 3), (8, 3), (8, 7), (4, 7)])
 sup_inner_zone = translate(inner_zone, xoff=0, yoff=10)
 
@@ -104,8 +104,8 @@ mesh.add_line(
     fields=[field],
 )
 
-# Classic straddle barrier (no quad_buffer) for contrast: it forces Voronoi
-# faces onto the line with mirrored point pairs rather than a structured strip.
+# Plain barrier (no quad_buffer) for contrast: its Voronoi faces are placed
+# exactly on the line by generator pairs rather than by a structured strip.
 mesh.add_line(
     barrier,
     line_id="barrier",

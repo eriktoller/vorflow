@@ -3,6 +3,12 @@
 **Status:** planned · **Risk:** high · **Behavior change:** opt-in
 **Back to** [design notes](README.md)
 
+> **Update (after 0.3.0):** the straddle path that this note compares
+> against was replaced by exact barrier faces
+> ([milestone 8](08-exact-barrier-faces.md)). Quad buffers on barriers do not
+> use the exact faces yet. They still rely on mirrored generators and on
+> cutting cells.
+
 ## Goal
 
 Port `gmshflow`'s transfinite **structured-quad buffer-surface** system for

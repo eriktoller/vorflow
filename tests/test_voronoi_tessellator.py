@@ -841,3 +841,58 @@ def test_real_mesh_on_slanted_domain_assigns_every_cell_a_zone():
     assert mesher.generate(*clean)
     grid = VoronoiTessellator(mesher, cm).generate()
     assert grid["zone_id"].eq("dom").all()
+
+
+@pytest.mark.slow
+def test_straight_zone_edge_with_a_size_jump_keeps_its_z_order_zone():
+    # A resolution-5 zone against a resolution-20 background, edge at x = 150, no barriers: every cell
+    # centred on the edge keeps the inner zone, as on develop (8987f7d gave 10 of 59 to the outer zone).
+    from vorflow.engine import MeshGenerator
+
+    cm = ConceptualMesh()
+    cm.add_polygon(Polygon([(0, 0), (300, 0), (300, 300), (0, 300)]), zone_id=1, resolution=20.0)
+    cm.add_polygon(Polygon([(0, 0), (150, 0), (150, 300), (0, 300)]), zone_id=2, resolution=5.0, z_order=1)
+    mesher = MeshGenerator(background_lc=20.0, verbosity=0)
+    assert mesher.generate(*cm.generate())
+    grid = VoronoiTessellator(mesher, cm).generate()
+    on_edge = np.isclose(grid["x"], 150.0, atol=1e-6) & (grid["y"] > 1) & (grid["y"] < 299)
+    assert on_edge.sum() > 50
+    assert (grid.loc[on_edge, "zone_id"] == 2).all()
+
+
+@pytest.mark.parametrize("next_to_a_barrier", [False, True])
+def test_cell_spanning_a_zone_edge_next_to_a_barrier_takes_the_zone_holding_most_of_it(next_to_a_barrier):
+    # Node 2 sits on the corner of the inner zone, so its cell is about a quarter inside it. Away from barriers
+    # the z_order rule gives it the inner zone, as before. When it touches a barrier site's cell (node 4) it
+    # goes to the outer zone, which holds most of it. Node 3, on a straight stretch of the edge, splits evenly
+    # and keeps the z_order zone either way.
+    cm = ConceptualMesh()
+    cm.add_polygon(Polygon([(0, 0), (4, 0), (4, 4), (0, 4)]), zone_id="outer")
+    cm.add_polygon(Polygon([(0, 0), (2, 0), (2, 2), (0, 2)]), zone_id="inner", z_order=1)
+    clean_polys, _, _ = cm.generate()
+    nodes = np.array([[1.0, 1.0], [2.0, 2.0], [2.0, 1.0], [3.0, 3.0], [3.0, 1.0], [1.0, 3.0]])
+    mesh_gen = DummyMeshGenerator(nodes=nodes, tags=np.arange(1, len(nodes) + 1), zones_gdf=clean_polys)
+    mesh_gen.node_is_site = np.arange(1, len(nodes) + 1) == 4 if next_to_a_barrier else None
+
+    grid = VoronoiTessellator(mesh_gen, cm, clip_to_boundary=True).generate().set_index("node_id")
+
+    assert grid.loc[1, "zone_id"] == "inner"
+    assert grid.loc[2, "zone_id"] == ("outer" if next_to_a_barrier else "inner")
+    assert grid.loc[3, "zone_id"] == "inner"
+
+
+def test_zone_share_sums_every_polygon_row_of_a_zone():
+    # Zone 2 is three tiles meeting zone 3 at (150, 150). The cell centred there is 62.5% zone 2 (25% + 25% +
+    # 12.5%) and 37.5% zone 3, more than any one tile: it keeps zone 2.
+    zones = gpd.GeoDataFrame({"zone_id": [2, 2, 2, 3], "z_order": [2, 2, 2, 1]}, geometry=[
+        Polygon([(150, 150), (100, 150), (100, 200), (150, 200)]),
+        Polygon([(150, 150), (150, 100), (100, 100), (100, 150)]),
+        Polygon([(150, 150), (200, 100), (150, 100)]),
+        Polygon([(150, 150), (150, 200), (200, 200), (200, 100)]),
+    ])
+    grid = gpd.GeoDataFrame({"node_id": [1], "x": [150.0], "y": [150.0], "zone_id": [2], "z_order": [2]},
+                            geometry=[shapely.box(140, 140, 160, 160)])
+
+    out = tessellator_module._edge_cells_to_majority_zone(grid, zones, band=np.array([True]))
+
+    assert out["zone_id"].tolist() == [2]

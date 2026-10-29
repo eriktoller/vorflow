@@ -14,7 +14,11 @@ zero, so ``h`` there is at most the polygon's resolution.
 
 Only embedded features are checked; field-only features feed ``h`` alone.
 Barrier, straddle and quad-buffer features are checked as the plain lines and
-polygons they are drawn from.
+polygons they are drawn from, with one exception: a barrier end that runs
+alongside another barrier, or along the domain outline, is not a near miss.
+The barrier cleaning leaves such an end alone on purpose, and the barrier
+construction gives the gap one row of cells (``vorflow._barrier.corridor``);
+the gap checks still report it as a narrow gap.
 
 Everything here is pure shapely/NumPy and works on clean GeoDataFrames.
 """
@@ -29,7 +33,8 @@ from scipy.sparse import coo_matrix
 from scipy.sparse.csgraph import connected_components
 from shapely.geometry import LineString, Point
 
-from ._features import is_embedded, line_parts, polygon_parts
+from ._barrier.lines import SNAP_PARALLEL_ANGLE, runs_alongside
+from ._features import is_embedded, is_face_line, line_parts, polygon_parts
 
 # (error below, warning below) on ratio = distance / h. None: never an error.
 THRESHOLDS = {
@@ -89,6 +94,7 @@ class Chain:
     xy: np.ndarray  # vertices, without the closing repeat of a ring
     closed: bool
     polygon: object = None  # the polygon part a ring bounds
+    barrier: bool = False  # a line whose faces the barrier construction places
 
 
 @dataclass(frozen=True)
@@ -170,8 +176,47 @@ def build_chains(polys, lines) -> list[Chain]:
                 chains.append(Chain(_feature("polygon", row), ring, xy, True, part))
     for _, row in _embedded_rows(lines):
         for part in line_parts(row.geometry):
-            chains.append(Chain(_feature("line", row), part, np.asarray(part.coords)[:, :2], False))
+            chains.append(Chain(_feature("line", row), part, np.asarray(part.coords)[:, :2], False,
+                                barrier=is_face_line(row)))
     return chains
+
+
+def domain_outline(chains) -> list[np.ndarray]:
+    """Vertex arrays of the outline of the union of all embedded polygon parts (outer edges and holes)."""
+    parts = [c.polygon for c in chains if c.closed and c.polygon is not None]
+    if not parts:
+        return []
+    outline = shapely.union_all(parts).boundary
+    return [np.asarray(g.coords)[:, :2] for g in getattr(outline, "geoms", [outline])]
+
+
+def corridor_end(chain: Chain, end: int, targets: list[np.ndarray], reach: float) -> bool:
+    """True when ``chain`` is a barrier whose end (0 or -1) runs alongside one of ``targets`` within ``reach``.
+
+    Only the last ``reach`` of the end segment counts, so a long end segment
+    that runs on past the target (a staggered end) still qualifies.
+    """
+    if not chain.barrier:
+        return False
+    a, b = (chain.xy[0], chain.xy[1]) if end == 0 else (chain.xy[-1], chain.xy[-2])
+    length = float(np.hypot(*(b - a)))
+    stub = np.array([a, a + (b - a) * min(1.0, reach / max(length, 1e-300))])
+    return any(runs_alongside(stub, 0, target, reach) for target in targets)
+
+
+def _beside(chain: Chain, pos: int, other: Chain, other_pos: int) -> bool:
+    """True when the end segment of barrier ``chain`` at vertex ``pos`` is near parallel to a segment of
+    barrier ``other`` at vertex ``other_pos``: the two vertices face each other across a corridor."""
+    if not (chain.barrier and other.barrier) or chain.closed or pos not in (0, len(chain.xy) - 1):
+        return False
+    u = chain.xy[1] - chain.xy[0] if pos == 0 else chain.xy[-1] - chain.xy[-2]
+    for k in (other_pos - 1, other_pos + 1):
+        if 0 <= k < len(other.xy):
+            w = other.xy[k] - other.xy[other_pos]
+            cos = abs(float(u @ w)) / max(float(np.hypot(*u) * np.hypot(*w)), 1e-300)
+            if cos >= np.cos(SNAP_PARALLEL_ANGLE):
+                return True
+    return False
 
 
 def embedded_points(points) -> list[tuple]:
@@ -269,6 +314,10 @@ def check_close_vertices(chains, points, size: SizeField, tol: float) -> list[di
                               mid[candidate], h[candidate]):
         feature_a, partner_a, chain_a = owners[owner[a]]
         feature_b, partner_b, chain_b = owners[owner[b]]
+        if chain_a is not None and chain_b is not None and (
+                _beside(chains[chain_a], pos[a], chains[chain_b], pos[b])
+                or _beside(chains[chain_b], pos[b], chains[chain_a], pos[a])):
+            continue  # a corridor tip: the barrier construction gives the gap one row of cells
         if chain_a is not None and chain_a == chain_b:
             arc = abs(arcs[chain_a][pos[a]] - arcs[chain_a][pos[b]])
             if chains[chain_a].closed:
@@ -296,24 +345,30 @@ def check_near_misses(chains, points, size: SizeField, tol: float) -> list[dict]
         return []
     tree = shapely.STRtree([g for _, g in targets])
     reach = THRESHOLDS["line_end_near_miss"][1] * size.background_lc
+    outline = domain_outline(chains)
     probes = []
     for chain in chains:
         if not chain.closed:
-            for xy in (chain.xy[0], chain.xy[-1]):
-                probes.append(("line_end_near_miss", chain.feature, Point(xy)))
-    probes += [("point_near_miss", feature, point) for feature, point in points]
+            for end in (0, -1):
+                probes.append(("line_end_near_miss", chain.feature, Point(chain.xy[end]), chain, end))
+    probes += [("point_near_miss", feature, point, None, None) for feature, point in points]
 
     findings = []
-    for kind, feature, probe in probes:
-        near = [targets[j] for j in tree.query(probe, predicate="dwithin", distance=reach)
-                if targets[j][0] != feature]
-        if not near:
+    for kind, feature, probe, chain, end in probes:
+        hits = [j for j in tree.query(probe, predicate="dwithin", distance=reach) if targets[j][0] != feature]
+        if not hits:
             continue
+        near = [targets[j] for j in hits]
         distances = [shapely.distance(probe, g) for _, g in near]
         if min(distances) <= tol:  # snapped onto another feature
             continue
         k = int(np.argmin(distances))
         h = size.at([[probe.x, probe.y]])[0]
+        if chain is not None and hits[k] < len(chains):
+            target = chains[hits[k]]
+            alongside = outline if target.closed else ([target.xy] if target.barrier else [])
+            if corridor_end(chain, end, alongside, THRESHOLDS[kind][1] * h):
+                continue  # not a near miss: a corridor tip (module docstring)
         if _reported(kind, distances[k], h):
             findings.append(_finding(kind, feature, near[k][0], distances[k], h, (probe.x, probe.y),
                                      shapely.shortest_line(probe, near[k][1])))

@@ -29,7 +29,9 @@ or useful enough to port.
 ## Decisions
 
 - Keep both the lightweight straddle path and the robust structured-quad buffer
-  path. Structured buffers are opt-in and do not replace straddle.
+  path. Structured buffers are opt-in and do not replace straddle. (After
+  0.3.0 the straddle path was replaced by exact barrier faces; see
+  milestone 8.)
 - Keep the current Voronoi clipping behavior as the default.
 - Do not add a core sliver-filtering or active-domain API for now. Larger
   mesh-envelope / smaller active-domain workflows should select or tag active
@@ -61,8 +63,10 @@ or useful enough to port.
 | 5 | Triangular/mixed element-grid output | Done | [05-triangular-grid-output.md](05-triangular-grid-output.md) |
 | 6 | First PyPI release | Done (`0.1.0`) | [06-pypi-publishing.md](06-pypi-publishing.md) |
 | 7 | Centred point cells and Lloyd relaxation | Done | [07-point-centring-lloyd.md](07-point-centring-lloyd.md) |
+| 8 | Exact barrier faces | Done (unreleased) | [08-exact-barrier-faces.md](08-exact-barrier-faces.md) |
 
-All seven milestones are done. `0.1.0` was released to PyPI (milestone 6),
+The seven porting milestones are done. Milestone 8, exact barrier faces,
+followed after 0.3.0. `0.1.0` was released to PyPI (milestone 6),
 and the features are: quality metrics and connectivity
 reports (`get_triangular_quality`, `utils.build_connectivity`), the
 active-domain workflow example (`examples/active_domain_quality_example.py`),
@@ -102,6 +106,11 @@ element-grid exporter (`MeshGenerator.get_element_grid()`, see
    2 km model with four refined wells, 20 passes lower the p95 centroid
    ortho_error from 4.1 to 2.7 degrees; Gmsh smoothing does not (4.2 at
    100/10). See the milestone doc for measurements.
+8. **Exact barrier faces**: not a `gmshflow` port. It replaces the straddle
+   pairs with generators placed by the empty-circle rule, so every barrier
+   segment is one cell face and no cell is cut. On 73 barrier benchmark
+   cases, cut cells fell from 78 to 0. See the milestone doc for
+   measurements and the remaining limits.
 
 ## Verification
 

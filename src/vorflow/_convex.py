@@ -21,9 +21,16 @@ the neighbour that shares that face: the neighbour keeps its shape but gains a
 vertex. A barrier face never gains one, as each barrier segment must stay one
 face: where the bisector ends inside a barrier face, two diagonals to the ends
 of that face cut it off instead (both lie either side of the bisector, so they
-resolve the corner). The cut always starts at the reflex vertex, where the generator sits,
-so the generator would lie at the end of the new face; every piece therefore
-takes its centroid as x/y. A zero-width spike (a vertex where the ring turns
+resolve the corner).
+
+The cuts start at the reflex vertex, where Gmsh puts the generator, so the
+generator usually lies on a corner of a piece, where it cannot be the cell
+centre (XT3D crashes on it). The piece that holds the generator clear of its
+boundary keeps it as x/y; the faces it kept from the cell, such as an exact
+barrier face, stay orthogonal. Any other piece with one barrier face takes
+the midpoint of the chord of the normal to that face through the generator,
+which keeps the barrier face orthogonal too; all other pieces take their
+centroid. A zero-width spike (a vertex where the ring turns
 straight back, as a barrier end can leave) is dropped first; the base of the
 spike is inserted into the neighbour in the same way. A cell that cannot be
 split (one with holes, or one where no cut makes progress) is left as it is
@@ -58,6 +65,15 @@ REFLEX_TOLERANCE = 1e-9
 # inside its polygon, to snap cut ends and to check that a split preserved
 # the area.
 SPLIT_TOLERANCE = 1e-9
+
+# The piece of a split cell that holds the generator keeps it as x/y when
+# the generator lies at least this fraction of the piece's size (square root
+# of its area) inside it. Pieces are convex, so every face is visible from
+# it, and its faces that were faces of the cell (such as an exact barrier
+# face) stay orthogonal. A generator on or near the boundary (the reflex
+# corner, or a cut through it) gives way to the centroid: XT3D crashes on a
+# cell centre on a face.
+GENERATOR_CLEARANCE = 0.01
 
 # Added distance relative to the coordinate magnitude: roundoff grows with the
 # coordinates (e.g. UTM northings), whatever the cell size.
@@ -381,8 +397,11 @@ def split_concave_cells(grid, targets: np.ndarray, barriers=None) -> tuple:
 
     The largest piece covering the generator (else the largest) keeps the
     row and its ``node_id``; the others are new rows with fresh IDs above the
-    maximum. Every piece of a split cell takes its centroid as x/y and is
-    marked in a ``concave_split`` column; the mesh node stays in
+    maximum. The piece that holds the generator clear of its boundary keeps
+    it as x/y; a piece with one face on the ``barriers`` lines takes a point
+    on the normal to that face through the generator; the others take their
+    centroid (see the module docstring). Every piece is marked in a
+    ``concave_split`` column; the mesh node stays in
     ``source_x``/``source_y``, which are added (equal to x/y) when the grid
     lacks them. No cut ends inside a face on the ``barriers`` lines (a
     shapely geometry, or None). A cell that cannot be split stays as it is,
@@ -419,8 +438,8 @@ def split_concave_cells(grid, targets: np.ndarray, barriers=None) -> tuple:
 
         grid.at[position, geometry] = pieces[primary]
         grid.at[position, "concave_split"] = True
-        grid.at[position, "x"] = pieces[primary].centroid.x
-        grid.at[position, "y"] = pieces[primary].centroid.y
+        if not _holds_generator(pieces[primary], generator):
+            grid.at[position, "x"], grid.at[position, "y"] = _piece_centre(pieces[primary], generator, barriers)
         piece_ids = [int(row["node_id"])]
         for piece in others:
             max_id += 1
@@ -428,7 +447,7 @@ def split_concave_cells(grid, targets: np.ndarray, barriers=None) -> tuple:
             new[geometry] = piece
             new["node_id"] = max_id
             new["concave_split"] = True
-            new["x"], new["y"] = piece.centroid.x, piece.centroid.y
+            new["x"], new["y"] = _piece_centre(piece, generator, barriers)
             new_rows.append(new)
             piece_ids.append(max_id)
         report.append({
@@ -448,6 +467,41 @@ def split_concave_cells(grid, targets: np.ndarray, barriers=None) -> tuple:
     if failed:
         logger.warning(f"Left {len(failed)} concave cells unsplit, by node_id: {', '.join(failed)}.")
     return grid, _report_frame(report)
+
+
+def _holds_generator(piece: Polygon, generator: Point) -> bool:
+    """True when ``generator`` (or another centre) lies inside the convex ``piece``, clear of its boundary."""
+    clearance = piece.exterior.distance(generator)
+    return piece.contains(generator) and clearance > GENERATOR_CLEARANCE * np.sqrt(piece.area)
+
+
+def _piece_centre(piece: Polygon, generator: Point, barriers) -> tuple[float, float]:
+    """x/y for a piece that does not hold the generator: on the normal to its barrier face, else its centroid.
+
+    The cell's face on a barrier is the perpendicular bisector of the
+    generator and the neighbour's generator, so a centre on the normal
+    through the generator keeps that face orthogonal. A piece with no
+    barrier face, or more than one, or no point on that normal clear of its
+    boundary, takes its centroid.
+    """
+    if barriers is not None:
+        xy = _ring(piece)
+        tolerance = _tolerance(piece)
+        on_barrier = shapely.distance(shapely.points(xy), barriers) <= tolerance
+        faces = np.flatnonzero(on_barrier & np.roll(on_barrier, -1))
+        faces = [k for k in faces
+                 if barriers.distance(Point((xy[k] + xy[(k + 1) % len(xy)]) / 2)) <= tolerance]
+        if len(faces) == 1:
+            k = faces[0]
+            along = xy[(k + 1) % len(xy)] - xy[k]
+            normal = np.array([-along[1], along[0]]) / np.hypot(*along) * 2 * piece.length
+            g = np.array(generator.coords[0])
+            chord = LineString([g - normal, g + normal]).intersection(piece)
+            if chord.geom_type == "LineString" and not chord.is_empty:
+                centre = chord.interpolate(0.5, normalized=True)
+                if _holds_generator(piece, centre):
+                    return centre.x, centre.y
+    return piece.centroid.x, piece.centroid.y
 
 
 def _report_frame(rows: list[dict]) -> pd.DataFrame:

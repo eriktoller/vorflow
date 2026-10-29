@@ -296,6 +296,30 @@ def test_split_leaves_the_neighbour_across_a_barrier_face_unchanged():
     assert report["n_pieces"].iloc[0] == 3
 
 
+def test_split_piece_holding_the_generator_keeps_it():
+    """Catches a piece replacing a generator well inside it with its centroid, which skews its old faces."""
+    grid = _grid([L_SHAPE])
+    grid.loc[0, ["x", "y"]] = [0.5, 0.2]
+
+    split, _ = split_concave_cells(grid, np.array([0]))
+
+    assert split[["x", "y"]].iloc[0].tolist() == [0.5, 0.2]
+    other = split.geometry.iloc[1].centroid
+    assert split[["x", "y"]].iloc[1].tolist() == pytest.approx([other.x, other.y])
+
+
+def test_split_piece_with_a_barrier_face_is_centred_on_its_normal():
+    """Catches a piece cut off with a barrier face taking its centroid, which skews that face."""
+    grid = _grid([SLIT])
+    grid.loc[0, ["x", "y"]] = [5.0, 1.0]
+
+    split, _ = split_concave_cells(grid, np.array([0]), LineString([(0, 0), (10, 0)]))
+
+    triangle = split[np.isclose(split.geometry.area, 5.0)]
+    assert len(triangle) == 1
+    assert triangle[["x", "y"]].iloc[0].tolist() == pytest.approx([5.0, 0.5])
+
+
 def _grid(cells):
     return gpd.GeoDataFrame(
         {
@@ -587,3 +611,22 @@ def test_split_keeps_every_barrier_segment_one_face():
     assert len(tessellator.concave_split_report) > 0
     assert len(split) == len(plain)
     assert split.geometry.length.sum() == pytest.approx(plain.geometry.length.sum(), rel=1e-9)
+    assert split["ortho_error"].max() < 1e-6
+
+
+@pytest.mark.slow
+def test_split_keeps_barrier_faces_orthogonal_at_a_notch_tip():
+    """Catches the split piece with a barrier face taking its centroid instead of the generator."""
+    domain = Polygon([(0, 0), (0, 300), (156.23, 300), (166.53, 150.69), (168.15, 300), (300, 300), (300, 0)])
+    barrier = LineString([(108.97, 172.37), (231.88, 124.30)])
+    cm = ConceptualMesh()
+    cm.add_polygon(domain, zone_id=1, resolution=20.0)
+    cm.add_line(barrier, line_id="b", resolution=8.0, is_barrier=True)
+    mg = MeshGenerator(background_lc=20.0, verbosity=0)
+    mg.generate(*cm.generate())
+
+    tessellator = VoronoiTessellator(mg, cm, split_concave="all")
+    faces = _barrier_faces(tessellator.generate(), barrier)
+
+    assert len(tessellator.concave_split_report) == 1
+    assert faces["ortho_error"].max() < 1e-6

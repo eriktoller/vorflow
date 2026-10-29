@@ -575,9 +575,12 @@ cell gains a vertex where the cut ends (its shape does not change). Where the
 bisector would end on a barrier face, two diagonals to the ends of that face
 cut it off instead, so every barrier segment stays one face. The
 largest piece holding the generator keeps the cell's `node_id`; the others
-get new IDs. All pieces carry their centroid as `x`/`y`, unlike every other
-cell: the generator sits on the corner, at the end of the cut, and a cell
-centre there makes XT3D crash; the mesh node stays in `source_x`/`source_y`,
+get new IDs. Pieces usually carry their centroid as `x`/`y`, unlike every
+other cell: the generator sits on the corner, at the end of the cut, and a
+cell centre there makes XT3D crash. A piece that holds the generator clear of
+its boundary keeps it, and a piece with one barrier face takes a point on the
+normal to that face through the generator, so barrier faces stay orthogonal.
+The mesh node stays in `source_x`/`source_y`,
 and a `concave_split` column marks the pieces. A cell that cannot be split
 (for example one with a hole, which a DISV cell cannot represent) is left as
 it is, with a warning.

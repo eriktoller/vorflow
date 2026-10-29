@@ -732,10 +732,14 @@ class VoronoiTessellator:
             generator keeps the cell's ``node_id``; the others get new IDs
             above the maximum. A cell that cannot be split (e.g. one with a
             hole, which no DISV cell can represent) is left as it is with a
-            warning, in either mode. Unlike every other cell, all pieces of
-            a split cell carry their centroid as ``x``/``y``: the generator
-            sits on the reflex corner, at the end of the cut, and a cell
-            centre there makes MODFLOW 6 XT3D crash. With the split on, the
+            warning, in either mode. Unlike every other cell, a piece of a
+            split cell usually carries its centroid as ``x``/``y``: the
+            generator sits on the reflex corner, at the end of the cut, and
+            a cell centre there makes MODFLOW 6 XT3D crash. A piece that
+            holds the generator clear of its boundary (as next to a
+            barrier, whose sites move it off the corner) keeps it, and a
+            piece with one barrier face takes a point on that face's normal
+            through the generator, so barrier faces stay orthogonal. With the split on, the
             grid gets a ``concave_split`` column marking the pieces, and
             ``source_x``/``source_y`` (the mesh node) if it lacks them. The new faces are poor for the flow solution (CVFD
             skewness about 0.5), so in a test with an exact linear head the
@@ -1612,8 +1616,8 @@ class VoronoiTessellator:
             self.final_grid['lloyd_shift'] = self.final_grid['node_id'].map(lloyd_shift)
 
         # The 'x' and 'y' columns refer to the generator point coordinates,
-        # which are essential for quality analysis (except on split concave
-        # cells, which carry their centroid). We add separate columns for the
+        # which are essential for quality analysis (except on most split
+        # concave pieces, which carry their centroid). We add separate columns for the
         # geometric centroid of the final cell.
         self.final_grid['centroid_x'] = self.final_grid.geometry.centroid.x
         self.final_grid['centroid_y'] = self.final_grid.geometry.centroid.y

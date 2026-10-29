@@ -121,6 +121,26 @@ def test_zones_overhanging_the_domain_lose_no_cells():
     grid_to_mfusg_disu(grid, 10.0, 0.0)
 
 
+def test_generate_uses_the_mesh_generator_state_captured_at_construction():
+    # A mesh generator re-run after the tessellator was built must not mix its new barrier
+    # sites and circles with the captured nodes.
+    cm = _build_conceptual_mesh()
+    clean_polys, _, _ = cm.generate()
+    nodes = np.array([[0.25, 0.25], [0.75, 0.25], [0.25, 0.75], [0.75, 0.75]])
+    mesh_gen = DummyMeshGenerator(nodes=nodes, tags=np.arange(1, 5), zones_gdf=clean_polys)
+    tessellator = VoronoiTessellator(mesh_gen, cm)
+
+    mesh_gen.node_is_site = np.array([True, False])
+    mesh_gen.barrier_circles = (np.array([[0.5, 0.5]]), np.array([1.0]))
+    mesh_gen.barrier_lines = gpd.GeoDataFrame(
+        {"feature_id": [0], "is_barrier": [True]}, geometry=[LineString([(0.5, 0), (0.5, 1)])]
+    )
+    grid = tessellator.generate()
+
+    assert len(grid) == 4
+    assert tessellator.n_barrier_mirrors == 0
+
+
 def test_enforce_barriers_preserves_uint64_ids_and_split_fragments():
     """Catches coercion of newly assigned barrier-fragment IDs to float."""
     tessellator, barrier = _plain_barrier_tessellator()

@@ -793,6 +793,10 @@ class VoronoiTessellator:
         self.node_sizes = getattr(mesh_generator, 'node_sizes', None)
         self.node_edges = getattr(mesh_generator, 'node_edges', None)
         self.buffer_footprints = getattr(mesh_generator, 'buffer_footprints', None)
+        # Barrier construction, captured with the nodes for the same reason.
+        self.node_is_site = getattr(mesh_generator, 'node_is_site', None)
+        self.barrier_lines = getattr(mesh_generator, 'barrier_lines', None)
+        self.barrier_circles = getattr(mesh_generator, 'barrier_circles', None)
         self.zones_gdf = mesh_generator.zones_gdf
         self.clip_to_boundary = clip_to_boundary
         self.boundary_centering = boundary_centering
@@ -990,7 +994,7 @@ class VoronoiTessellator:
         candidates = np.flatnonzero(spacing > 0)
 
         # Barrier sites are placed exactly; moving one would bend its faces.
-        sites = getattr(self.mg, 'node_is_site', None)
+        sites = self.node_is_site
         if sites is not None and len(sites) == len(nodes):
             candidates = candidates[~np.asarray(sites, dtype=bool)[candidates]]
         vertices, vertex_angles = _ring_vertex_angles(domain_geom)
@@ -1119,7 +1123,7 @@ class VoronoiTessellator:
         other ``is_barrier`` clean lines (quad buffers, or mesh generators
         without a barrier construction) come from ``clean_lines``.
         """
-        exact = getattr(self.mg, 'barrier_lines', None)
+        exact = self.barrier_lines
         done = set()
         out = []
         if exact is not None and not exact.empty:
@@ -1136,15 +1140,14 @@ class VoronoiTessellator:
 
     def _barrier_circles(self):
         """The mesh generator's barrier circles ``(centres, radii)``, or None."""
-        circles = getattr(self.mg, 'barrier_circles', None)
+        circles = self.barrier_circles
         if circles is None or len(circles[0]) == 0:
             return None
         return np.asarray(circles[0], dtype=float), np.asarray(circles[1], dtype=float)
 
     def _barrier_band(self, grid):
         """Mask of the grid cells next to a barrier: the barrier sites' cells and the cells touching them."""
-        sites = getattr(self.mg, 'node_is_site', None)
-        tags = getattr(self.mg, 'node_tags', None)
+        sites, tags = self.node_is_site, self.node_tags
         if grid.empty or sites is None or tags is None or len(sites) != len(tags) or not np.any(sites):
             return np.zeros(len(grid), dtype=bool)
         is_site = np.isin(grid['node_id'].to_numpy(), np.asarray(tags)[np.asarray(sites, dtype=bool)])
@@ -1168,7 +1171,7 @@ class VoronoiTessellator:
             return
         generators = np.asarray(generators, dtype=float).reshape(-1, 2)
         inside = _lloyd.inside_circles(generators, *circles)
-        sites = getattr(self.mg, 'node_is_site', None)
+        sites = self.node_is_site
         if not all_generators and sites is not None and len(sites) == len(generators):
             inside &= ~np.asarray(sites, dtype=bool)
         if inside.any():

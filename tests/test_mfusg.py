@@ -114,6 +114,16 @@ def test_boundary_roundoff_preserves_centres_but_rejects_real_errors(tmp_path, o
         grid_to_mfusg_disu(bad, 10, 0)
 
 
+@pytest.mark.parametrize("size", [1.0, 1000.0])
+def test_centre_tolerance_scales_with_cell_size(size):
+    # Barrier sites on the domain edge end up 1e-14..1e-7 m outside their clipped cell, far past
+    # coordinate roundoff near the origin. A centre 1e-8 x the cell size out is accepted; 1e-4 x is not.
+    polygon = box(0, 0, size, size)
+    assert grid_to_mfusg_disu(_grid([polygon], [(-1e-8 * size, size / 2)]), 10, 0)["nodes"] == 1
+    with pytest.raises(ValueError, match="Centre of cell 0 lies outside"):
+        grid_to_mfusg_disu(_grid([polygon], [(-1e-4 * size, size / 2)]), 10, 0)
+
+
 @pytest.mark.parametrize("offset", [0, 5_000_000])
 def test_roundoff_overlap_keeps_reciprocal_face_and_rejects_real_overlap(offset):
     eps = np.spacing(float(offset + 1))

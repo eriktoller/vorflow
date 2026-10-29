@@ -184,6 +184,12 @@ long for a tolerance to help. Where a junction merge made the pieces short,
 the message says the input is not at fault. A geometric failure inside the
 construction is raised as `BarrierMeshError` too, as a bug to report.
 
+A reflex corner of the domain (a hole corner, the inner corner of an L)
+inside a circle whose centre is off the boundary is a defect too. Gmsh's
+node at the corner would be removed with the circle, and the cell of a site
+on one side of the corner could reach round it and come out, cut off, on
+the other side, as a cell part without its own node.
+
 **Meshing** (`frames.py`, `polish.py`, `engine.py`). Gmsh meshes a copy of the
 clean frames in which each barrier is a size field only, and the sites are
 embedded points. Afterwards the mesh nodes inside the circles are removed
@@ -376,8 +382,12 @@ barrier.
   which meshes such a barrier with a structured strip (not exact faces).
 - **Near-miss ends at tolerance 0.** An end that stops just short of another
   barrier, but further away than the snap distance, meshes exactly but with a
-  cluster of small faces, or raises; the error then gives the
-  `simplify_tolerance` that snaps it.
+  cluster of small faces. Below 0.02 x `resolution` it raises; the error then
+  gives the `simplify_tolerance` that snaps it. The face ends follow the
+  face length at every sample along a piece, so a short dip near such an
+  end (from the caps or a repair round) is kept even in the middle of a
+  long piece; with 64 even steps per piece, ends 0.1-0.5 x `resolution`
+  from a long piece raised.
 - The safety-net code in `tessellator.py` (`_straddled_pieces`,
   `_merge_barrier_fragments`) stays for quad buffers and is to be retired
   once those use exact faces too.

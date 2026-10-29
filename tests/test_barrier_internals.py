@@ -13,7 +13,7 @@ import shapely
 from scipy.sparse.csgraph import dijkstra
 from shapely.geometry import LineString, box
 
-from vorflow._barrier import corridor, lines, network, pipeline, rung, sizing, validate
+from vorflow._barrier import corridor, lines, network, pipeline, rung, sites, sizing, validate
 
 DOMAIN = box(0, 0, 300, 300)
 LC = 8.0
@@ -70,6 +70,28 @@ def test_defects_find_a_bad_pair_and_a_site_outside_the_domain():
     small = box(0, 0, 300, 150.5)  # the sites above the barrier lie outside
     kinds = {k for k, _ in validate.defects(layout, np.empty((0, 2)), small)}
     assert kinds == {"site outside"}
+
+
+def test_reflex_corners_are_the_hole_corners_and_the_inner_corner_of_an_l():
+    hole = DOMAIN.difference(box(120, 120, 180, 180))
+    assert sorted(map(tuple, validate.reflex_corners(hole))) == [(120, 120), (120, 180), (180, 120), (180, 180)]
+    ell = DOMAIN.difference(box(150, 150, 300, 300))
+    assert list(map(tuple, validate.reflex_corners(ell))) == [(150, 150)]
+    assert len(validate.reflex_corners(DOMAIN)) == 0
+
+
+def test_no_circle_holds_a_hole_corner():
+    # A barrier leaving a hole edge 30 from its corner: Gmsh's node at the corner would be removed with a
+    # circle round it, and a site's cell could reach round the corner (a detached cell part).
+    domain = DOMAIN.difference(box(120, 120, 180, 180))
+    a = math.radians(80.0)
+    plan = _plan([[(180, 150), (180 + 150 / math.tan(a), 300)]], domain=domain)
+    layout = plan.layout
+    corners = validate.reflex_corners(domain)
+    d = np.hypot(*(layout.xy[:, None, :] - corners[None]).transpose(2, 0, 1))
+    assert (d >= layout.radius[:, None] * (1 - 1e-9)).all()
+    moved = dataclasses.replace(layout, radius=np.maximum(layout.radius, d.min(axis=1) * 1.01))
+    assert "corner in circle" in {k for k, _ in validate.defects(moved, np.empty((0, 2)), domain)}
 
 
 def test_arc_defect_when_a_site_on_a_node_circle_lies_inside_a_pair_arc():
@@ -209,6 +231,26 @@ def test_face_lengths_follow_the_size_field():
 # ---------------------------------------------------------------------------
 # corridor
 # ---------------------------------------------------------------------------
+def test_face_ends_follow_a_local_dip_of_h_on_a_long_piece():
+    # 64 even steps along a 1000 m piece stepped over a dip 4 m wide, so a cap or a repair round there did
+    # not move the face ends and the repair rounds ran out.
+    s = np.linspace(0.0, 1000.0, 2001)
+    h = np.where(np.abs(s - 500.0) < 2.0, 0.25, 8.0)
+    field = sizing.SizeField(np.zeros(len(s), dtype=int), s, h, np.column_stack([s, np.zeros_like(s)]),
+                             np.full(len(s), -1), set())
+    count = sites._count(field, 0, 0.0, 1000.0)
+    ends = sites._positions(field, 0, 0.0, 1000.0, count)
+    near = ends[np.abs(ends - 500.0) < 2.0]
+    assert len(near) >= 10 and np.diff(near).max() < 0.5
+
+
+@pytest.mark.parametrize("gap", [0.4, 1.0])
+def test_end_near_a_long_barrier_plans(gap):
+    # The end of one barrier (or straddle_width line) 0.1-0.25 lc from the middle of a long piece of another.
+    plan = _plan([[(0, 150), (300, 150)], [(90, 280), (150, 150 + gap)]], lc=4.0)
+    assert validate.defects(plan.layout, np.empty((0, 2)), DOMAIN) == []
+
+
 def test_collinear_pieces_have_no_bisector_and_no_corridor():
     a0, a1, b0, b1 = map(np.array, ([40.0, 150.0], [147.0, 150.0], [153.0, 150.0], [260.0, 150.0]))
     assert corridor.collinear(a0, a1, b0, b1)
@@ -250,6 +292,7 @@ def test_defects_left_after_the_repair_rounds_raise(monkeypatch):
 
     monkeypatch.setattr(pipeline, "defects", always_bad)
     monkeypatch.setattr(pipeline, "SITE_GROWTH_CAP", 1e9)
+    monkeypatch.setattr(pipeline, "MIN_H_FRACTION", 1e-6)  # each round halves the faces there: not the floor
     with pytest.raises(pipeline.BarrierMeshError,
                        match=f"1 defects \\(pair\\) are left after {pipeline.REPAIR_ROUNDS} local refinements"):
         _plan(STRAIGHT)

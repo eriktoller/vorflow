@@ -278,6 +278,18 @@ def test_near_miss_without_tolerance_raises_barrier_mesh_error():
     assert "(150.00, 150." in str(info.value)
 
 
+@pytest.mark.parametrize("kind", [B, {"straddle_width": 0.3}], ids=["barrier", "straddle_width"])
+def test_end_near_the_middle_of_a_long_barrier_meshes_exactly(kind):
+    # An end 0.4 (0.1 lc) from the middle of a 300 m barrier: the face ends there did not follow the size caps
+    # or the repair rounds, and BarrierMeshError blamed legs folding back (a straddle_width line in the fuzz).
+    lines = [([(0, 150), (300, 150)], {**B, "resolution": 4.0}),
+             ([(90, 280), (150, 150.4)], {**kind, "resolution": 4.0})]
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore", FutureWarning)
+        mg, vt, grid = _mesh(_model(lines))
+    _assert_exact(mg, vt, grid)
+
+
 def test_digitising_noise_is_cleaned_with_a_warning():
     noise = _ray(CENTRE, 60.0, 0.05 * LC)
     cm = _model([([(40, 100), CENTRE, noise, (260, 210)], B)])

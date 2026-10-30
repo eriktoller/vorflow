@@ -914,7 +914,7 @@ def cells_on(
         inside = shapely.intersection(gdf.geometry.to_numpy()[mask], geometry)
         rows = np.flatnonzero(mask)
         mask[rows[shapely.length(inside) <= 1e-9 * geometry.length]] = False
-    cells = gdf.loc[mask].copy()
+    cells = gdf.iloc[mask].copy()
     if cells.empty:
         raise ValueError("the geometry is outside the grid")
     if isinstance(geometry, Point):
@@ -1024,6 +1024,8 @@ def faces_on(gdf, geometry, tolerance=None, predicate="within"):
     faces.reset_index(drop=True, inplace=True)
 
     return faces
+
+
 def grid_to_mfusg_disu(gdf: gpd.GeoDataFrame, top, botm, nlay: int = 1, gsf_path=None) -> dict:
     """Build **MODFLOW-USG**, not MODFLOW 6, DISU input from a polygon grid.
 

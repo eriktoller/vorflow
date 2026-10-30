@@ -55,6 +55,30 @@ def test_close_domain_slits_removes_seams_and_keeps_vertices():
     assert closed.area == pytest.approx(12.0)
     assert closed.symmetric_difference(box(0, 0, 6, 2)).area < 1e-9
     assert closed.hausdorff_distance(box(0, 0, 6, 2)) < 1e-9
+    # Every vertex left is one of the input's, not a roundoff copy of it.
+    input_vertices = set(map(tuple, shapely.get_coordinates(domain)))
+    assert set(map(tuple, shapely.get_coordinates(closed))) <= input_vertices
+
+
+def test_close_domain_slits_leaves_a_domain_without_slits_unchanged():
+    domain = Polygon([(0, 0), (200, 0), (200, 200), (0, 200)], [[(50, 50), (60, 50), (60, 60)]])
+
+    assert tessellator_module._close_domain_slits(domain) is domain
+
+
+@pytest.mark.slow
+def test_grid_keeps_the_domain_boundary_exact():
+    # Closing slits moved every boundary vertex by roundoff, so a line drawn
+    # along the domain edge (x = 0) no longer met any cell.
+    cm = ConceptualMesh()
+    cm.add_polygon(box(0, 0, 200, 200), zone_id=1, resolution=10)
+    cm.add_point(Point(100, 100), point_id="well", resolution=2)
+    mg = MeshGenerator(background_lc=10, conceptual_mesh=cm)
+    mg.generate()
+    grid = VoronoiTessellator(mg, cm).generate()
+
+    assert grid.total_bounds.tolist() == [0.0, 0.0, 200.0, 200.0]
+    assert grid.geometry.intersects(LineString([(0, 0), (0, 200)])).any()
 
 
 def _clip_frame(cells, generators):
